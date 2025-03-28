@@ -29,10 +29,16 @@ On a first incoming event, the node become a queue leader (dispatcher), if no qu
 The key must be a string starting with /q/ OR /queue/ 
 This KV distributed to the whole cluster. So, this will take time to get more than half nodes confirm the new value set.
 
-> [!TODO]
-> - Change the leader, if current leader not handling messages recently
-> - loaded queue definition from DB,
-> - get a command to create a queue
+> [!NOTE]
+> - Change the queue dispatcher, if current one not handling messages recently
+> - loaded queue definition from DB
+> - get a CLI command to create a queue
+
+
+> [!IMPORTANT]
+Delivery guarantee for producer implemented on connection to dispatcher queue.
+There is a chance that producer if not connected to dispatcher node might 
+get lost message if dispatcher node get dies suddenly before indexed message and broadcast it. 
 
 
 the node as queue dispatcher put rsvr on a queue, to
@@ -56,11 +62,17 @@ client as etcd consumer creates key local key and start etcd watcher for client 
 
 producer as etcd client put msg (a value) to node it's connected, 
 	then the node copy to a coordinator aka dispatcher node:
-/queue/{q_name}/producer/{client_id}/{key-{uuid}}
-/q/{q_name}/p/{client_id}/{key}
+/queue/{q_name}/producer/{key}
+/q/{q_name}/p/{key}
 /q/{q_name}/input/{client_id}/{key}
 /q/{q_name}/i/{client_id}/{key}
 	0-1 network synch calls, no locks
+
+> [!NOTE] 
+TODO: Create multiple producers as a sender stream by
+/queue/{q_name}/producer@{node_id} with value: connection url,
+dispatcher will create a watcher stream into the peer 
+
 
 ### Place into the ordered queue 
  

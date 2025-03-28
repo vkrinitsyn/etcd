@@ -14,25 +14,29 @@ and [tonic](https://github.com/hyperium/tonic).
 
 
 > [!IMPORTANT]
-This is an experimental Proof of Concept of the features bellow
+This is an experimental Prof of Concept of the features bellow
 
 ## Features
 - etcd API v3 compatible client using protobuf
-- [queue](queue.md) with order and delivery guarantee
-- user mgmt is not a priority
-- no message storage, cluster election, as use another implementation
+- priority is a PoC [queue](queue.md) implementation with order and delivery consumer guarantee
+- no message storage, cluster election, as use another cluster implementation
 
 ## Supported APIs
 
-- [_] KV
-- [_] Watch
-- [_] Lease
-- [_] Auth
-- [_] Maintenance
-- [_] Cluster
-- [_] Lock
-- [_] Election
-- [_] Namespace
+- [ ] KV (wo: filter, range, version, pagination, linearizable read)
+- [ ] Watch (wo: filter, fragment, ranges, revision)
+ 
+### Low priority:
+- [ ] Lock
+- [ ] Namespace
+- [ ] Lease
+
+### Lowest priority:
+- [ ] Auth
+- [ ] Maintenance
+- [ ] Cluster
+- [ ] Election
+
 
 ## Usage
 

@@ -299,7 +299,6 @@ pub struct Compare {
     /// range_end compares the given target to all keys in the range [key, range_end).
     /// See RangeRequest for more details on key ranges.
     ///
-    /// TODO: fill out with most of the rest of RangeRequest fields when needed.
     #[prost(bytes = "vec", tag = "64")]
     pub range_end: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "compare::TargetUnion", tags = "4, 5, 6, 7, 8")]
@@ -763,7 +762,6 @@ pub struct LeaseTimeToLiveResponse {
 pub struct LeaseLeasesRequest {}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct LeaseStatus {
-    /// TODO: int64 TTL = 2;
     #[prost(int64, tag = "1")]
     pub id: i64,
 }
@@ -1223,6 +1221,8 @@ pub mod kv_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::metadata::MetadataValue;
+
     #[derive(Debug, Clone)]
     pub struct KvClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -1317,6 +1317,7 @@ pub mod kv_client {
         pub async fn put(
             &mut self,
             request: impl tonic::IntoRequest<super::PutRequest>,
+            peer: Option<u64>,
         ) -> std::result::Result<tonic::Response<super::PutResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1329,6 +1330,9 @@ pub mod kv_client {
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static("/etcdserverpb.KV/Put");
             let mut req = request.into_request();
+            if let Some(peer) = peer {
+                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+            }
             req.extensions_mut().insert(GrpcMethod::new("etcdserverpb.KV", "Put"));
             self.inner.unary(req, path, codec).await
         }
@@ -1338,6 +1342,7 @@ pub mod kv_client {
         pub async fn delete_range(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteRangeRequest>,
+            peer: Option<u64>,
         ) -> std::result::Result<
             tonic::Response<super::DeleteRangeResponse>,
             tonic::Status,
@@ -1355,6 +1360,9 @@ pub mod kv_client {
                 "/etcdserverpb.KV/DeleteRange",
             );
             let mut req = request.into_request();
+            if let Some(peer) = peer {
+                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+            }
             req.extensions_mut()
                 .insert(GrpcMethod::new("etcdserverpb.KV", "DeleteRange"));
             self.inner.unary(req, path, codec).await
@@ -1366,6 +1374,7 @@ pub mod kv_client {
         pub async fn txn(
             &mut self,
             request: impl tonic::IntoRequest<super::TxnRequest>,
+            peer: Option<u64>,
         ) -> std::result::Result<tonic::Response<super::TxnResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1378,6 +1387,9 @@ pub mod kv_client {
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static("/etcdserverpb.KV/Txn");
             let mut req = request.into_request();
+            if let Some(peer) = peer {
+                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+            }
             req.extensions_mut().insert(GrpcMethod::new("etcdserverpb.KV", "Txn"));
             self.inner.unary(req, path, codec).await
         }

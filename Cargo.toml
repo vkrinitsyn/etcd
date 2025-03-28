@@ -11,18 +11,13 @@ homepage = "https://github.com/etcdv3/etcd-client"
 documentation = "https://docs.rs/etcd-client/"
 keywords = ["etcd", "v3", "api", "client", "async"]
 
-[features]
-tls = ["tonic/tls"]
-#tls-openssl = ["openssl", "hyper-openssl", "hyper", "hyper-util"]
-#tls-openssl-vendored = ["tls-openssl", "openssl/vendored"]
-#tls-roots = ["tls", "tonic/tls-roots"]
-#pub-response-field = ["visible"]
-
 [dependencies]
+slog = { version = "2.7.0", features=["default"] }
+sloggers = "2.2.0"
 tonic = "0.12.3"
 prost = "0.13"
-tokio = "1.38"
-tokio-stream = "0.1"
+tokio = { version = "^1.44", features = ["full"] }
+tokio-stream = "^0.1"
 tower-service = "0.3"
 http = "1.1"
 visible = { version = "0.0.1", optional = true }
@@ -31,11 +26,35 @@ openssl = { version = "0.10", optional = true }
 hyper = { version = "1.4", features = ["client"], optional = true }
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy"], optional = true }
-etcd-client = {version = "0.14.1", features = []}
+dns-lookup = "2.0.4"
+
+
 clap = "4.5.32"
+clap-serde-derive = "0.2.1"
+
+lazy_static = "1.5.0"
+i18n-embed-fl = "^0.9"
+i18n-embed = { version = "^0.15", features = ["fluent-system", "desktop-requester"]}
+rust-embed = "8.6.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml = "^0.9"
+
+shims = {git = "https://github.com/vkrinitsyn/shim.git"}
+uuid = { version = "1.16.0", features = ["v4"] }
+rsa = "0.10.0-pre.4"
+rand = "0.8.5"
+
+[features]
+tls = ["tonic/tls"]
+#tls-openssl = ["openssl", "hyper-openssl", "hyper", "hyper-util"]
+#tls-openssl-vendored = ["tls-openssl", "openssl/vendored"]
+#tls-roots = ["tls", "tonic/tls-roots"]
+#pub-response-field = ["visible"]
+
 
 [dev-dependencies]
 tokio = { version = "1.38", features = ["full"] }
+etcd-client = {version = "0.14.1", features = []}
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", default-features = false, features = ["prost"] }
