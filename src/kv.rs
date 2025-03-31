@@ -1,13 +1,6 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use clap_serde_derive::ClapSerde;
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::RwLock;
-use tokio::time::Instant;
-use crate::cli::Config;
-use crate::EtcdEvents;
-use crate::etcdpb::etcdserverpb::{PutRequest, RangeResponse};
+use crate::etcdpb::etcdserverpb::PutRequest;
 use crate::etcdpb::mvccpb::KeyValue;
+use tokio::time::Instant;
 
 /// Key Value
 #[derive(Clone)]

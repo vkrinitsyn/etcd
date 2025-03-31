@@ -1221,7 +1221,8 @@ pub mod kv_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    use tonic::metadata::MetadataValue;
+    use tonic::metadata::{Ascii, MetadataValue};
+    use crate::etcdpb::XPEER;
 
     #[derive(Debug, Clone)]
     pub struct KvClient<T> {
@@ -1317,7 +1318,7 @@ pub mod kv_client {
         pub async fn put(
             &mut self,
             request: impl tonic::IntoRequest<super::PutRequest>,
-            peer: Option<u64>,
+            peer: Option<MetadataValue<Ascii>>,
         ) -> std::result::Result<tonic::Response<super::PutResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1331,7 +1332,7 @@ pub mod kv_client {
             let path = http::uri::PathAndQuery::from_static("/etcdserverpb.KV/Put");
             let mut req = request.into_request();
             if let Some(peer) = peer {
-                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+                req.metadata_mut().insert(XPEER, peer);
             }
             req.extensions_mut().insert(GrpcMethod::new("etcdserverpb.KV", "Put"));
             self.inner.unary(req, path, codec).await
@@ -1342,7 +1343,7 @@ pub mod kv_client {
         pub async fn delete_range(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteRangeRequest>,
-            peer: Option<u64>,
+            peer: Option<MetadataValue<Ascii>>,
         ) -> std::result::Result<
             tonic::Response<super::DeleteRangeResponse>,
             tonic::Status,
@@ -1361,7 +1362,7 @@ pub mod kv_client {
             );
             let mut req = request.into_request();
             if let Some(peer) = peer {
-                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+                req.metadata_mut().insert(XPEER, peer);
             }
             req.extensions_mut()
                 .insert(GrpcMethod::new("etcdserverpb.KV", "DeleteRange"));
@@ -1374,7 +1375,7 @@ pub mod kv_client {
         pub async fn txn(
             &mut self,
             request: impl tonic::IntoRequest<super::TxnRequest>,
-            peer: Option<u64>,
+            peer: Option<MetadataValue<Ascii>>,
         ) -> std::result::Result<tonic::Response<super::TxnResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1388,7 +1389,7 @@ pub mod kv_client {
             let path = http::uri::PathAndQuery::from_static("/etcdserverpb.KV/Txn");
             let mut req = request.into_request();
             if let Some(peer) = peer {
-                req.metadata_mut().insert("x-peer", MetadataValue::from(peer));
+                req.metadata_mut().insert(XPEER, peer);
             }
             req.extensions_mut().insert(GrpcMethod::new("etcdserverpb.KV", "Txn"));
             self.inner.unary(req, path, codec).await

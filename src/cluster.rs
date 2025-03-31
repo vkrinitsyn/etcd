@@ -1,18 +1,13 @@
 use crate::cli::Config;
 use crate::etcdpb::etcdserverpb::kv_server::{Kv, KvServer};
-use crate::queue::Queue;
+use crate::queue::{Queue};
 use crate::{EtcdEvents, KvEvent};
 use slog::{info, Logger};
-use std::collections::{HashMap, HashSet};
-use std::fmt::format;
+use std::collections::{HashMap};
 use std::net::SocketAddr;
-use std::string::FromUtf8Error;
 use std::sync::Arc;
-use i18n_embed_fl::fl;
-use shims::Histogram;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tonic::service::Routes;
 use tonic::Status;
 use tonic::transport::Server;
 use tonic::transport::server::Router;
@@ -21,8 +16,8 @@ use crate::etcdpb::etcdserverpb::auth_server::AuthServer;
 use crate::etcdpb::etcdserverpb::cluster_server::ClusterServer;
 use crate::etcdpb::etcdserverpb::lease_server::LeaseServer;
 use crate::etcdpb::etcdserverpb::maintenance_server::MaintenanceServer;
-use crate::etcdpb::etcdserverpb::watch_server::{Watch, WatchServer};
-use crate::etcdpb::etcdserverpb::{PutRequest, WatchResponse};
+use crate::etcdpb::etcdserverpb::watch_server::{ WatchServer};
+use crate::etcdpb::etcdserverpb::WatchResponse;
 use crate::etcdpb::v3electionpb::election_server::ElectionServer;
 use crate::etcdpb::v3lockpb::lock_server::LockServer;
 use crate::peer::EtcdCluster;
@@ -31,12 +26,12 @@ pub(crate) use crate::peer::EtcdPeerNode;
 
 impl EtcdNode {
     pub async fn init(cfg: Config, log: Logger) -> Result<Self, String> {
-        let (a, b) = Uuid::new_v4().as_u64_pair(); // TODO use node name
+        let (a, b) = Uuid::new_v4().as_u64_pair(); // TODO use node id from env
         let node_id = a^b; 
-        let cluster = EtcdCluster::connect(&cfg, node_id, &log).await?;
+        let cluster = EtcdCluster::connect(&cfg, node_id, 0, &log).await?;
 
-        let (sender, mut rsvr) = mpsc::channel(10);
-        let (watcher, mut watcher_rv) = mpsc::channel(10);
+        let (_sender, mut rsvr) = mpsc::channel(10);
+        let (watcher, watcher_rv) = mpsc::channel(10);
 
         let c = EtcdNode {
             cfg: Arc::new(RwLock::new(cfg)),
@@ -126,31 +121,6 @@ impl EtcdNode {
         
         Ok(())
     }
-    
-    /// process queue message from /producer/ (no watcher notify)
-    /// will create queue bucket if not exists
-    /// The returned queue will call for put() local or remote
-    ///
-    /// There no watcher will notify on this event because queue perform put with subsequently notification  
-    /// 
-    pub(crate) async fn queue(&self, r: &PutRequest) -> Result<(Queue, String), ()> {
-        let key = String::from_utf8(r.key.clone()).map_err(|_|())?;
-        if key.starts_with("/q") { // quick precheck
-            let names: Vec<&str> = key.split("/").collect();
-            if let Some((prefix, q_key)) = Queue::queue_name(&names) {
-                return match self.queues.read().await.get(&q_key).map(|q| q.clone()) {
-                    None => {
-                        let q = Queue::new(&self, prefix, q_key.clone()).await;
-                        self.queues.write().await.insert(q_key, q.clone());
-                        // TODO return index on broadcast
-                        Ok((q, Queue::get_producer_key(&names)?))
-                    }
-                    Some(q) => Ok((q, Queue::get_producer_key(&names)?))
-                };
-            }
-        }
-        Err(())
-    }
 
     /// in case of use as embedded lib bound to same port
     pub fn add_all_services(&self, srv: Router) -> Router {
@@ -227,7 +197,7 @@ pub struct WatcherConsumer {
 
 
 #[inline]
-fn uuid() -> String {
+fn _uuid() -> String {
     let x = Uuid::new_v4();
     x.hyphenated().to_string()[..8].into()
 }

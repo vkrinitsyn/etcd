@@ -1,16 +1,5 @@
-use slog::Logger;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
-use tonic::{async_trait, Request, Response, Status};
-use tonic::transport::{Error, Server};
 use crate::cli::Config;
-use crate::cluster::{ EtcdNode};
-use crate::etcdpb::etcdserverpb::kv_server::Kv;
-use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, TxnRequest, TxnResponse};
-use crate::srv::parking::*;
-use crate::etcdpb::v3lockpb::lock_server::{Lock, LockServer};
-use crate::etcdpb::v3lockpb::{LockRequest, LockResponse, UnlockRequest, UnlockResponse};
-use crate::srv::UNIMPL;
+use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest};
 
 pub mod etcdpb;
 pub mod cli;
@@ -19,9 +8,6 @@ mod srv;
 mod queue;
 mod kv;
 mod peer;
-// mod peer;
-
-//mod iputil;
 
 /// Etcd reconfiguration and integration events
 #[derive(Clone)]

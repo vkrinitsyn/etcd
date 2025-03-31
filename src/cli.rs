@@ -1,6 +1,6 @@
 use clap_serde_derive::{
-    clap::{self, ArgAction},
-    serde::Serialize,serde::Deserialize,
+    clap::{self},
+    serde::Serialize,
     ClapSerde,
 };
 

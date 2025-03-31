@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate slog;
 
-use std::io::Write;
 use i18n_embed::{
     fluent::{fluent_language_loader, FluentLanguageLoader},
     LanguageLoader,
@@ -14,9 +13,8 @@ use etcd::cli::Config;
 
 use std::{fs::File, io::BufReader};
 
-use clap::{Parser, CommandFactory, Command};
+use clap::{Parser,  Command};
 use std::{
-    default,
     error::Error,
     path::PathBuf,
 };
@@ -25,18 +23,12 @@ use std::{
 #[folder = "i18n/"]
 struct Localizations;
 
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::atomic::Ordering;
 use clap_serde_derive::ClapSerde;
-use lazy_static::*;
 use lazy_static::lazy_static;
 use slog::Logger;
 use sloggers::Build;
 use sloggers::terminal::{Destination, TerminalLoggerBuilder};
 use sloggers::types::{Severity, SourceLocation};
-use tokio::sync::mpsc::Sender;
-use tonic::transport::Server;
 use etcd::cluster::{ EtcdNode};
 
 lazy_static! {

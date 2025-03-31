@@ -11,12 +11,12 @@ type SnapshotResult<T> = Result<Response<T>, Status>;
 
 #[async_trait]
 impl Maintenance for EtcdNode {
-    async fn alarm(&self, request: Request<AlarmRequest>) -> Result<Response<AlarmResponse>, Status> {
+    async fn alarm(&self, _request: Request<AlarmRequest>) -> Result<Response<AlarmResponse>, Status> {
         Err(Status::unimplemented(UNIMPL))
     }
 
     /// .
-    async fn status(&self, request: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
+    async fn status(&self, _request: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
         
         Ok(Response::new(StatusResponse {
             header: Some(ResponseHeader {
@@ -37,25 +37,25 @@ impl Maintenance for EtcdNode {
         }))
     }
 
-    async fn defragment(&self, request: Request<DefragmentRequest>) -> Result<Response<DefragmentResponse>, Status> {
+    async fn defragment(&self, _request: Request<DefragmentRequest>) -> Result<Response<DefragmentResponse>, Status> {
         Err(Status::unimplemented(UNIMPL))
     }
 
-    async fn hash(&self, request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
+    async fn hash(&self, _request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
         Err(Status::unimplemented(UNIMPL))
     }
 
-    async fn hash_kv(&self, request: Request<HashKvRequest>) -> Result<Response<HashKvResponse>, Status> {
+    async fn hash_kv(&self, _request: Request<HashKvRequest>) -> Result<Response<HashKvResponse>, Status> {
         Err(Status::unimplemented(UNIMPL))
     }
 
     type SnapshotStream = SnapshotResultStream;
 
-    async fn snapshot(&self, request: Request<SnapshotRequest>) -> SnapshotResult<SnapshotResultStream> {
+    async fn snapshot(&self, _request: Request<SnapshotRequest>) -> SnapshotResult<SnapshotResultStream> {
         Err(Status::unimplemented(UNIMPL))
     }
 
-    async fn move_leader(&self, request: Request<MoveLeaderRequest>) -> Result<Response<MoveLeaderResponse>, Status> {
+    async fn move_leader(&self, _request: Request<MoveLeaderRequest>) -> Result<Response<MoveLeaderResponse>, Status> {
         Err(Status::unimplemented(UNIMPL))
     }
 

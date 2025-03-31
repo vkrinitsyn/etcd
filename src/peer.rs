@@ -1,29 +1,23 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use slog::*;
 use tokio::{
-    sync::mpsc::error::SendError,
     sync::Mutex,
-    sync::mpsc::{channel, Sender},
-    time::Instant
+    sync::mpsc::{channel},
 };
-use tonic::{ Request, Response, Status, Streaming};
+use tonic::{ Status};
+use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
-use uuid::Uuid;
 use crate::{
     etcdpb::etcdserverpb::maintenance_client::MaintenanceClient,
-    etcdpb::etcdserverpb::{CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, ResponseHeader, StatusRequest, StatusResponse, TxnRequest, TxnResponse},
-    etcdpb::etcdserverpb::lease_client::LeaseClient,
     etcdpb::etcdserverpb::kv_client::KvClient,
-    EtcdEvents,
     KvEvent,
-    cluster::{EtcdNode, EtcdPeerNodeType, NodeId},
-    srv::UNIMPL
+    cluster::{EtcdPeerNodeType, NodeId},
 };
 use crate::cli::Config;
+use crate::etcdpb::etcdserverpb::StatusRequest;
 
 /// represent cluster structure
 /// hold configs and capable to update
@@ -35,6 +29,7 @@ pub struct EtcdCluster {
     connect_timeout_ms: u64,
 
     node_id: NodeId,
+    cluster_id: NodeId,
     log: Logger,
 }
 
@@ -57,7 +52,7 @@ pub(crate) enum BroadcastRequest {
 
 impl EtcdCluster {
     /// send request to the clusters peer and get success response from more than half nodes 
-    pub(crate) async fn connect(cfg: &Config, node_id: NodeId, log: &Logger) -> std::result::Result<Self, String> {
+    pub(crate) async fn connect(cfg: &Config, node_id: NodeId, cluster_id: NodeId, log: &Logger) -> std::result::Result<Self, String> {
         let timeout_ms = cfg.election_timeout;
 
 
@@ -65,11 +60,12 @@ impl EtcdCluster {
             peers: vec![],
             connect_timeout_ms: timeout_ms as u64,
             node_id,
+            cluster_id,
             log: log.clone(),
         };
         
         // let mut urls: HashSet<String> = HashSet::from_iter(clients.iter().cloned());
-        let mut urls: HashSet<&str> = HashSet::from_iter(cfg.listen_client_urls.split(",")); //.map(|s| s.to_string()));
+        let urls: HashSet<&str> = HashSet::from_iter(cfg.listen_client_urls.split(",")); //.map(|s| s.to_string()));
         
         let mut clients: HashSet<&str> = HashSet::from_iter(cfg.initial_advertise_peer_urls.split(",")); //.map(|s| s.to_string()));
         for h in urls {
@@ -114,7 +110,7 @@ impl EtcdCluster {
                                                error!(self.log, "connecting maintenance {} - no header in response", url);
                                            }
                                            Some(s) => {
-                                               if s.cluster_id >= 0 {
+                                               if s.cluster_id == self.cluster_id {
                                                    self.peers.push(Arc::new(Mutex::new(
                                                        EtcdPeerNode {
                                                            peer_id: s.member_id,
@@ -125,7 +121,9 @@ impl EtcdCluster {
                                                        })));
                                                    cnt += 1;
                                                } else {
-                                                   error!(self.log, "connecting maintenance {} - wrong cluster", url);
+                                                   error!(self.log, "connecting maintenance {} - wrong cluster,\
+                                                    running on ClusterID [{}], but connecting node from {}", 
+                                                       url, self.cluster_id, s.cluster_id);
                                                }
                                            }
                                        }
@@ -152,13 +150,13 @@ impl EtcdCluster {
     /// send request to the clusters peer and get success response from more than half nodes 
     pub(crate) async fn broadcast(&self, request: BroadcastRequest) -> std::result::Result<(), Status> {
         let (reply, mut receiver) = channel(10);
-        let peer_id = Some(self.node_id);
-
+        let peer_id = Some(MetadataValue::from_str(self.node_id.to_string().as_str())
+            .map_err(|e| Status::invalid_argument(format!("{}", e)))?);
         for peer in self.peers.iter() {
             let reply_c = reply.clone();
             let r = request.clone();
             let p = peer.clone();
-
+            let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 let resp_ok = match r {
                     BroadcastRequest::Kv(br) => {
@@ -178,8 +176,8 @@ impl EtcdCluster {
 
         let mut received_ok = 0f32;
         let mut received_total = 0f32;
-        while (!(received_ok > total_cnt / 2f32 
-                ||  received_total >= total_cnt )) {
+        while !(received_ok > total_cnt / 2f32 
+                ||  received_total >= total_cnt ) {
             
             if let Some(ok) = receiver.recv().await {
                 received_total += 1f32;
