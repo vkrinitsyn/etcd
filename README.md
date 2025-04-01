@@ -23,8 +23,8 @@ This is an experimental Prof of Concept of the features bellow
 
 ## Supported APIs
 
-- [ ] KV (wo: filter, range, version, pagination, linearizable read)
-- [ ] Watch (wo: filter, fragment, ranges, revision)
+- [x] KV (wo: filter, range, version, pagination, linearizable read)
+- [x] Watch (wo: filter, fragment, ranges, revision)
  
 ### Low priority:
 - [ ] Lock
