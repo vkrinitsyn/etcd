@@ -33,23 +33,24 @@ pub struct Queue {
     pub(crate) fq_name: String,
 
     pub(crate) etcd: Arc<RwLock<EtcdNode>>,
-    dispatcher: Arc<RwLock<Option< crate::cluster::EtcdPeerNodeType>>>,
+    dispatcher: Arc<RwLock<Option< EtcdPeerNodeType>>>,
 
     /// store messages /queue/{q_name}/{idx}/{key}
     queue: Arc<RwLock<VecDeque<QueueMsg>>>,
+    
     /// store messages /queue/{q_name}/{idx}/{key}
     idx: Arc<AtomicU64>,
-
-    // store messages /queue/{q_name}/{idx}/{key}
-    // delivery: Arc<RwLock<VecDeque<QueueMsg>>>,
+    
+    // TODO currently handled message: 
+    // dispatched: Arc<RwLock<(ClientId, WatcherId, u64)>>
 
     /// store deliveries /queue/{q_name}/consumer/{client_id}/{idx}/{key}
     clients: Arc<RwLock<HashMap<ClientId, crate::cluster::EtcdClientType>>>,
-    
-    sender: Sender<MsgNotyfiType>,
+
+    sender: Sender<MsgNotifyType>,
 }
 
-type MsgNotyfiType = u64;
+type MsgNotifyType = u64;
 
 /// client that produce queue input  
 #[derive(Clone)]
@@ -65,6 +66,7 @@ pub struct QueueNameKey {
     /// if key is consumer, then on delete needs to delete an indexed line (AKS)
     consumer: bool,
     /// if key is producer, then on put needs move to indexed line
+    #[allow(dead_code)]
     producer: bool,
     /// if key the queue but neither consumer nor producer, then no extra work
     queue: bool,
@@ -72,15 +74,7 @@ pub struct QueueNameKey {
     client_id: Option<Uuid>,
 }
 
-/* // clients that consume a queue with a queue on a client to delivery
-pub struct Consumer {
-    client_id: ClientId,
-    /// TODO tbd?
-    // delivery: VecDeque<QueueMsg>,
-    // notify: Sender<EtcdEvents>,
-}
-*/
-
+#[allow(dead_code)]
 pub struct QueueMsg {
     /// message index (uuid?)
     idx: u64,
@@ -94,7 +88,7 @@ pub struct QueueMsg {
 
 impl From<&QueueMsg> for KeyValue {
     fn from(value: &QueueMsg) -> Self {
-        crate::etcdpb::mvccpb::KeyValue {
+        KeyValue {
             key: value.key.clone().into_bytes(),
             value: value.value.clone(), .. Default::default()
         }
@@ -139,7 +133,7 @@ impl QueueNameKey {
             input: value,
         }
     }
-    pub(crate) fn _is_queue(&self) -> bool {
+    pub(crate) fn is_queue(&self) -> bool {
         self.queue
     }
 }
@@ -155,7 +149,7 @@ impl Queue {
             None => {
                 let mut watchers = HashMap::new();
                 watchers.insert(watcher_id, WatcherConsumer { key, client} );
-                clients.insert(client_id,  Arc::new(RwLock::new(EtcdClientNode { watchers } )));
+                clients.insert(client_id,  Arc::new(RwLock::new(EtcdClientNode { client_id, watchers } )));
             }
             Some(c) => {
                 let mut watchers = c.write().await;
@@ -186,6 +180,17 @@ impl Queue {
         }.run(rsvr).await
     }
 
+    pub(crate) async fn get(&self, qn: &QueueNameKey) -> Option<KeyValue> {
+        if let Some(idx) = qn.idx {
+            for i in self.queue.read().await.iter().rev() {
+                if i.idx == idx {
+                    return Some(i.into());
+                }
+            }
+        }
+        None
+    }
+
     /// EtcdNode required to notify consumers
     pub(crate) async fn put(&self, qn: QueueNameKey, x: PutRequest, from_peer: &Option<String>) -> Result<Response<PutResponse>, Status> {
         let idx = qn.idx.unwrap_or(self.idx.fetch_add(1, Ordering::Relaxed));
@@ -212,13 +217,13 @@ impl Queue {
             let peers = self.etcd.read().await.peers.clone(); // copy smart link to peers
             let _ = peers.read().await.broadcast(BroadcastRequest::Kv(KvEvent::Put(r))).await?;
         }
-        
+
         Ok(Response::new(PutResponse::default()))
     }
 
 
     /// start a thread to dispatch a queue messages
-    async fn run(self, mut rsvr: Receiver<MsgNotyfiType>) -> Self {
+    async fn run(self, mut rsvr: Receiver<MsgNotifyType>) -> Self {
         let queue = self.clone();
         tokio::spawn(async move {
             while let Some(_r) = rsvr.recv().await {
@@ -258,11 +263,11 @@ impl Queue {
         if let Some(idx) = request.idx {
             let mut q = self.queue.write().await;
             q.retain(|v| v.idx > idx); // TODO optimize for big queue size
-            
+
         }
     }
-    
-    /// TODO queue: check if dispatcher is not available, then try become queue dispatcher AND set idx 
+
+    /// TODO queue: check if dispatcher is not available, then try become queue dispatcher AND set idx
     pub(crate) async fn dispatcher(&self) -> Option<EtcdPeerNodeType> {
         self.dispatcher.read().await.clone()
     }
@@ -330,6 +335,7 @@ impl EtcdNode {
             match watcher.get_mut(&cid) {
                 None => {
                     let mut watcher_client_writer = EtcdClientNode {
+                        client_id: cid,
                         watchers: HashMap::new(),
                     };
                     watcher_client_writer.watchers.insert(r.watch_id, c);
@@ -353,7 +359,7 @@ impl EtcdNode {
             }
         }
 
-        if let Err(e) = sender.send(Result::Ok(
+        if let Err(e) = sender.send(Ok(
             WatchResponse {
                 watch_id: r.watch_id,
                 created: true, .. Default::default()

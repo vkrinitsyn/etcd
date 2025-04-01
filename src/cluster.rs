@@ -181,10 +181,12 @@ pub(crate) type EtcdClientType = Arc<RwLock<EtcdClientNode>>;
 /// remote node info
 
 pub struct EtcdClientNode {
-    // pub(crate) watch_id: ClientId,
+    /// TODO take from auth
+    #[allow(dead_code)]
+    pub(crate) client_id: ClientId,
 
     pub(crate) watchers: HashMap<WatcherId, WatcherConsumer>,
-    // watcher notification
+    // TODO stat
     // pub(crate) stat: Histogram, //::new(Config::default())
 }
 

@@ -109,8 +109,8 @@ pub struct Config {
 
 
     /// List of this member's peer URLs to advertise to the rest of the cluster.
-    /// The URLs needed to be a comma-separated list.
-    #[arg(long, required = false, default_value = "http://localhost:2380")]
+    /// The URLs needed to be a comma-separated list: http://localhost:2380
+    #[arg(long, required = false, default_value = "")]
     pub initial_advertise_peer_urls: String,
 
     /// Comma separated string of initial cluster configuration for bootstrapping.

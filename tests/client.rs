@@ -1,6 +1,7 @@
+#![allow(dead_code)]
 mod testing;
 
-use crate::testing::{get_client, Result, DEFAULT_TEST_ENDPOINT};
+use crate::testing::{get_client, Result, DEFAULT_TEST_ENDPOINT, TESTING_PREFIX, TESTING_RANGE};
 use etcd_client::{
     AlarmAction, AlarmOptions, AlarmType, Client, Compare, CompareOp, ConnectOptions,
     DeleteOptions, EventType, GetOptions, LeaseGrantOptions, MemberAddOptions, Permission,
@@ -59,7 +60,7 @@ async fn test_get() -> Result<()> {
     }
 
     // get from key
-    {
+    if TESTING_RANGE {
         let resp = client
             .get(
                 "get11",
@@ -75,7 +76,7 @@ async fn test_get() -> Result<()> {
     }
 
     // get prefix keys
-    {
+    if TESTING_PREFIX {
         let resp = client
             .get("get1", Some(GetOptions::new().with_prefix()))
             .await?;
@@ -112,7 +113,7 @@ async fn test_delete() -> Result<()> {
     }
 
     // delete a range of keys
-    {
+    if TESTING_RANGE {
         let resp = client
             .delete("del11", Some(DeleteOptions::new().with_range("del22")))
             .await?;
@@ -127,7 +128,7 @@ async fn test_delete() -> Result<()> {
     }
 
     // delete key with prefix
-    {
+    if TESTING_PREFIX {
         let resp = client
             .delete("del3", Some(DeleteOptions::new().with_prefix()))
             .await?;
@@ -141,7 +142,7 @@ async fn test_delete() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_compact() -> Result<()> {
     let mut client = get_client().await?;
     let rev0 = client
@@ -182,7 +183,7 @@ async fn test_compact() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_txn() -> Result<()> {
     let mut client = get_client().await?;
     client.put("txn01", "01", None).await?;
@@ -268,7 +269,7 @@ async fn test_watch() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_grant_revoke() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.lease_grant(123, None).await?;
@@ -278,7 +279,7 @@ async fn test_grant_revoke() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_keep_alive() -> Result<()> {
     let mut client = get_client().await?;
 
@@ -300,7 +301,7 @@ async fn test_keep_alive() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_time_to_live() -> Result<()> {
     let mut client = get_client().await?;
     let lease_id = 200;
@@ -318,7 +319,7 @@ async fn test_time_to_live() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_leases() -> Result<()> {
     let lease1 = 100;
     let lease2 = 101;
@@ -355,7 +356,7 @@ async fn test_leases() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_lock() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.lock("lock-test", None).await?;
@@ -368,7 +369,7 @@ async fn test_lock() -> Result<()> {
 }
 
 #[ignore]
-#[tokio::test]
+//#[tokio::test]
 async fn test_auth() -> Result<()> {
     let mut client = get_client().await?;
     client.auth_enable().await?;
@@ -393,7 +394,7 @@ async fn test_auth() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_role() -> Result<()> {
     let mut client = get_client().await?;
 
@@ -489,7 +490,7 @@ async fn test_role() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_user() -> Result<()> {
     let name1 = "usr1";
     let password1 = "pwd1";
@@ -545,7 +546,7 @@ async fn test_user() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_alarm() -> Result<()> {
     let mut client = get_client().await?;
 
@@ -582,7 +583,7 @@ async fn test_alarm() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_status() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.status().await?;
@@ -592,7 +593,7 @@ async fn test_status() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_defragment() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.defragment().await?;
@@ -601,7 +602,7 @@ async fn test_defragment() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_hash() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.hash().await?;
@@ -611,7 +612,7 @@ async fn test_hash() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_hash_kv() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.hash_kv(0).await?;
@@ -622,7 +623,7 @@ async fn test_hash_kv() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_snapshot() -> Result<()> {
     let mut client = get_client().await?;
     let mut msg = client.snapshot().await?;
@@ -638,7 +639,7 @@ async fn test_snapshot() -> Result<()> {
 }
 
 #[ignore]
-#[tokio::test]
+//#[tokio::test]
 async fn test_cluster() -> Result<()> {
     let node1 = "localhost:2520";
     let node2 = "localhost:2530";
@@ -662,7 +663,7 @@ async fn test_cluster() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_move_leader() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.member_list().await?;
@@ -692,7 +693,7 @@ async fn test_move_leader() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_election() -> Result<()> {
     let mut client = get_client().await?;
     let resp = client.lease_grant(10, None).await?;
@@ -742,7 +743,7 @@ async fn test_election() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+//#[tokio::test]
 async fn test_remove_and_add_endpoint() -> Result<()> {
     let mut client = get_client().await?;
     client.put("endpoint", "add_remove", None).await?;

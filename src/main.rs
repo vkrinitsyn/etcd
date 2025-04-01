@@ -13,11 +13,7 @@ use etcd::cli::Config;
 
 use std::{fs::File, io::BufReader};
 
-use clap::{Parser,  Command};
-use std::{
-    error::Error,
-    path::PathBuf,
-};
+use clap::Parser;
 
 #[derive(RustEmbed)]
 #[folder = "i18n/"]

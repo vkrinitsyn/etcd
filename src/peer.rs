@@ -33,11 +33,12 @@ pub struct EtcdCluster {
     log: Logger,
 }
 
+#[allow(dead_code)]
 pub(crate) struct EtcdPeerNode {
-    pub(crate) peer_id: NodeId,
+    peer_id: NodeId,
     pub(crate) conn: String,
     pub(crate) kv_client: Arc<Mutex<KvClient<Channel>>>,
-    pub(crate) mt_client: Arc<Mutex<MaintenanceClient<Channel>>>,
+    mt_client: Arc<Mutex<MaintenanceClient<Channel>>>,
     // pub(crate) lease_client: Arc<Mutex<LeaseClient<Channel>>>,
     
 }
@@ -64,10 +65,10 @@ impl EtcdCluster {
             log: log.clone(),
         };
         
-        // let mut urls: HashSet<String> = HashSet::from_iter(clients.iter().cloned());
         let urls: HashSet<&str> = HashSet::from_iter(cfg.listen_client_urls.split(",")); //.map(|s| s.to_string()));
         
-        let mut clients: HashSet<&str> = HashSet::from_iter(cfg.initial_advertise_peer_urls.split(",")); //.map(|s| s.to_string()));
+        let mut clients: HashSet<&str> = HashSet::from_iter(cfg.initial_advertise_peer_urls.split(",")
+            .filter(|c| c.trim().len() > 0 && c.starts_with("http"))); //.map(|s| s.to_string()));
         for h in urls {
             if h.contains("//") {
                 clients.remove(h);
@@ -77,10 +78,12 @@ impl EtcdCluster {
         }
 
         let half = clients.len() as f32 / 2f32;
-        if cluster.add_connections(clients).await? as f32 > half {
+        let input_size = clients.len();
+        let connected = cluster.add_connections(clients).await?;
+        if input_size == 0 || connected as f32 > half {
             Ok(cluster)
         } else {
-            Err("cant connect to more than half peers".to_string())
+            Err(format!("cant connect to more than half peers [{}/{}]", connected, input_size))
         }
     }
     pub(crate) async fn add_connections(&mut self, mut clients: HashSet<&str>) -> std::result::Result<usize, String> {
@@ -122,7 +125,7 @@ impl EtcdCluster {
                                                    cnt += 1;
                                                } else {
                                                    error!(self.log, "connecting maintenance {} - wrong cluster,\
-                                                    running on ClusterID [{}], but connecting node from {}", 
+                                                    running on ClusterID [{}], but connecting node from {}",
                                                        url, self.cluster_id, s.cluster_id);
                                                }
                                            }
@@ -176,7 +179,7 @@ impl EtcdCluster {
 
         let mut received_ok = 0f32;
         let mut received_total = 0f32;
-        while !(received_ok > total_cnt / 2f32 
+        while !(received_ok > total_cnt / 2f32
                 ||  received_total >= total_cnt ) {
             
             if let Some(ok) = receiver.recv().await {
@@ -186,7 +189,7 @@ impl EtcdCluster {
                 }
             }
         }
-        if received_ok > total_cnt / 2f32 {
+        if total_cnt == 0f32 || received_ok > total_cnt / 2f32 {
             Ok(())
         } else {
             Err(Status::aborted("wont commit more than half"))

@@ -12,13 +12,21 @@ impl Kv for EtcdNode {
     /// TODO implement all variation
     async fn range(&self, request: Request<RangeRequest>) -> Result<Response<RangeResponse>, Status> {
         let r = request.into_inner();
-        
-        // let key = String::from_utf8_lossy(&r.key).to_string();
-        let mut kvs = Vec::new();
-        if let Some(x) = self.vault.read().await.get(&r.key) {
-            kvs.push(x.into());
-        }
 
+        let mut kvs = Vec::new();
+        let key = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
+        if key.is_queue() {
+            if let Some(q) = self.queues.read().await.get(&key.queue_name) {
+                if let Some(x) = q.get(&key).await {
+                    kvs.push(x.into());
+                }
+            }
+        } 
+        if kvs.is_empty() {
+            if let Some(x) = self.vault.read().await.get(&r.key) {
+                kvs.push(x.into());
+            }
+        }
         Ok(Response::new( RangeResponse {
             header: None,
             count: kvs.len() as i64,
