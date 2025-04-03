@@ -1,3 +1,4 @@
+use slog::trace;
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::kv_server::Kv;
 use crate::etcdpb::etcdserverpb::{CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse};
@@ -35,7 +36,7 @@ impl Kv for EtcdNode {
         }))
     }
 
-    /// TODO implement all variation of ignores
+    /// TODO implement all variation of Requests ignores
     /// 1. if from peer - do not send to any peers
     /// 2. else if queue producer - do not put to vault, send to queue dispatcher host
     /// 3. else if send to 
@@ -50,7 +51,7 @@ impl Kv for EtcdNode {
                         return d.lock().await.kv_client.lock().await.put(Request::new(r), None).await;
                     }
                 }
-                q.put(key, r, &from_peer).await
+                q.put(key, r, &from_peer, &self.log).await
             }
             Err(()) => { // not a queue producer
                 let kv: kv::Kv = r.clone().into();
@@ -78,13 +79,14 @@ impl Kv for EtcdNode {
     async fn delete_range(&self, request: Request<DeleteRangeRequest>) -> Result<Response<DeleteRangeResponse>, Status> {
         let from_peer = peer(request.metadata());
         let r = request.into_inner();
+        trace!(self.log, "remove request {} ", String::from_utf8_lossy(&r.key));
 
         let x = self.vault.write().await.remove(&r.key);
         let deleted = if x.is_some() { 1 } else { 0 };
 
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         if let Some(q) = self.queues.read().await.get(&qn.queue_name) {
-            let _ = q.delete(&qn, &from_peer).await;
+            let _ = q.delete(&qn, &from_peer, &self.log).await;
         }
 
         if from_peer.is_none() {

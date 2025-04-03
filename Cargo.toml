@@ -44,8 +44,8 @@ uuid = { version = "1.16.0", features = ["v4"] }
 rsa = "0.10.0-pre.4"
 rand = "0.8.5"
 
-[features]
-tls = ["tonic/tls"]
+#[features]
+#tls = ["tonic/tls"]
 #tls-openssl = ["openssl", "hyper-openssl", "hyper", "hyper-util"]
 #tls-openssl-vendored = ["tls-openssl", "openssl/vendored"]
 #tls-roots = ["tls", "tonic/tls-roots"]

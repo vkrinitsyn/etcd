@@ -4,7 +4,7 @@ use crate::{KvEvent};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use slog::warn;
+use slog::{debug, info, trace, warn, Logger};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
@@ -37,11 +37,11 @@ pub struct Queue {
 
     /// store messages /queue/{q_name}/{idx}/{key}
     queue: Arc<RwLock<VecDeque<QueueMsg>>>,
-    
+
     /// store messages /queue/{q_name}/{idx}/{key}
     idx: Arc<AtomicU64>,
-    
-    // TODO currently handled message: 
+
+    // TODO currently handled message:
     // dispatched: Arc<RwLock<(ClientId, WatcherId, u64)>>
 
     /// store deliveries /queue/{q_name}/consumer/{client_id}/{idx}/{key}
@@ -53,7 +53,7 @@ pub struct Queue {
 type MsgNotifyType = u64;
 
 /// client that produce queue input  
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QueueNameKey {
     /// copy of original key as string
     input: String,
@@ -61,6 +61,8 @@ pub struct QueueNameKey {
     prefix: String,
     /// the name after prefix
     pub(crate) queue_name: String,
+    /// key after /{idx}/, or /producer/
+    tail: String,
     /// if received and indexed msg, then must be from dispatcher to keep a copy until delivered
     idx: Option<u64>,
     /// if key is consumer, then on delete needs to delete an indexed line (AKS)
@@ -75,6 +77,7 @@ pub struct QueueNameKey {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub struct QueueMsg {
     /// message index (uuid?)
     idx: u64,
@@ -125,6 +128,7 @@ impl QueueNameKey {
         QueueNameKey {
             prefix:  names.get(1).map(|v| v.to_string()).unwrap_or("".to_string()),
             queue_name: names.get(2).map(|v| v.to_string()).unwrap_or("".to_string()),
+            tail: names.get(if consumer { 6 } else { 4 }).map(|v| v.to_string()).unwrap_or("".to_string()),
             idx: names.get(if consumer { 5 } else { 3 }).unwrap_or(&"").parse::<u64>().ok(),
             consumer,
             producer,
@@ -192,11 +196,11 @@ impl Queue {
     }
 
     /// EtcdNode required to notify consumers
-    pub(crate) async fn put(&self, qn: QueueNameKey, x: PutRequest, from_peer: &Option<String>) -> Result<Response<PutResponse>, Status> {
+    pub(crate) async fn put(&self, qn: QueueNameKey, x: PutRequest, from_peer: &Option<String>, _log: &Logger) -> Result<Response<PutResponse>, Status> {
         let idx = qn.idx.unwrap_or(self.idx.fetch_add(1, Ordering::Relaxed));
         let msg = QueueMsg {
             idx,
-            key: if from_peer.is_some() { qn.input.clone() }else{format!("{}/{}/{}", self.fq_name, idx, qn.input)},
+            key: if from_peer.is_some() { qn.input.clone() }else{format!("{}/{}/{}", self.fq_name, idx, qn.tail)},
             value: x.value.clone(),
             created: Instant::now(),
             handled_by: None,
@@ -224,11 +228,16 @@ impl Queue {
 
     /// start a thread to dispatch a queue messages
     async fn run(self, mut rsvr: Receiver<MsgNotifyType>) -> Self {
+        let log = self.etcd.read().await.log.clone();
         let queue = self.clone();
         tokio::spawn(async move {
-            while let Some(_r) = rsvr.recv().await {
-                while let Some(x) = queue.queue.read().await.back() {
+            while let Some(r) = rsvr.recv().await {
+                if let Some(x) = queue.queue.read().await.back() {
+                    if x.idx > 0 && r != x.idx { continue; }
+                    trace!(log, "dispatch {} [{}]", x.key, queue.queue.read().await.len());
                     // TODO queue: implement picking best consumer strategy
+                    // TODO queue: implement dead queue - self send a message after a while, check timeout and remove
+                    
                     if let Some((_cid, c)) = queue.clients.read().await.iter().next() {
                         if let Some((wid, w)) = c.read().await.watchers.iter().next() {
                             if let Err(_e) = w.client.send(Ok(WatchResponse {
@@ -259,12 +268,14 @@ impl Queue {
 
 
     // TODO queue: - implement queue acknowledge auth, allow only logged in clientId to cleanup only his dispatcher message
-    pub(crate) async fn delete(&self, request: &QueueNameKey, _from_peer: &Option<String>) {
-        if let Some(idx) = request.idx {
+    pub(crate) async fn delete(&self, request: &QueueNameKey, _from_peer: &Option<String>, log: &Logger) {
+        let q = if let Some(idx) = request.idx {
             let mut q = self.queue.write().await;
             q.retain(|v| v.idx > idx); // TODO optimize for big queue size
-
-        }
+            q.len() as i64
+        } else {-1};
+        trace!(log, "removed# {:?} queue size: [{}]", request.idx, q);
+        let _ = self.sender.send(0).await;
     }
 
     /// TODO queue: check if dispatcher is not available, then try become queue dispatcher AND set idx
@@ -305,6 +316,7 @@ impl EtcdNode {
     pub(crate) async fn create_watcher(&self, r: WatchCreateRequest, cid: Uuid, sender: Sender<Result<WatchResponse, Status>>) -> ClientId {
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         let cid = qn.client_id.unwrap_or(cid);
+        info!(self.log, "Create watcher for client: {}, WatchID:{}", cid, r.watch_id);
         if qn.consumer {
             let mut queue_map = self.queues.write().await;
             match queue_map.get_mut(&qn.queue_name) {
@@ -370,25 +382,21 @@ impl EtcdNode {
         cid
     }
 
-    pub(crate) async fn remove_watcher(&self, r: WatchCancelRequest, cid: ClientId, sender: Sender<Result<WatchResponse, Status>>) {
-        let mut canceled = false;
-
+    pub(crate) async fn remove_watcher(&self, r: WatchCancelRequest, cid: ClientId) {
         if let Some(c) =  self.watchers.write().await.get_mut(&cid) {
+            trace!(self.log, "CancelRequest watching by client: {} of [{}] watchers", cid, c.read().await.watchers.len());
             if let Some(w) = c.write().await.watchers.remove(&r.watch_id) {
                 if let Some(o) = self.observers.write().await.get_mut(&w.key) {
                     o.retain(|(o_cid, o_wid)| !(o_cid == &cid && o_wid == &r.watch_id));
                 }
-                canceled = true;
-            }
-        }
+                debug!(self.log, "CancelRequest watching: {} {}", cid, r.watch_id);
 
-        if let Err(e) = sender.send(Ok(
-            WatchResponse {
-                watch_id: r.watch_id,
-                canceled, .. Default::default()
+                if let Err(e) = w.client.send(Ok(
+                    WatchResponse { watch_id: r.watch_id, canceled: true, .. Default::default() }
+                )).await {
+                    warn!(self.log, "Cancel watcher: {}", e);
+                }
             }
-        )).await {
-            warn!(self.log, "Cancel watcher: {}", e);
         }
     }
 

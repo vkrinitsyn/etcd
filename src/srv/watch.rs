@@ -6,7 +6,7 @@ use crate::etcdpb::etcdserverpb::{
 };
 use std::pin::Pin;
 use std::vec;
-use slog::warn;
+use slog::{info, warn};
 use tokio::sync::{mpsc};
 use tokio::sync::mpsc::{Receiver};
 use tokio_stream::{Stream, StreamExt};
@@ -23,13 +23,14 @@ impl EtcdNode {
     pub(crate) async fn watch_notify(&self, mut receiver: Receiver<crate::kv::Kv>) {
         let observers = self.observers.clone();
         let watchers = self.watchers.clone();
-        let _log = self.log.clone();
+        let log = self.log.clone();
         tokio::spawn(async move {
             while let Some(kv) = receiver.recv().await {
                 if let Some(v) = observers.read().await.get(&kv.key).map(|v| v.clone()) {
                     for (cid, wid) in v { // expected watcher per client
                         if let Some(client_watcher) = watchers.read().await.get(&cid) {
                             if let Some(client) = client_watcher.read().await.watchers.get(&wid) {
+                                info!(log, "watch notify: {}", String::from_utf8_lossy(&kv.key));
                                 if let Err(_e) = client.client.send(Ok(
                                     WatchResponse {
                                         header: None,
@@ -78,9 +79,10 @@ impl Watch for EtcdNode {
                                     cid = etcd.create_watcher(r, cid, sender.clone()).await;
                                 }
                                 RequestUnion::CancelRequest(r) => {
-                                    let _ = etcd.remove_watcher(r, cid, sender.clone()).await;
+                                    let _ = etcd.remove_watcher(r, cid).await;
                                 }
                                 RequestUnion::ProgressRequest(_r) => {
+                                    info!(etcd.log, "Progress watcher: {}", cid);
                                     if let Err(e) = sender.send(Result::Err(Status::ok("progress"))).await {
                                         warn!(etcd.log, "Progress watcher: {}", e);
                                     }
@@ -89,11 +91,11 @@ impl Watch for EtcdNode {
                         }
                     }
                     Err(e) => {
-                        warn!(etcd.log, "watcher: {}", e);
-                        break;
+                        warn!(etcd.log, "watcher [{}]: {}", cid, e.message());
                     }
                 }
             }
+            info!(etcd.log, "end watching: {}", cid);
         });
 
         let output_stream = ReceiverStream::new(receiver);

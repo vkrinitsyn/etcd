@@ -8,7 +8,7 @@
 OR
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
  
-An Server implementation of a [etcd](https://github.com/etcd-io/etcd) v3 API client on Rust.
+Server implementation of a [etcd](https://github.com/etcd-io/etcd) v3 API client on Rust.
 It provides asynchronous client backed by [tokio](https://github.com/tokio-rs/tokio)
 and [tonic](https://github.com/hyperium/tonic).
 
