@@ -1,4 +1,11 @@
-use crate::cli::Config;
+
+use i18n_embed::{
+    fluent::{fluent_language_loader, FluentLanguageLoader},
+    LanguageLoader,
+};
+use rust_embed::RustEmbed;
+use lazy_static::lazy_static;
+use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest};
 
 pub mod etcdpb;
@@ -8,6 +15,31 @@ mod srv;
 mod queue;
 mod kv;
 mod peer;
+
+#[derive(RustEmbed)]
+#[folder = "i18n/"]
+pub struct Localizations;
+
+lazy_static! {
+    static ref LANGUAGE_LOADER: FluentLanguageLoader = {
+		let loader: FluentLanguageLoader = fluent_language_loader!();
+		loader
+		.load_languages(&Localizations, &[loader.fallback_language().to_owned()])
+		.unwrap();
+		loader
+    };
+}
+
+#[macro_export]
+macro_rules! fl {
+    ($message_id:literal) => {{
+        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id)
+    }};
+
+    ($message_id:literal, $($args:expr),*) => {{
+        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id, $($args), *)
+    }};
+}
 
 /// Etcd reconfiguration and integration events
 #[derive(Clone)]
@@ -21,7 +53,7 @@ pub enum EtcdEvents {
 #[derive(Clone)]
 pub enum EtcdMgmtEvent {
     /// runtime reconfigure event
-    Config(Config),
+    Config(EtcdConfig),
     /// Node management event to stop 
     Stop,
     /// Node management event to soft restart 

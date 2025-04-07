@@ -1,10 +1,11 @@
-use crate::cli::Config;
+use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::kv_server::{Kv, KvServer};
 use crate::queue::{Queue};
 use crate::{EtcdEvents, KvEvent};
 use slog::{info, Logger};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -25,8 +26,13 @@ pub(crate) use crate::peer::EtcdPeerNode;
 
 
 impl EtcdNode {
-    pub async fn init(cfg: Config, log: Logger) -> Result<Self, String> {
-        let (a, b) = Uuid::new_v4().as_u64_pair(); // TODO use node id from env
+    pub async fn init(cfg: EtcdConfig, log: Logger) -> Result<Self, String> {
+        let (a, b) = if cfg.node.len() > 0 {
+            Uuid::from_str(cfg.node.as_str())
+                .map_err(|e| format!("parsing to uuid: {}: {}", cfg.node, e))?
+        } else {
+            Uuid::new_v4()
+        }.as_u64_pair();
         let node_id = a^b; 
         let cluster = EtcdCluster::connect(&cfg, node_id, 0, &log).await?;
 
@@ -155,7 +161,7 @@ pub type WatcherId = i64;
 #[derive(Clone)]
 pub struct EtcdNode {
     pub(crate) node_id: NodeId,
-    pub(crate) cfg: Arc<RwLock<Config>>,
+    pub(crate) cfg: Arc<RwLock<EtcdConfig>>,
     pub(crate) vault: Arc<RwLock<HashMap<KvKey, crate::kv::Kv>>>,
     pub(crate) queues: Arc<RwLock<HashMap<String, Queue>>>,
 

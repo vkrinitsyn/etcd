@@ -16,7 +16,7 @@ use crate::{
     KvEvent,
     cluster::{EtcdPeerNodeType, NodeId},
 };
-use crate::cli::Config;
+use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::StatusRequest;
 
 /// represent cluster structure
@@ -53,7 +53,7 @@ pub(crate) enum BroadcastRequest {
 
 impl EtcdCluster {
     /// send request to the clusters peer and get success response from more than half nodes 
-    pub(crate) async fn connect(cfg: &Config, node_id: NodeId, cluster_id: NodeId, log: &Logger) -> std::result::Result<Self, String> {
+    pub(crate) async fn connect(cfg: &EtcdConfig, node_id: NodeId, cluster_id: NodeId, log: &Logger) -> std::result::Result<Self, String> {
         let timeout_ms = cfg.election_timeout;
 
 

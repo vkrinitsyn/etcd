@@ -1,3 +1,5 @@
+use std::io::{BufReader, Read};
+use clap::Parser;
 use clap_serde_derive::{
     clap::{self},
     serde::Serialize,
@@ -5,7 +7,13 @@ use clap_serde_derive::{
 };
 
 #[derive(ClapSerde, Clone)]
-pub struct Config {
+pub struct EtcdConfig {
+    /// Node UUID
+    #[arg(long, required = false, default_value = "")]
+    pub node : String,
+
+// all fields bellow copied from etcd configuration
+
     /// Human-readable name for this member.
     #[arg(long, required = false, default_value = "default")]
     pub name: String,
@@ -407,5 +415,29 @@ pub struct ClientConfig {
     #[arg(long, default_value = "false")]
     auto_tls: bool
 
+}
+
+#[derive(Parser)]
+// author, version, about,
+#[command(after_help = "https://etcd.io/docs/v3.5/op-guide/configuration/")]
+pub struct EtcdCliArgs {
+    /// Input files
+    input: Vec<std::path::PathBuf>,
+
+    /// Config file
+    #[arg(long = "config", default_value = "config.yml")]
+    pub config_path: std::path::PathBuf,
+
+    /// Rest of arguments
+    #[command(flatten)]
+    pub config: <EtcdConfig as ClapSerde>::Opt,
+}
+
+impl EtcdCliArgs {
+    pub fn parse_from<R: Read>(&mut self, input: BufReader<R>) -> Result<EtcdConfig, String> {
+        serde_yaml::from_reader::<_, <EtcdConfig as ClapSerde>::Opt>(input)
+            .map_err(|e| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e)) 
+            .map(|config| EtcdConfig::from(config).merge(&mut self.config))
+    }
 }
 

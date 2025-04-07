@@ -3,68 +3,27 @@
 #[macro_use]
 extern crate slog;
 
-use i18n_embed::{
-    fluent::{fluent_language_loader, FluentLanguageLoader},
-    LanguageLoader,
-};
-use rust_embed::RustEmbed;
-use etcd::cli::Config;
-
-
+use etcd::cli::{EtcdCliArgs, EtcdConfig};
 use std::{fs::File, io::BufReader};
-
 use clap::Parser;
-
-#[derive(RustEmbed)]
-#[folder = "i18n/"]
-struct Localizations;
-
-use clap_serde_derive::ClapSerde;
-use lazy_static::lazy_static;
 use slog::Logger;
 use sloggers::Build;
 use sloggers::terminal::{Destination, TerminalLoggerBuilder};
 use sloggers::types::{Severity, SourceLocation};
-use etcd::cluster::{ EtcdNode};
+use etcd::cluster::EtcdNode;
 
-lazy_static! {
-    static ref LANGUAGE_LOADER: FluentLanguageLoader = {
-		let loader: FluentLanguageLoader = fluent_language_loader!();
-		loader
-		.load_languages(&Localizations, &[loader.fallback_language().to_owned()])
-		.unwrap();
-		loader
-    };
-}
-
-#[macro_export]
-macro_rules! fl {
-    ($message_id:literal) => {{
-        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id)
-    }};
-
-    ($message_id:literal, $($args:expr),*) => {{
-        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id, $($args), *)
-    }};
-}
-
-
+/// etcd standalone entry point
 #[tokio::main]
 async fn main() -> Result<(), String> {
     // Parse whole args with clap
-    let mut args = Args::parse();
-    
+    let mut args = EtcdCliArgs::parse();
+   
     // Get config file
     let config = if let Ok(f) = File::open(&args.config_path) {
-        // Parse config with serde
-        match serde_yaml::from_reader::<_, <Config as ClapSerde>::Opt>(BufReader::new(f)) {
-            // merge config already parsed from clap
-            Ok(config) => Config::from(config).merge(&mut args.config),
-            Err(err) => panic!("Error in configuration file:\n{}", err),
-        }
+        args.parse_from(BufReader::new(f))?
     } else {
         // If there is not config file return only config parsed from clap
-        Config::from(&mut args.config)
+        EtcdConfig::from(&mut args.config)
     };
     let log = logger(&config);
     let c = EtcdNode::init(config, log.clone()).await?;
@@ -112,7 +71,7 @@ pub fn exit_with_msg(log: Logger, msg: String, code: i32) -> ! {
     std::process::exit(code);
 }
 
-pub fn logger(cfg: &Config) -> Logger {
+pub fn logger(cfg: &EtcdConfig) -> Logger {
 
     let mut builder = TerminalLoggerBuilder::new();
     builder.channel_size(10240);
@@ -138,21 +97,5 @@ fn severity_from_string(severity: &String) -> Severity {
         "trace" => Severity::Trace,
         _ => Severity::Critical,
     }
-}
-
-#[derive(Parser)]
-// author, version, about,
-#[command(after_help = "https://etcd.io/docs/v3.5/op-guide/configuration/")]
-struct Args {
-    /// Input files
-    input: Vec<std::path::PathBuf>,
-
-    /// Config file
-    #[arg(long = "config", default_value = "config.yml")]
-    config_path: std::path::PathBuf,
-
-    /// Rest of arguments
-    #[command(flatten)]
-    pub config: <Config as ClapSerde>::Opt,
 }
 
