@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use clap::Parser;
 use clap_serde_derive::{
@@ -6,11 +7,15 @@ use clap_serde_derive::{
     ClapSerde,
 };
 
-#[derive(ClapSerde, Clone)]
+#[derive(ClapSerde, Clone, Debug)]
 pub struct EtcdConfig {
     /// Node UUID
     #[arg(long, required = false, default_value = "")]
     pub node : String,
+
+    /// Cluster UUID
+    #[arg(long, required = false, default_value = "")]
+    pub cluster: String,
 
 // all fields bellow copied from etcd configuration
 
@@ -441,3 +446,18 @@ impl EtcdCliArgs {
     }
 }
 
+impl EtcdConfig {
+    pub fn peers(&self) -> HashSet<&str> {
+        let urls: HashSet<&str> = HashSet::from_iter(self.listen_client_urls.split(","));
+        let mut clients: HashSet<&str> = HashSet::from_iter(self.initial_advertise_peer_urls.split(",")
+            .filter(|c| c.trim().len() > 0 && c.starts_with("http")));
+        for h in urls {
+            if h.contains("//") {
+                clients.remove(h);
+            } else {
+                clients.remove(format!("http:://{}",h).as_str());
+            }
+        }
+        clients
+    }
+}

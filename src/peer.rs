@@ -65,27 +65,17 @@ impl EtcdCluster {
             log: log.clone(),
         };
         
-        let urls: HashSet<&str> = HashSet::from_iter(cfg.listen_client_urls.split(",")); //.map(|s| s.to_string()));
-        
-        let mut clients: HashSet<&str> = HashSet::from_iter(cfg.initial_advertise_peer_urls.split(",")
-            .filter(|c| c.trim().len() > 0 && c.starts_with("http"))); //.map(|s| s.to_string()));
-        for h in urls {
-            if h.contains("//") {
-                clients.remove(h);
-            } else {
-                clients.remove(format!("http:://{}",h).as_str());
-            }
-        }
-
-        let half = clients.len() as f32 / 2f32;
-        let input_size = clients.len();
-        let connected = cluster.add_connections(clients).await?;
+        let peers = cfg.peers();
+        let half = peers.len() as f32 / 2f32;
+        let input_size = peers.len();
+        let connected = cluster.add_connections(peers).await?;
         if input_size == 0 || connected as f32 > half {
             Ok(cluster)
         } else {
             Err(format!("cant connect to more than half peers [{}/{}]", connected, input_size))
         }
     }
+    
     pub(crate) async fn add_connections(&mut self, mut clients: HashSet<&str>) -> std::result::Result<usize, String> {
         let connect_timeout_ms = self.connect_timeout_ms;
         for p in &self.peers {

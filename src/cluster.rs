@@ -1,8 +1,8 @@
 use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::kv_server::{Kv, KvServer};
 use crate::queue::{Queue};
-use crate::{EtcdEvents, KvEvent};
-use slog::{info, Logger};
+use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
+use slog::{error, info, Logger};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -27,16 +27,10 @@ pub(crate) use crate::peer::EtcdPeerNode;
 
 impl EtcdNode {
     pub async fn init(cfg: EtcdConfig, log: Logger) -> Result<Self, String> {
-        let (a, b) = if cfg.node.len() > 0 {
-            Uuid::from_str(cfg.node.as_str())
-                .map_err(|e| format!("parsing to uuid: {}: {}", cfg.node, e))?
-        } else {
-            Uuid::new_v4()
-        }.as_u64_pair();
-        let node_id = a^b; 
-        let cluster = EtcdCluster::connect(&cfg, node_id, 0, &log).await?;
+        let node_id = parse_uuid(&cfg.node)?; 
+        let cluster = EtcdCluster::connect(&cfg, node_id, parse_uuid(&cfg.cluster)?, &log).await?;
 
-        let (_sender, mut rsvr) = mpsc::channel(10);
+        let (event, mut rsvr) = mpsc::channel(10);
         let (watcher, watcher_rv) = mpsc::channel(10);
 
         let c = EtcdNode {
@@ -47,7 +41,8 @@ impl EtcdNode {
             watchers: Arc::new(Default::default()),
             watch_notify: watcher,
             peers: Arc::new(RwLock::new(cluster)),
-            node_id, 
+            node_id,
+            event,
             log: log.clone(),
         };
         c.watch_notify(watcher_rv).await;
@@ -67,8 +62,14 @@ impl EtcdNode {
                             let _ = grpc_client.txn(tonic::Request::new(kv)).await;
                         }
                     }
-                    EtcdEvents::Mgmt(_e) => {
-                        // todo! send EtcdMgmtEvent to main working loop
+                    EtcdEvents::Mgmt(e) => match e {
+                        EtcdMgmtEvent::Config(c) => {
+                            let _ = grpc_client.reconfigure(c).await;
+                        }
+                        e @ _ => {
+                            // TODO
+                            error!(grpc_client.log, "Not implemented: {:?}", e);
+                        }
                     }
                 }
             }
@@ -148,7 +149,17 @@ impl EtcdNode {
             .add_service(LeaseServer::new(self.clone()))
     }
 
-
+    async fn reconfigure(&self, cfg: EtcdConfig) {
+        let peers = cfg.peers();
+        match self.peers.write().await.add_connections(peers).await {
+            Ok(cnt) => if cnt > 0 {
+                self.cfg.write().await.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
+            },
+            Err(e) => {
+                error!(self.log, "Error adding peers: {}", e);
+            }
+        }
+    }
 }
 
 pub type KvKey = Vec<u8>;
@@ -174,7 +185,7 @@ pub struct EtcdNode {
 
     /// cluster nodes (not clients, see node watchers for clients)
     pub(crate) peers: Arc<RwLock<EtcdCluster>>,
-
+    pub(crate) event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
 
 }
@@ -205,7 +216,12 @@ pub struct WatcherConsumer {
 
 
 #[inline]
-fn _uuid() -> String {
-    let x = Uuid::new_v4();
-    x.hyphenated().to_string()[..8].into()
+fn parse_uuid(value: &String) -> Result<u64, String> {
+    let (a, b) = if value.len() > 0 {
+        Uuid::from_str(value.as_str())
+            .map_err(|e| format!("parsing to uuid: [{}]: {}", value, e))?
+    } else {
+        Uuid::new_v4()
+    }.as_u64_pair();
+    Ok(a^b)
 }

@@ -50,7 +50,7 @@ pub enum EtcdEvents {
     Mgmt(EtcdMgmtEvent),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum EtcdMgmtEvent {
     /// runtime reconfigure event
     Config(EtcdConfig),

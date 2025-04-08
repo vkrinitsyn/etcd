@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status};
@@ -121,8 +122,12 @@ impl Auth for EtcdNode {
 
 #[async_trait]
 impl Cluster for EtcdNode {
-    async fn member_add(&self, _request: Request<MemberAddRequest>) -> Result<Response<MemberAddResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+    async fn member_add(&self, request: Request<MemberAddRequest>) -> Result<Response<MemberAddResponse>, Status> {
+        let ma = request.into_inner();
+        let peers: HashSet<&str> = HashSet::from_iter(ma.peer_ur_ls.iter().map(|p| p.as_str()));
+        self.peers.write().await.add_connections(peers).await
+            .map(|_r| Response::new(MemberAddResponse::default()))
+            .map_err(|e| Status::invalid_argument(e))
     }
 
     async fn member_remove(&self, _request: Request<MemberRemoveRequest>) -> Result<Response<MemberRemoveResponse>, Status> {
