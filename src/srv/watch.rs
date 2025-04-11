@@ -1,4 +1,4 @@
-use crate::cluster::{EtcdNode};
+use crate::cluster::{EtcdNode, WatcherId};
 use crate::etcdpb::etcdserverpb::watch_server::Watch;
 use crate::etcdpb::etcdserverpb::{
     WatchRequest,
@@ -6,9 +6,9 @@ use crate::etcdpb::etcdserverpb::{
 };
 use std::pin::Pin;
 use std::vec;
-use slog::{info, warn};
+use slog::{debug, info, warn};
 use tokio::sync::{mpsc};
-use tokio::sync::mpsc::{Receiver};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Request, Response, Status, Streaming};
@@ -73,22 +73,7 @@ impl Watch for EtcdNode {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(r) => {
-                        if let Some(rx) = r.request_union {
-                            match rx {
-                                RequestUnion::CreateRequest(r) => {
-                                    cid = etcd.create_watcher(r, cid, sender.clone()).await;
-                                }
-                                RequestUnion::CancelRequest(r) => {
-                                    let _ = etcd.remove_watcher(r, cid).await;
-                                }
-                                RequestUnion::ProgressRequest(_r) => {
-                                    info!(etcd.log, "Progress watcher: {}", cid);
-                                    if let Err(e) = sender.send(Result::Err(Status::ok("progress"))).await {
-                                        warn!(etcd.log, "Progress watcher: {}", e);
-                                    }
-                                }
-                            }
-                        }
+                        cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
                     }
                     Err(e) => {
                         warn!(etcd.log, "watcher [{}]: {}", cid, e.message());
@@ -102,3 +87,53 @@ impl Watch for EtcdNode {
         Ok(Response::new(Box::pin(output_stream) as Self::WatchStream))
     }
 }
+
+impl EtcdNode {
+    /// use as library watcher entry point
+    pub async fn new_watcher(&self, mut stream: Receiver<WatchRequest>, sender: WatchSender, client_id: &Uuid) {
+        let etcd = self.clone();
+        let mut cid = client_id.clone();
+
+        tokio::spawn(async move {
+            while let Some(r) = stream.recv().await {
+                cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
+            }
+            info!(etcd.log, "end watching: {}", cid);
+        });
+    }
+
+    async fn handle_watch_request(&self, request: Option<RequestUnion>, sender: &WatchSender, cid: &Uuid) -> Uuid {
+        if let Some(rx) = request {
+            match rx {
+                RequestUnion::CreateRequest(r) => {
+                    return self.create_watcher(r, cid.clone(), sender.clone()).await;
+                }
+                RequestUnion::CancelRequest(r) => {
+                    let _ = self.remove_watcher(r, cid.clone()).await;
+                }
+                RequestUnion::ProgressRequest(_r) => {
+                    let watchers = self.list_watchers(cid).await;
+                    debug!(self.log, "Progress watcher: {}", cid);
+                    if let Err(e) = sender.send(Ok(
+                            WatchResponse {
+                                watch_id: *watchers.get(0).unwrap_or(&0),
+                                fragment: watchers.len() > 1, ..Default::default()
+                            }
+                        )
+                    ).await {
+                        warn!(self.log, "Progress watcher: {}", e);
+                    }
+                }
+            }
+        }
+        cid.clone()
+    }
+    
+    async fn list_watchers(&self, cid: &Uuid) -> Vec<WatcherId> {
+        match self.watchers.read().await.get(cid) {
+            None => vec![],
+            Some(w) => w.read().await.watchers.keys().map(|e| *e).collect()
+        }
+    }
+}
+pub type WatchSender = Sender<Result<WatchResponse, Status>>;

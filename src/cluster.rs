@@ -185,7 +185,7 @@ pub struct EtcdNode {
 
     /// cluster nodes (not clients, see node watchers for clients)
     pub(crate) peers: Arc<RwLock<EtcdCluster>>,
-    pub(crate) event: Sender<EtcdEvents>,
+    pub event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
 
 }
