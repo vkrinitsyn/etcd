@@ -12,8 +12,8 @@ pub mod etcdpb;
 pub mod cli;
 pub mod cluster;
 mod srv;
-mod queue;
-mod kv;
+pub mod queue;
+pub mod kv;
 mod peer;
 
 #[derive(RustEmbed)]
