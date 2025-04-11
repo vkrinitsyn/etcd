@@ -110,7 +110,7 @@ impl QueueNameKey {
 
     /// store deliveries /queue/{q_name}
     #[inline]
-    pub(crate) fn new(value: String) -> Self {
+    pub fn new(value: String) -> Self {
         let names: Vec<&str> = value.split("/").collect();
         let queue = names.len() > 2 && names.get(1)
             .map(|v| v.trim().len() > 0 && *v == Self::Q1 || *v == Self::Q).unwrap_or(false);
