@@ -15,6 +15,7 @@ use tonic::{async_trait, Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::etcdpb::etcdserverpb::watch_request::RequestUnion;
 use crate::etcdpb::mvccpb::{Event};
+use crate::WatchSender;
 
 type WatchResult<T> = Result<Response<T>, Status>;
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
@@ -136,4 +137,3 @@ impl EtcdNode {
         }
     }
 }
-pub type WatchSender = Sender<Result<WatchResponse, Status>>;

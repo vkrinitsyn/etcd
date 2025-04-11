@@ -5,8 +5,10 @@ use i18n_embed::{
 };
 use rust_embed::RustEmbed;
 use lazy_static::lazy_static;
+use tokio::sync::mpsc::Sender;
+use tonic::Status;
 use crate::cli::EtcdConfig;
-use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest};
+use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest, WatchResponse};
 
 pub mod etcdpb;
 pub mod cli;
@@ -40,6 +42,8 @@ macro_rules! fl {
         i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id, $($args), *)
     }};
 }
+
+pub type WatchSender = Sender<Result<WatchResponse, Status>>;
 
 /// Etcd reconfiguration and integration events
 #[derive(Clone)]
