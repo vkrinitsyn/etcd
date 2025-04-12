@@ -137,7 +137,7 @@ impl QueueNameKey {
             input: value,
         }
     }
-    pub(crate) fn is_queue(&self) -> bool {
+    pub fn is_queue(&self) -> bool {
         self.queue
     }
 }
