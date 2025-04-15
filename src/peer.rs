@@ -140,7 +140,8 @@ impl EtcdCluster {
         Ok(cnt)
     }
 
-    /// send request to the clusters peer and get success response from more than half nodes 
+    /// send request to the clusters peer and get success response from more than half nodes
+    // TODO use stream  for broadcasting to cluster peers
     pub(crate) async fn broadcast(&self, request: BroadcastRequest) -> std::result::Result<(), Status> {
         let (reply, mut receiver) = channel(10);
         let peer_id = Some(MetadataValue::from_str(self.node_id.to_string().as_str())
@@ -185,4 +186,13 @@ impl EtcdCluster {
             Err(Status::aborted("wont commit more than half"))
         }
     }
+    
+    pub(crate) async fn peer_urls(&self) -> String {
+        let mut peers = Vec::new();
+        for p in &self.peers {
+            peers.push(p.lock().await.conn.clone());
+        }
+        peers.join(",")
+    }
+    
 }

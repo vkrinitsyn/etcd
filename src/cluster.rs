@@ -27,7 +27,7 @@ pub(crate) use crate::peer::EtcdPeerNode;
 
 impl EtcdNode {
     pub async fn init(cfg: EtcdConfig, log: Logger) -> Result<Self, String> {
-        let node_id = parse_uuid(&cfg.node)?; 
+        let node_id = parse_uuid(&cfg.node)?;
         let cluster = EtcdCluster::connect(&cfg, node_id, parse_uuid(&cfg.cluster)?, &log).await?;
 
         let (event, mut rsvr) = mpsc::channel(10);
@@ -85,9 +85,9 @@ impl EtcdNode {
         let mut srv = Server::builder();
 
         let srv = self.add_services(srv.add_service(AuthServer::new(self.clone())), false);
-        
+
         let addrs = self.cfg.read().await.listen_client_urls.clone();
-        let addrsv:Vec<&str> = addrs.split(",").collect();
+        let addrsv: Vec<&str> = addrs.split(",").collect();
         let adr: Vec<&str> = if addrsv[0].starts_with("http") {
             let url: Vec<&str> = addrsv[0].split("//").collect();
             url[1].split(":").collect()
@@ -125,7 +125,7 @@ impl EtcdNode {
                 }
             }
         });
-        
+
         Ok(())
     }
 
@@ -160,6 +160,12 @@ impl EtcdNode {
             }
         }
     }
+
+    /// return current cluster connections
+    pub async fn get_peer_urls(&self) -> String {
+        self.peers.read().await.peer_urls().await
+    }
+
 }
 
 pub type KvKey = Vec<u8>;

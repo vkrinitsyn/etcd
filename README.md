@@ -17,9 +17,10 @@ and [tonic](https://github.com/hyperium/tonic).
 This is an experimental Prof of Concept of the features bellow
 
 ## Features
-- etcd API v3 compatible client using protobuf
-- priority is a PoC [queue](queue.md) implementation with order and delivery consumer guarantee
+- etcd API v3 compatible client using protobuf to leverage existing ecosystem
+- priority is a [queue](https://github.com/vkrinitsyn/etcd/blob/main/queue.md#etcd-based-queue) implementation with order and delivery guarantee
 - no message storage, cluster election, as use another cluster implementation
+- ability to build into another rust application as a component, see [rppd](https://github.com/vkrinitsyn/rppd?tab=readme-ov-file#rppd---rust-python-postgres-discovery)
 
 ## Supported APIs
 

@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::vec;
 use slog::{debug, info, warn};
 use tokio::sync::{mpsc};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Request, Response, Status, Streaming};
