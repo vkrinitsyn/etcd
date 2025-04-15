@@ -140,6 +140,10 @@ impl QueueNameKey {
     pub fn is_queue(&self) -> bool {
         self.queue
     }
+
+    pub fn name(&self) -> String {
+        format!("/{}/{}", self.prefix, self.queue_name)
+    }
 }
 
 
@@ -316,7 +320,7 @@ impl EtcdNode {
     pub(crate) async fn create_watcher(&self, r: WatchCreateRequest, cid: Uuid, sender: Sender<Result<WatchResponse, Status>>) -> ClientId {
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         let cid = qn.client_id.unwrap_or(cid);
-        info!(self.log, "Create watcher for client: {}, WatchID:{}", cid, r.watch_id);
+        info!(self.log, "Create watcher for client: {}, WatchID: {}, {}", cid, r.watch_id, &qn.input);
         if qn.consumer {
             let mut queue_map = self.queues.write().await;
             match queue_map.get_mut(&qn.queue_name) {
