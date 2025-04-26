@@ -26,7 +26,10 @@ async fn main() -> Result<(), String> {
         EtcdConfig::from(&mut args.config)
     };
     let log = logger(&config);
-    let c = EtcdNode::init(config, log.clone()).await?;
+    let c = EtcdNode::init(
+        config, log.clone(),
+        #[cfg(feature = "tracer")] None,
+    ).await?;
     let _ = c.serve().await?;
 
     match wait_for_signal().await {

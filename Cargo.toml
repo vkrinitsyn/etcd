@@ -36,8 +36,13 @@ serde_yaml = "^0.9"
 uuid = { version = "1.16.0", features = ["v4"] }
 #rsa = "^0.9"
 #rand = "0.8.5"
+opentelemetry_sdk = { version = "0.29.0", features = ["rt-tokio", "tracing"], optional = true }
+opentelemetry = { version = "0.29.1", optional = true }
 
-#[features]
+[features]
+default = []
+tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
 #tls = ["tonic/tls"]
 #tls-openssl = ["openssl", "hyper-openssl", "hyper", "hyper-util"]
 #tls-openssl-vendored = ["tls-openssl", "openssl/vendored"]
