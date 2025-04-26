@@ -5,7 +5,6 @@ use i18n_embed::{
 };
 use rust_embed::RustEmbed;
 use lazy_static::lazy_static;
-use opentelemetry_sdk::trace::SdkTracer;
 use tokio::sync::mpsc::Sender;
 use tonic::Status;
 use crate::cli::EtcdConfig;
@@ -61,7 +60,7 @@ pub enum EtcdMgmtEvent {
     Config(EtcdConfig),
     /// change tracer runtime
     #[cfg(feature = "tracer")]
-    Tracer(Option<SdkTracer>),
+    Tracer(Option<opentelemetry_sdk::trace::SdkTracer>),
     /// Node management event to stop 
     Stop,
     /// Node management event to soft restart 
