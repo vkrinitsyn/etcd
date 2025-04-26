@@ -26,7 +26,9 @@ pub(crate) use crate::peer::EtcdPeerNode;
 
 
 impl EtcdNode {
-    pub async fn init(cfg: EtcdConfig, log: Logger) -> Result<Self, String> {
+    pub async fn init(cfg: EtcdConfig, log: Logger,
+      #[cfg(feature = "tracer")] tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
+    ) -> Result<Self, String> {
         let node_id = parse_uuid(&cfg.node)?;
         let cluster = EtcdCluster::connect(&cfg, node_id, parse_uuid(&cfg.cluster)?, &log).await?;
 
@@ -44,6 +46,7 @@ impl EtcdNode {
             node_id,
             event,
             log: log.clone(),
+            #[cfg(feature = "tracer")] tracer,
         };
         c.watch_notify(watcher_rv).await;
         let grpc_client = c.clone();
@@ -193,6 +196,7 @@ pub struct EtcdNode {
     pub(crate) peers: Arc<RwLock<EtcdCluster>>,
     pub event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
+    #[cfg(feature = "tracer")] pub(crate) tracer: Option<opentelemetry_sdk::trace::SdkTracer>
 
 }
 
