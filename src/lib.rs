@@ -58,6 +58,9 @@ pub enum EtcdEvents {
 pub enum EtcdMgmtEvent {
     /// runtime reconfigure event
     Config(EtcdConfig),
+    /// change tracer runtime
+    #[cfg(feature = "tracer")]
+    Tracer(Option<opentelemetry_sdk::trace::SdkTracer>),
     /// Node management event to stop 
     Stop,
     /// Node management event to soft restart 

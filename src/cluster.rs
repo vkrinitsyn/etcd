@@ -46,7 +46,7 @@ impl EtcdNode {
             node_id,
             event,
             log: log.clone(),
-            #[cfg(feature = "tracer")] tracer,
+            #[cfg(feature = "tracer")] tracer: Arc::new(RwLock::new(tracer)),
         };
         c.watch_notify(watcher_rv).await;
         let grpc_client = c.clone();
@@ -68,6 +68,10 @@ impl EtcdNode {
                     EtcdEvents::Mgmt(e) => match e {
                         EtcdMgmtEvent::Config(c) => {
                             let _ = grpc_client.reconfigure(c).await;
+                        }
+                        #[cfg(feature = "tracer")]
+                        EtcdMgmtEvent::Tracer(c) => {
+                            *grpc_client.tracer.write().await = c;
                         }
                         e @ _ => {
                             // TODO
@@ -162,6 +166,8 @@ impl EtcdNode {
                 error!(self.log, "Error adding peers: {}", e);
             }
         }
+        
+        // self.tracer
     }
 
     /// return current cluster connections
@@ -196,7 +202,7 @@ pub struct EtcdNode {
     pub(crate) peers: Arc<RwLock<EtcdCluster>>,
     pub event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
-    #[cfg(feature = "tracer")] pub(crate) tracer: Option<opentelemetry_sdk::trace::SdkTracer>
+    #[cfg(feature = "tracer")] pub(crate) tracer: Arc<RwLock<Option<opentelemetry_sdk::trace::SdkTracer>>>
 
 }
 
