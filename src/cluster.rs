@@ -22,6 +22,7 @@ use crate::etcdpb::etcdserverpb::WatchResponse;
 use crate::etcdpb::v3electionpb::election_server::ElectionServer;
 use crate::etcdpb::v3lockpb::lock_server::LockServer;
 use crate::peer::EtcdCluster;
+use crate::LP;
 pub(crate) use crate::peer::EtcdPeerNode;
 
 
@@ -75,7 +76,7 @@ impl EtcdNode {
                         }
                         e @ _ => {
                             // TODO
-                            error!(grpc_client.log, "Not implemented: {:?}", e);
+                            error!(grpc_client.log, "{}Not implemented: {:?}", LP, e);
                         }
                     }
                 }
@@ -116,7 +117,7 @@ impl EtcdNode {
         };
         let name = self.cfg.read().await.name.clone();
 
-        info!(self.log, "Starting server [{}] at: {}", name, addrs);
+        info!(self.log, "{}Starting server [{}] at: {}", LP, name, addrs);
         tokio::spawn(async move {
             match srv.serve(adr) // .serve_with_incoming_shutdown(uds_stream, rx.map(drop) )
                 .await {
@@ -163,7 +164,7 @@ impl EtcdNode {
                 self.cfg.write().await.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
             },
             Err(e) => {
-                error!(self.log, "Error adding peers: {}", e);
+                error!(self.log, "{}Error adding peers: {}", LP, e);
             }
         }
         

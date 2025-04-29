@@ -43,6 +43,11 @@ macro_rules! fl {
     }};
 }
 
+
+/// Logging prefix, to start every logging message with a string to use in a server as a module 
+const LP: &'static str = "[etcd] ";
+
+
 pub type WatchSender = Sender<Result<WatchResponse, Status>>;
 
 /// Etcd reconfiguration and integration events
@@ -61,7 +66,7 @@ pub enum EtcdMgmtEvent {
     /// change tracer runtime
     #[cfg(feature = "tracer")]
     Tracer(Option<opentelemetry_sdk::trace::SdkTracer>),
-    /// Node management event to stop 
+    /// Node management event to stop
     Stop,
     /// Node management event to soft restart 
     Restart,
