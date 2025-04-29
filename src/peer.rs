@@ -10,12 +10,7 @@ use tokio::{
 use tonic::{ Status};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
-use crate::{
-    etcdpb::etcdserverpb::maintenance_client::MaintenanceClient,
-    etcdpb::etcdserverpb::kv_client::KvClient,
-    KvEvent,
-    cluster::{EtcdPeerNodeType, NodeId},
-};
+use crate::{etcdpb::etcdserverpb::maintenance_client::MaintenanceClient, etcdpb::etcdserverpb::kv_client::KvClient, KvEvent, cluster::{EtcdPeerNodeType, NodeId}, LP};
 use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::StatusRequest;
 
@@ -100,7 +95,7 @@ impl EtcdCluster {
                                        let status = node.into_inner();
                                        match status.header {
                                            None => {
-                                               error!(self.log, "connecting maintenance {} - no header in response", url);
+                                               error!(self.log, "{}connecting maintenance {} - no header in response", LP, url);
                                            }
                                            Some(s) => {
                                                if s.cluster_id == self.cluster_id {
@@ -114,25 +109,25 @@ impl EtcdCluster {
                                                        })));
                                                    cnt += 1;
                                                } else {
-                                                   error!(self.log, "connecting maintenance {} - wrong cluster,\
-                                                    running on ClusterID [{}], but connecting node from {}",
+                                                   error!(self.log, "{}connecting maintenance {} - wrong cluster,\
+                                                    running on ClusterID [{}], but connecting node from {}", LP,
                                                        url, self.cluster_id, s.cluster_id);
                                                }
                                            }
                                        }
                                    }
                                    Err(e) => {
-                                       error!(self.log, "connecting maintenance {} with error {}", url, e);
+                                       error!(self.log, "{}connecting maintenance {} with error {}", LP, url, e);
                                    }
                                }
                            }
                            Err(e) => {
-                               error!(self.log, "connecting endpoint {} with error {}", url, e);
+                               error!(self.log, "{}connecting endpoint {} with error {}", LP, url, e);
                            }
                        }
                     }
                     Err(e) => {
-                        error!(self.log, "making endpoint to {} with error {}", url, e);
+                        error!(self.log, "{}making endpoint to {} with error {}", LP, url, e);
                     }
                 }
             }

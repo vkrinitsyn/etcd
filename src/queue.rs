@@ -1,6 +1,6 @@
 use crate::cluster::{ClientId, EtcdClientNode, EtcdNode, EtcdPeerNodeType, WatcherConsumer};
 use crate::etcdpb::etcdserverpb::{PutRequest, PutResponse, WatchCancelRequest, WatchCreateRequest, WatchResponse};
-use crate::{KvEvent};
+use crate::{KvEvent, LP};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -320,7 +320,7 @@ impl EtcdNode {
     pub(crate) async fn create_watcher(&self, r: WatchCreateRequest, cid: Uuid, sender: Sender<Result<WatchResponse, Status>>) -> ClientId {
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         let cid = qn.client_id.unwrap_or(cid);
-        info!(self.log, "Create watcher for client: {}, WatchID: {}, {}", cid, r.watch_id, &qn.input);
+        info!(self.log, "{}Create watcher for client: {}, WatchID: {}, {}", LP, cid, r.watch_id, &qn.input);
         if qn.consumer {
             let mut queue_map = self.queues.write().await;
             match queue_map.get_mut(&qn.queue_name) {
@@ -367,7 +367,7 @@ impl EtcdNode {
                             let msg = format!("Watcher#{} already on {}", r.watch_id, String::from_utf8_lossy(&w.key));
                             if let Err(e) = sender.send(Err(Status::already_exists(msg))).await
                             {
-                                warn!(self.log, "Create watcher: {}", e);
+                                warn!(self.log, "{}Create watcher: {}", LP, e);
                             }
                         }
                     }
@@ -381,7 +381,7 @@ impl EtcdNode {
                 created: true, .. Default::default()
             }
         )).await {
-            warn!(self.log, "Create watcher: {}", e);
+            warn!(self.log, "{}Create watcher: {}", LP, e);
         }
         cid
     }
@@ -393,12 +393,12 @@ impl EtcdNode {
                 if let Some(o) = self.observers.write().await.get_mut(&w.key) {
                     o.retain(|(o_cid, o_wid)| !(o_cid == &cid && o_wid == &r.watch_id));
                 }
-                debug!(self.log, "CancelRequest watching: {} {}", cid, r.watch_id);
+                debug!(self.log, "{}CancelRequest watching: {} {}", LP, cid, r.watch_id);
 
                 if let Err(e) = w.client.send(Ok(
                     WatchResponse { watch_id: r.watch_id, canceled: true, .. Default::default() }
                 )).await {
-                    warn!(self.log, "Cancel watcher: {}", e);
+                    warn!(self.log, "{}Cancel watcher: {}", LP, e);
                 }
             }
         }

@@ -15,7 +15,7 @@ use tonic::{async_trait, Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::etcdpb::etcdserverpb::watch_request::RequestUnion;
 use crate::etcdpb::mvccpb::{Event};
-use crate::WatchSender;
+use crate::{WatchSender, LP};
 
 type WatchResult<T> = Result<Response<T>, Status>;
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
@@ -31,7 +31,7 @@ impl EtcdNode {
                     for (cid, wid) in v { // expected watcher per client
                         if let Some(client_watcher) = watchers.read().await.get(&cid) {
                             if let Some(client) = client_watcher.read().await.watchers.get(&wid) {
-                                info!(log, "watch notify: {}", String::from_utf8_lossy(&kv.key));
+                                info!(log, "{}watch notify: {}", LP, String::from_utf8_lossy(&kv.key));
                                 if let Err(_e) = client.client.send(Ok(
                                     WatchResponse {
                                         header: None,
@@ -81,7 +81,7 @@ impl Watch for EtcdNode {
                     }
                 }
             }
-            info!(etcd.log, "end watching: {}", cid);
+            info!(etcd.log, "{}end watching: {}", LP, cid);
         });
 
         let output_stream = ReceiverStream::new(receiver);
@@ -99,7 +99,7 @@ impl EtcdNode {
             while let Some(r) = stream.recv().await {
                 cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
             }
-            info!(etcd.log, "end watching: {}", cid);
+            info!(etcd.log, "{}end watching: {}", LP, cid);
         });
     }
 
@@ -114,7 +114,7 @@ impl EtcdNode {
                 }
                 RequestUnion::ProgressRequest(_r) => {
                     let watchers = self.list_watchers(cid).await;
-                    debug!(self.log, "Progress watcher: {}", cid);
+                    debug!(self.log, "{}Progress watcher: {}", LP, cid);
                     if let Err(e) = sender.send(Ok(
                             WatchResponse {
                                 watch_id: *watchers.get(0).unwrap_or(&0),
@@ -122,7 +122,7 @@ impl EtcdNode {
                             }
                         )
                     ).await {
-                        warn!(self.log, "Progress watcher: {}", e);
+                        warn!(self.log, "{}Progress watcher: {}", LP, e);
                     }
                 }
             }
