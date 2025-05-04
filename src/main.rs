@@ -5,6 +5,7 @@ extern crate slog;
 
 use etcd::cli::{EtcdCliArgs, EtcdConfig};
 use std::{fs::File, io::BufReader};
+use std::process::ExitCode;
 use clap::Parser;
 use slog::Logger;
 use sloggers::Build;
@@ -14,30 +15,45 @@ use etcd::cluster::EtcdNode;
 
 /// etcd standalone entry point
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn main() -> ExitCode {
     // Parse whole args with clap
     let mut args = EtcdCliArgs::parse();
    
     // Get config file
     let config = if let Ok(f) = File::open(&args.config_path) {
-        args.parse_from(BufReader::new(f))?
+        match args.parse_from(BufReader::new(f)) {
+            Ok(a) => a,
+            Err(e) => {
+                return ExitCode::from(11);
+            }
+        }
     } else {
         // If there is not config file return only config parsed from clap
         EtcdConfig::from(&mut args.config)
     };
     let log = logger(&config);
-    let c = EtcdNode::init(
+    match EtcdNode::init(
         config, log.clone(),
         #[cfg(feature = "tracer")] None,
-    ).await?;
-    let _ = c.serve().await?;
+    ).await {
+        Ok(c) => {
+            if let Err(e) = c.serve().await {
+                crit!(log, "Error: {}", e);
+                return ExitCode::from(12);
+            }
+        }
+        Err(e) => {
+            crit!(log, "Error: {}", e);
+            return ExitCode::from(13);
+        }
+    }
 
     match wait_for_signal().await {
         Ok(msg) => {
-            exit_with_msg(log, msg, 0);
+            exit_with_msg(log, msg, 0)
         }
         Err(msg) => {
-            exit_with_msg(log, msg, 10);
+            exit_with_msg(log, msg, 10)
         }
     }
 }
@@ -65,13 +81,13 @@ async fn wait_for_signal() -> Result<String, String> {
         .map_err(|err| format!("Unable to listen for shutdown signal: {}", err))
 }
 
-pub fn exit_with_msg(log: Logger, msg: String, code: i32) -> ! {
+pub fn exit_with_msg(log: Logger, msg: String, code: u8) -> ExitCode {
     #[cfg(test)]
     assert!(false, "\n{}", msg);
 
     crit!(log, "\n{}", msg);
     // std::io::stdout().flush().unwrap();
-    std::process::exit(code);
+    ExitCode::from(code)
 }
 
 pub fn logger(cfg: &EtcdConfig) -> Logger {

@@ -110,8 +110,7 @@ impl EtcdNode {
 
             let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind).expect(format!("Binding to {}", bind).as_str());
             if ips.len() == 0 {
-                eprintln!("No IpAddr found {}", bind);
-                std::process::exit(9);
+                return Err(format!("No IpAddr found {}", bind));
             }
             SocketAddr::new(ips[0], port)
         };
