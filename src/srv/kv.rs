@@ -3,14 +3,9 @@ use opentelemetry_sdk::trace::{SdkTracer};
 #[cfg(feature = "tracer")]
 use opentelemetry::trace::{Span, Tracer};
 
-use slog::trace;
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::kv_server::Kv;
 use crate::etcdpb::etcdserverpb::{CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse};
-use crate::peer::BroadcastRequest;
-use crate::queue::QueueNameKey;
-use crate::srv::{peer, UNIMPL};
-use crate::{kv, KvEvent};
 use tonic::{async_trait, Request, Response, Status};
 
 #[async_trait]
@@ -49,11 +44,13 @@ impl Kv for EtcdNode {
         result
     }
 
-    async fn txn(&self, _request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+    async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        #[cfg(feature = "tracer")]
+        let _s = self.tracer.read().await.as_ref().map(|t| t.start("txn"));
+        self.txn_impl(request).await
     }
 
     async fn compact(&self, _request: Request<CompactionRequest>) -> Result<Response<CompactionResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        Ok(Response::new(CompactionResponse { header: None }))
     }
 }

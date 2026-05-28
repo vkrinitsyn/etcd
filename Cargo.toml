@@ -1,15 +1,15 @@
 [package]
 name = "etcd"
-version = "0.14.3"
-authors = ["The etcd-client Authors <davidli2010@foxmail.com>"]
+version = "0.15.1"
+authors = ["The etcd (light server) <v.krinitsyn@gmail.com>"]
 edition = "2024"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-description = "An etcd v3 API client"
-repository = "https://github.com/etcdv3/etcd-client.git"
-homepage = "https://github.com/etcdv3/etcd-client"
-documentation = "https://docs.rs/etcd-client/"
-keywords = ["etcd", "v3", "api", "client", "async"]
+description = "An etcd v3 API server"
+repository = "https://github.com/vkrinitsyn/etcd.git"
+homepage = "https://github.com/vkrinitsyn/etcd"
+#documentation = "https://docs.rs/etcd-light/"
+keywords = ["etcd", "v3", "api", "server", "async"]
 
 [dependencies]
 slog = { version = "2.7.0", features=["default"] }
@@ -24,10 +24,7 @@ dns-lookup = "2.0.4"
 clap = "4.5.32"
 clap-serde-derive = "0.2.1"
 
-lazy_static = "1.5.0"
-i18n-embed-fl = "^0.9"
-i18n-embed = { version = "^0.15", features = ["fluent-system", "desktop-requester"]}
-rust-embed = "8.6.0"
+rust-i18n = "3"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "^0.9"
 
@@ -52,6 +49,7 @@ tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 [dev-dependencies]
 tokio = { version = "^1.44", features = ["full"] }
 etcd-client = {version = "0.14.1", features = []}
+slog = { version = "2.7.0", features=["default"] }
 
 [build-dependencies]
 tonic-build = { version = "^0.13", default-features = false, features = ["prost"] }

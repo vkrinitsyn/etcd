@@ -4,13 +4,15 @@ use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status};
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::auth_server::Auth;
-use crate::etcdpb::etcdserverpb::{ AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse, AuthRoleAddRequest, AuthRoleAddResponse, AuthRoleDeleteRequest, AuthRoleDeleteResponse, AuthRoleGetRequest, AuthRoleGetResponse, AuthRoleGrantPermissionRequest, AuthRoleGrantPermissionResponse, AuthRoleListRequest, AuthRoleListResponse, AuthRoleRevokePermissionRequest, AuthRoleRevokePermissionResponse, AuthUserAddRequest, AuthUserAddResponse, AuthUserChangePasswordRequest, AuthUserChangePasswordResponse, AuthUserDeleteRequest, AuthUserDeleteResponse, AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse, AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest, AuthUserRevokeRoleResponse, AuthenticateRequest, AuthenticateResponse, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
+use crate::etcdpb::etcdserverpb::{ AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse, AuthRoleAddRequest, AuthRoleAddResponse, AuthRoleDeleteRequest, AuthRoleDeleteResponse, AuthRoleGetRequest, AuthRoleGetResponse, AuthRoleGrantPermissionRequest, AuthRoleGrantPermissionResponse, AuthRoleListRequest, AuthRoleListResponse, AuthRoleRevokePermissionRequest, AuthRoleRevokePermissionResponse, AuthUserAddRequest, AuthUserAddResponse, AuthUserChangePasswordRequest, AuthUserChangePasswordResponse, AuthUserDeleteRequest, AuthUserDeleteResponse, AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse, AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest, AuthUserRevokeRoleResponse, AuthenticateRequest, AuthenticateResponse, Member, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
 use crate::etcdpb::etcdserverpb::cluster_server::Cluster;
 use crate::etcdpb::v3electionpb::{CampaignRequest, CampaignResponse, LeaderRequest, LeaderResponse, ProclaimRequest, ProclaimResponse, ResignRequest, ResignResponse};
 use crate::etcdpb::v3electionpb::election_server::Election;
 use crate::etcdpb::v3lockpb::lock_server::Lock;
 use crate::etcdpb::v3lockpb::*;
-use crate::srv::{ UNIMPL};
+use crate::peer::PeerState;
+
+const UNIMPL: &str = "Not yet implemented";
 
 #[async_trait]
 impl Lock for EtcdNode {
@@ -139,10 +141,40 @@ impl Cluster for EtcdNode {
     }
 
     async fn member_list(&self, _request: Request<MemberListRequest>) -> Result<Response<MemberListResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        let peers = self.peers.read().await;
+        let peer_info = peers.peer_info().await;
+        let members: Vec<Member> = peer_info.into_iter().map(|(id, conn, state)| {
+            Member {
+                id,
+                name: String::new(),
+                peer_ur_ls: vec![conn],
+                client_ur_ls: vec![],
+                is_learner: state != PeerState::Online,
+            }
+        }).collect();
+        Ok(Response::new(MemberListResponse {
+            header: Some(self.response_header()),
+            members,
+        }))
     }
 
-    async fn member_promote(&self, _request: Request<MemberPromoteRequest>) -> Result<Response<MemberPromoteResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+    async fn member_promote(&self, request: Request<MemberPromoteRequest>) -> Result<Response<MemberPromoteResponse>, Status> {
+        let peer_id = request.into_inner().id;
+        let peers = self.peers.read().await;
+        let current = peers.peer_state(peer_id).await;
+        match current {
+            None => Err(Status::not_found(format!("peer {} not found", peer_id))),
+            Some(PeerState::Spare) => {
+                peers.promote_to_syncing(peer_id, &self.log).await;
+                Ok(Response::new(MemberPromoteResponse::default()))
+            }
+            Some(PeerState::InProgress) => {
+                peers.promote_to_online(peer_id, &self.log).await;
+                Ok(Response::new(MemberPromoteResponse::default()))
+            }
+            Some(PeerState::Online) => {
+                Err(Status::failed_precondition("peer is already Online"))
+            }
+        }
     }
 }

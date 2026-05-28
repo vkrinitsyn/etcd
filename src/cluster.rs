@@ -1,12 +1,15 @@
 use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::kv_server::{Kv, KvServer};
+use crate::etcdpb::etcdserverpb::ResponseHeader;
 use crate::queue::{Queue};
 use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
+use rust_i18n::t;
 use slog::{error, info, Logger};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::Status;
@@ -36,6 +39,7 @@ impl EtcdNode {
         let (event, mut rsvr) = mpsc::channel(10);
         let (watcher, watcher_rv) = mpsc::channel(10);
 
+        let term = Arc::new(AtomicU64::new(cfg.term));
         let c = EtcdNode {
             cfg: Arc::new(RwLock::new(cfg)),
             vault: Arc::new(Default::default()),
@@ -45,10 +49,32 @@ impl EtcdNode {
             watch_notify: watcher,
             peers: Arc::new(RwLock::new(cluster)),
             node_id,
+            term,
             event,
             log: log.clone(),
             #[cfg(feature = "tracer")] tracer: Arc::new(RwLock::new(tracer)),
         };
+        // Announce self to peers and sync KV data from fastest responder
+        {
+            let cfg = c.cfg.read().await;
+            let my_urls: Vec<String> = cfg.listen_client_urls
+                .split(',')
+                .filter(|u| !u.is_empty())
+                .map(|u| {
+                    if u.starts_with("http") { u.to_string() }
+                    else { format!("http://{}", u) }
+                })
+                .collect();
+            drop(cfg);
+
+            match c.peers.read().await.announce_and_sync(my_urls, &c.vault, &log).await {
+                Ok(n) => if n > 0 {
+                    info!(log, "{}startup sync: loaded {} keys", LP, n);
+                },
+                Err(e) => info!(log, "{}startup sync skipped: {}", LP, e),
+            }
+        }
+
         c.watch_notify(watcher_rv).await;
         let grpc_client = c.clone();
 
@@ -74,9 +100,35 @@ impl EtcdNode {
                         EtcdMgmtEvent::Tracer(c) => {
                             *grpc_client.tracer.write().await = c;
                         }
-                        e @ _ => {
-                            // TODO
-                            error!(grpc_client.log, "{}Not implemented: {:?}", LP, e);
+                        EtcdMgmtEvent::Stop => {
+                            info!(grpc_client.log, "{}received Stop event, shutting down event loop", LP);
+                            break;
+                        }
+                        EtcdMgmtEvent::Restart => {
+                            let new_term = grpc_client.term.fetch_add(1, Ordering::Relaxed) + 1;
+                            info!(grpc_client.log, "{}restart: term incremented to {}", LP, new_term);
+                            let cfg = grpc_client.cfg.read().await;
+                            let my_urls: Vec<String> = cfg.listen_client_urls
+                                .split(',')
+                                .filter(|u| !u.is_empty())
+                                .map(|u| {
+                                    if u.starts_with("http") { u.to_string() }
+                                    else { format!("http://{}", u) }
+                                })
+                                .collect();
+                            drop(cfg);
+                            match grpc_client.peers.read().await
+                                .announce_and_sync(my_urls, &grpc_client.vault, &grpc_client.log).await {
+                                Ok(n) => if n > 0 {
+                                    info!(grpc_client.log, "{}restart sync: loaded {} keys", LP, n);
+                                },
+                                Err(e) => info!(grpc_client.log, "{}restart sync skipped: {}", LP, e),
+                            }
+                        }
+                        EtcdMgmtEvent::Pause(secs) => {
+                            info!(grpc_client.log, "{}pausing for {} seconds", LP, secs);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(secs as u64)).await;
+                            info!(grpc_client.log, "{}resumed after pause", LP);
                         }
                     }
                 }
@@ -124,8 +176,7 @@ impl EtcdNode {
                     println!("bye");
                 }
                 Err(e) => {
-                    // eprintln!("{} {}", fl!("error"), e);
-                    eprintln!("{} {}", "error", e);
+                    eprintln!("{} {}", t!("error"), e);
                     println!();
                     // println!("{}", arg_config::usage());
                     std::process::exit(10);
@@ -160,14 +211,37 @@ impl EtcdNode {
         let peers = cfg.peers();
         match self.peers.write().await.add_connections(peers).await {
             Ok(cnt) => if cnt > 0 {
-                self.cfg.write().await.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
+                info!(self.log, "{}reconfigure: added {} peer(s)", LP, cnt);
             },
             Err(e) => {
                 error!(self.log, "{}Error adding peers: {}", LP, e);
             }
         }
-        
-        // self.tracer
+
+        if cfg.term > 0 {
+            self.term.store(cfg.term, Ordering::Relaxed);
+        }
+
+        let mut current = self.cfg.write().await;
+        current.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
+        current.listen_client_urls = cfg.listen_client_urls;
+        current.listen_peer_urls = cfg.listen_peer_urls;
+        current.initial_cluster = cfg.initial_cluster;
+        current.initial_cluster_token = cfg.initial_cluster_token;
+        current.name = cfg.name;
+        current.max_txn_ops = cfg.max_txn_ops;
+        current.max_request_bytes = cfg.max_request_bytes;
+        current.log_level = cfg.log_level;
+        current.term = cfg.term;
+    }
+
+    pub(crate) fn response_header(&self) -> ResponseHeader {
+        ResponseHeader {
+            cluster_id: 0,
+            member_id: self.node_id,
+            revision: 0,
+            raft_term: self.term.load(Ordering::Relaxed),
+        }
     }
 
     /// return current cluster connections
@@ -187,6 +261,7 @@ pub type WatcherId = i64;
 #[derive(Clone)]
 pub struct EtcdNode {
     pub(crate) node_id: NodeId,
+    pub(crate) term: Arc<AtomicU64>,
     pub(crate) cfg: Arc<RwLock<EtcdConfig>>,
     pub(crate) vault: Arc<RwLock<HashMap<KvKey, crate::kv::Kv>>>,
     pub(crate) queues: Arc<RwLock<HashMap<String, Queue>>>,

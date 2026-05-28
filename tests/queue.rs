@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 mod testing;
 
-use crate::testing::{get_client, Result};
+use crate::testing::{start_server, Result};
 use etcd_client::{EventType};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn test_queue() -> Result<()> {
-    let mut client = get_client().await?;
+    let (_node, mut client) = start_server().await;
     let cid = Uuid::new_v4();
     let (mut watcher, mut stream) = client.watch(format!("/queue/test_queue/consumer/{}", cid.as_hyphenated()), None).await?;
 

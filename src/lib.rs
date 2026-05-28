@@ -1,14 +1,10 @@
 
-use i18n_embed::{
-    fluent::{fluent_language_loader, FluentLanguageLoader},
-    LanguageLoader,
-};
-use rust_embed::RustEmbed;
-use lazy_static::lazy_static;
 use tokio::sync::mpsc::Sender;
 use tonic::Status;
 use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest, WatchResponse};
+
+rust_i18n::i18n!("locales");
 
 pub mod etcdpb;
 pub mod cli;
@@ -17,31 +13,6 @@ mod srv;
 pub mod queue;
 pub mod kv;
 mod peer;
-
-#[derive(RustEmbed)]
-#[folder = "i18n/"]
-pub struct Localizations;
-
-lazy_static! {
-    static ref LANGUAGE_LOADER: FluentLanguageLoader = {
-		let loader: FluentLanguageLoader = fluent_language_loader!();
-		loader
-		.load_languages(&Localizations, &[loader.fallback_language().to_owned()])
-		.unwrap();
-		loader
-    };
-}
-
-#[macro_export]
-macro_rules! fl {
-    ($message_id:literal) => {{
-        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id)
-    }};
-
-    ($message_id:literal, $($args:expr),*) => {{
-        i18n_embed_fl::fl!($crate::LANGUAGE_LOADER, $message_id, $($args), *)
-    }};
-}
 
 
 /// Logging prefix, to start every logging message with a string to use in a server as a module 

@@ -1,7 +1,6 @@
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::lease_server::Lease;
 use crate::etcdpb::etcdserverpb::{LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse};
-use crate::srv::UNIMPL;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status, Streaming};
@@ -23,7 +22,7 @@ impl Lease for EtcdNode {
     type LeaseKeepAliveStream = ResponseStream;
 
     async fn lease_keep_alive(&self, _request: Request<Streaming<LeaseKeepAliveRequest>>) -> LeaseKeepAliveResult<ResponseStream> {
-        Err(Status::unimplemented(UNIMPL))
+        Err(Status::unimplemented("TODO"))
     }
 
     async fn lease_time_to_live(&self, _request: Request<LeaseTimeToLiveRequest>) -> Result<Response<LeaseTimeToLiveResponse>, Status> {

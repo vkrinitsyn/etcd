@@ -6,7 +6,6 @@ mod lease;
 mod watch;
 mod maintenance;
 
-pub const UNIMPL: &str = "Not yet";
 
 // TODO add auth with client id (uuid)
 #[inline]

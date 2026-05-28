@@ -17,6 +17,10 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "")]
     pub cluster: String,
 
+    /// Logical term (epoch) for this node, incremented on restart/reconfigure.
+    #[arg(long, required = false, default_value = "1")]
+    pub term: u64,
+
 // all fields bellow copied from etcd configuration
 
     /// Human-readable name for this member.
@@ -447,6 +451,12 @@ impl EtcdCliArgs {
 }
 
 impl EtcdConfig {
+    pub fn with_defaults() -> Self {
+        let args = <EtcdCliArgs as Parser>::parse_from(["etcd"]);
+        let mut config = args.config;
+        EtcdConfig::from(&mut config)
+    }
+
     pub fn peers(&self) -> HashSet<&str> {
         let urls: HashSet<&str> = HashSet::from_iter(self.listen_client_urls.split(","));
         let mut clients: HashSet<&str> = HashSet::from_iter(self.initial_advertise_peer_urls.split(",")

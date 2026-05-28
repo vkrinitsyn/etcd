@@ -278,7 +278,7 @@ impl Queue {
             q.retain(|v| v.idx > idx); // TODO optimize for big queue size
             q.len() as i64
         } else {-1};
-        trace!(log, "removed# {:?} queue size: [{}]", request.idx, q);
+        trace!(log, "remove [{}] # {:?} queue size: [{}]", request.input, request.idx, q);
         let _ = self.sender.send(0).await;
     }
 
@@ -411,7 +411,8 @@ pub mod test {
     use super::*;
     #[test]
     pub fn test() {
-        assert_eq!(QueueNameKey::new("/q/name/p/key".into()).queue_name, "key".to_string());
+        assert_eq!(QueueNameKey::new("/q/name/p/key".into()).queue_name, "name".to_string());
+        assert!(QueueNameKey::new("/q/name/p/key".into()).queue);
         /*
         assert_eq!(Queue::get_producer_key(&("/q/name/i/key".split("/").collect())).unwrap(), "key".to_string());
         assert_eq!(Queue::get_producer_key(&("/queue/name/p/key".split("/").collect())).unwrap(), "key".to_string());

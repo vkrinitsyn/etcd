@@ -1,11 +1,11 @@
 mod testing;
 
-use crate::testing::{get_client, Result};
+use crate::testing::{start_server, Result};
 use etcd_client::{DeleteOptions, KvClientPrefix};
 
 // #[tokio::test]
 async fn test_namespace_kv() -> Result<()> {
-    let mut client = get_client().await?;
+    let (_node, mut client) = start_server().await;
     let mut c = KvClientPrefix::new(client.kv_client(), "foo/".into());
 
     c.put("abc", "bar", None).await?;
