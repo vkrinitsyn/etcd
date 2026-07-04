@@ -329,6 +329,7 @@ impl EtcdCluster {
     }
 
     /// Demote a peer back to Spare.
+    #[allow(dead_code)] // part of the peer state machine, not wired up yet
     pub(crate) async fn demote_to_spare(&self, peer_id: NodeId, log: &Logger) -> bool {
         for p in &self.peers {
             let mut node = p.lock().await;
@@ -353,6 +354,7 @@ impl EtcdCluster {
     }
 
     /// Number of Online peers.
+    #[allow(dead_code)] // part of the peer state machine, not wired up yet
     pub(crate) async fn online_count(&self) -> usize {
         let mut count = 0;
         for p in &self.peers {

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod testing;
 
 use crate::testing::{start_server, Result};

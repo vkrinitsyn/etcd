@@ -1,11 +1,11 @@
 [package]
-name = "etcd-server"
+name = "etcds"
 version = "0.16.0"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>"]
 edition = "2024"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-description = "An etcd v3 API server"
+description = "An etcd v3 API server - light server version for queue management"
 repository = "https://github.com/vkrinitsyn/etcd.git"
 homepage = "https://github.com/vkrinitsyn/etcd"
 keywords = ["etcd", "v3", "api", "server", "async"]

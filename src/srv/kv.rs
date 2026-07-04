@@ -1,7 +1,5 @@
 #[cfg(feature = "tracer")]
-use opentelemetry_sdk::trace::{SdkTracer};
-#[cfg(feature = "tracer")]
-use opentelemetry::trace::{Span, Tracer};
+use opentelemetry::trace::Tracer;
 
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::kv_server::Kv;

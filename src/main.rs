@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate slog;
 
-use etcd::cli::{EtcdCliArgs, EtcdConfig};
 use std::{fs::File, io::BufReader};
 use std::process::ExitCode;
 use clap::Parser;
@@ -11,7 +10,6 @@ use slog::Logger;
 use sloggers::Build;
 use sloggers::terminal::{Destination, TerminalLoggerBuilder};
 use sloggers::types::{Severity, SourceLocation};
-use etcd::cluster::EtcdNode;
 
 /// etcd standalone entry point
 #[tokio::main]
@@ -24,6 +22,7 @@ async fn main() -> ExitCode {
         match args.parse_from(BufReader::new(f)) {
             Ok(a) => a,
             Err(e) => {
+                eprintln!("Error parsing config file {}: {}", args.config_path.display(), e);
                 return ExitCode::from(11);
             }
         }
@@ -60,6 +59,8 @@ async fn main() -> ExitCode {
 
 #[cfg(unix)]
 use tokio::signal::unix::*;
+use etcds::cli::{EtcdCliArgs, EtcdConfig};
+use etcds::cluster::EtcdNode;
 
 #[cfg(unix)]
 async fn wait_for_signal() -> Result<String, String> {

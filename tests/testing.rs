@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use etcd_client::{Client, Error};
-use etcd::cluster::EtcdNode;
+use etcds::cluster::EtcdNode;
 
 pub const TESTING_RANGE: bool = false;
 pub const TESTING_PREFIX: bool = false;
@@ -13,7 +13,7 @@ pub async fn start_server() -> (EtcdNode, Client) {
     let port = PORT.fetch_add(1, Ordering::Relaxed);
     let addr = format!("localhost:{}", port);
 
-    let mut cfg = etcd::cli::EtcdConfig::with_defaults();
+    let mut cfg = etcds::cli::EtcdConfig::with_defaults();
     cfg.listen_client_urls = addr.clone();
 
     let log = slog::Logger::root(slog::Discard, slog::o!());
