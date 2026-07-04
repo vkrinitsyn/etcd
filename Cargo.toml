@@ -1,58 +1,49 @@
 [package]
-name = "etcd"
-version = "0.15.1"
-authors = ["The etcd (light server) <v.krinitsyn@gmail.com>"]
+name = "etcd-server"
+version = "0.16.0"
+authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>"]
 edition = "2024"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 description = "An etcd v3 API server"
 repository = "https://github.com/vkrinitsyn/etcd.git"
 homepage = "https://github.com/vkrinitsyn/etcd"
-#documentation = "https://docs.rs/etcd-light/"
 keywords = ["etcd", "v3", "api", "server", "async"]
 
 [dependencies]
-slog = { version = "2.7.0", features=["default"] }
-sloggers = "2.2.0"
-tonic = "^0.13"
-prost = "^0.13"
+slog = { version = "^2.0", features=["default"] }
+sloggers = "^2.2"
+tonic = "^0.14"
+tonic-prost = "^0.14"
+prost = "^0.14"
 tokio = { version = "^1.44", features = ["full"] }
 tokio-stream = "^0.1"
-dns-lookup = "2.0.4"
+dns-lookup = "^3.0"
 
 
-clap = "4.5.32"
+clap = "^4.5"
 clap-serde-derive = "0.2.1"
 
-rust-i18n = "3"
-serde = { version = "1.0.219", features = ["derive"] }
+rust-i18n = "4"
+serde = { version = "^1.0", features = ["derive"] }
 serde_yaml = "^0.9"
 
-#shims = {git = "https://github.com/vkrinitsyn/shim.git"}
-uuid = { version = "1.16.0", features = ["v4"] }
-#rsa = "^0.9"
-#rand = "0.8.5"
-opentelemetry_sdk = { version = "^0.29", features = ["rt-tokio", "tracing"], optional = true }
-opentelemetry = { version = "^0.29", optional = true }
+shims = {version = "^0.1"}
+uuid = { version = "1", features = ["v4"] }
+opentelemetry_sdk = { version = "^0.32", features = ["rt-tokio", "trace"], optional = true }
+opentelemetry = { version = "^0.32", optional = true }
 
 [features]
 default = []
 tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 
-#tls = ["tonic/tls"]
-#tls-openssl = ["openssl", "hyper-openssl", "hyper", "hyper-util"]
-#tls-openssl-vendored = ["tls-openssl", "openssl/vendored"]
-#tls-roots = ["tls", "tonic/tls-roots"]
-#pub-response-field = ["visible"]
-
-
 [dev-dependencies]
 tokio = { version = "^1.44", features = ["full"] }
-etcd-client = {version = "0.14.1", features = []}
-slog = { version = "2.7.0", features=["default"] }
+etcd-client = {version = "^0.19", features = []}
+slog = { version = "^2.8", features=["default"] }
 
 [build-dependencies]
-tonic-build = { version = "^0.13", default-features = false, features = ["prost"] }
+tonic-prost-build = "^0.14"
 
 [package.metadata.docs.rs]
 features = ["tls", "tls-roots"]

@@ -2,7 +2,7 @@ fn main() {
     let proto_root = "proto";
     println!("cargo:rerun-if-changed={}", proto_root);
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         // .out_dir("src/etcdpb")
         .compile_protos(
             &[

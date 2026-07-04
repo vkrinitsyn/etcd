@@ -160,7 +160,7 @@ impl EtcdNode {
         } else {
             let port = adr[1].parse::<u16>().map_err(|e| format!("expected port in {}: {}", addrs, e))?;
 
-            let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind).expect(format!("Binding to {}", bind).as_str());
+            let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind).expect(format!("Binding to {}", bind).as_str()).collect();
             if ips.len() == 0 {
                 return Err(format!("No IpAddr found {}", bind));
             }

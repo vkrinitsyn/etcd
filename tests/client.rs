@@ -204,12 +204,16 @@ async fn test_txn() -> Result<()> {
 async fn test_watch() -> Result<()> {
     let (_node, mut client) = start_server().await;
 
-    let (mut watcher, mut stream) = client.watch("watch01", None).await?;
+    let mut stream = client.watch("watch01", None).await?;
+
+    let resp = stream.message().await?.unwrap();
+    assert!(resp.created());
+    let watch_id = resp.watch_id();
 
     client.put("watch01", "01", None).await?;
 
     let resp = stream.message().await?.unwrap();
-    assert_eq!(resp.watch_id(), watcher.watch_id());
+    assert_eq!(resp.watch_id(), watch_id);
     assert_eq!(resp.events().len(), 1);
 
     let kv = resp.events()[0].kv().unwrap();
@@ -217,10 +221,10 @@ async fn test_watch() -> Result<()> {
     assert_eq!(kv.value(), b"01");
     assert_eq!(resp.events()[0].event_type(), EventType::Put);
 
-    watcher.cancel().await?;
+    stream.cancel(watch_id).await?;
 
     let resp = stream.message().await?.unwrap();
-    assert_eq!(resp.watch_id(), watcher.watch_id());
+    assert_eq!(resp.watch_id(), watch_id);
     assert!(resp.canceled());
 
     Ok(())
