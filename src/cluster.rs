@@ -226,6 +226,10 @@ impl EtcdNode {
         current.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
         current.listen_client_urls = cfg.listen_client_urls;
         current.listen_peer_urls = cfg.listen_peer_urls;
+        if !cfg.clickhouse_url.is_empty() {
+            current.clickhouse_url = cfg.clickhouse_url;
+            current.clickhouse_db = cfg.clickhouse_db;
+        }
         current.initial_cluster = cfg.initial_cluster;
         current.initial_cluster_token = cfg.initial_cluster_token;
         current.name = cfg.name;

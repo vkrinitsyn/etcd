@@ -6,6 +6,8 @@ use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest, Wa
 
 rust_i18n::i18n!("locales");
 
+#[cfg(feature = "clickhouse")]
+pub(crate) mod clickhouse;
 pub mod etcdpb;
 pub mod cli;
 pub mod cluster;

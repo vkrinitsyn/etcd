@@ -1,4 +1,4 @@
-use crate::cluster::{ClientId, EtcdClientNode, EtcdNode, EtcdPeerNodeType, WatcherConsumer};
+use crate::cluster::{ClientId, EtcdClientNode, EtcdNode, EtcdPeerNodeType, WatcherConsumer, WatcherId};
 use crate::etcdpb::etcdserverpb::{PutRequest, PutResponse, WatchCancelRequest, WatchCreateRequest, WatchResponse};
 use crate::{KvEvent, LP};
 use std::collections::{HashMap, VecDeque};
@@ -47,10 +47,21 @@ pub struct Queue {
     /// store deliveries /queue/{q_name}/consumer/{client_id}/{idx}/{key}
     clients: Arc<RwLock<HashMap<ClientId, crate::cluster::EtcdClientType>>>,
 
+    /// `/q/ch:<table>/` and `/queue/clickhouse:<table>/`: the queue is its own
+    /// consumer and writes each message's JSON value straight into this
+    /// ClickHouse table, with no watcher on the other end.
+    #[cfg(feature = "clickhouse")]
+    ch_table: Option<String>,
+
     sender: Sender<MsgNotifyType>,
 }
 
 type MsgNotifyType = u64;
+
+/// How long a consumer gets to accept one dispatched message before it is
+/// treated as dead. Bounded on purpose: an unbounded `send().await` on a watcher
+/// nobody is draining stalls every other consumer of the same queue.
+const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// client that produce queue input  
 #[derive(Clone, Debug)]
@@ -87,6 +98,16 @@ pub struct QueueMsg {
     created: Instant,
     /// set by dispatcher when forwarded to client
     handled_by: Option<ClientId>,
+}
+
+/// The oldest message no consumer has been handed yet.
+///
+/// `put` pushes to the FRONT, so FIFO order means walking from the back. Note
+/// this deliberately ignores which idx the wake-up carried: a notification is
+/// only "something changed", and matching it against the head is what used to
+/// stall the queue at one message.
+fn next_undelivered(q: &VecDeque<QueueMsg>) -> Option<u64> {
+    q.iter().rev().find(|m| m.handled_by.is_none()).map(|m| m.idx)
 }
 
 impl From<&QueueMsg> for KeyValue {
@@ -151,6 +172,9 @@ impl Queue {
 
     pub(crate) async fn make_consumer(&mut self, consumer_key: QueueNameKey, client_id: Uuid, watcher_id: i64, sender: &Sender<Result<WatchResponse, Status>>) {
         let key = consumer_key.input.clone().into_bytes();
+        // a consumer that registers after messages were produced must still get
+        // them: kick the dispatcher once this watcher is in place (below)
+        let notify = self.sender.clone();
         let client = sender.clone();
         let mut clients = self.clients.write().await;
         match clients.get_mut(&client_id) {
@@ -172,6 +196,72 @@ impl Queue {
                 }
             }
         }
+        drop(clients);
+        let _ = notify.send(0).await;
+    }
+
+    /// Write every pending message into ClickHouse as one JSONEachRow batch and
+    /// drop the ones that made it. Messages stay queued on failure, so a
+    /// ClickHouse that is down delays delivery rather than losing it.
+    #[cfg(feature = "clickhouse")]
+    async fn drain_to_clickhouse(&self, table: &str, log: &Logger) {
+        let (url, db) = {
+            let cfg = self.etcd.read().await.cfg.clone();
+            let cfg = cfg.read().await;
+            (cfg.clickhouse_url.clone(), cfg.clickhouse_db.clone())
+        };
+        let Some(sink) = crate::clickhouse::ChSink::new(&url, &db) else {
+            warn!(log, "{}queue {} targets ClickHouse but clickhouse_url is not set", LP, self.fq_name);
+            return;
+        };
+
+        // oldest first, and remember what we are sending so a concurrent put is
+        // not dropped along with the batch
+        let batch: Vec<(u64, String)> = {
+            let q = self.queue.read().await;
+            q.iter().rev()
+                .map(|m| (m.idx, String::from_utf8_lossy(&m.value).trim().to_string()))
+                .filter(|(_, v)| !v.is_empty())
+                .collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let rows: Vec<String> = batch.iter().map(|(_, v)| v.clone()).collect();
+        match sink.insert(table, &rows, log).await {
+            Ok(()) => {
+                let sent: std::collections::HashSet<u64> = batch.iter().map(|(i, _)| *i).collect();
+                let left = {
+                    let mut q = self.queue.write().await;
+                    q.retain(|m| !sent.contains(&m.idx));
+                    q.len()
+                };
+                debug!(log, "{}clickhouse {} <- {} row(s) from {} [{} left]",
+                    LP, table, rows.len(), self.fq_name, left);
+            }
+            Err(e) => {
+                // left queued on purpose: the next put or retry delivers them
+                warn!(log, "{}clickhouse insert into {} failed, {} row(s) stay queued: {}",
+                    LP, table, rows.len(), e);
+            }
+        }
+    }
+
+    /// Forget one watcher, and the client with it once it has none left, so the
+    /// dispatcher stops handing messages to something that cannot take them.
+    pub(crate) async fn drop_watcher(&self, client_id: &ClientId, watcher_id: WatcherId) {
+        let mut clients = self.clients.write().await;
+        let empty = match clients.get(client_id) {
+            None => false,
+            Some(c) => {
+                let mut c = c.write().await;
+                c.watchers.remove(&watcher_id);
+                c.watchers.is_empty()
+            }
+        };
+        if empty {
+            clients.remove(client_id);
+        }
     }
 
     pub(crate) async fn new(etcd: &EtcdNode, qn: &QueueNameKey) -> Self {
@@ -184,6 +274,8 @@ impl Queue {
             idx: Arc::new(AtomicU64::new(1)),
             // delivery: Arc::new(Default::default()),
             clients: Arc::new(Default::default()),
+            #[cfg(feature = "clickhouse")]
+            ch_table: crate::clickhouse::queue_target(&qn.queue_name).map(|t| t.to_string()),
             sender
         }.run(rsvr).await
     }
@@ -210,8 +302,10 @@ impl Queue {
             handled_by: None,
         };
 
-        self.queue.write().await.push_front(msg);
-        let _ = self.sender.send(idx).await;
+        let depth = { let mut q = self.queue.write().await; q.push_front(msg); q.len() };
+        let notified = self.sender.try_send(idx);
+        debug!(_log, "{}queued #{} [{}] notify={:?} cap={}", LP, idx, depth,
+            notified.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.sender.capacity());
 
         if self.dispatcher.read().await.is_none() {
             let r = PutRequest {
@@ -235,35 +329,107 @@ impl Queue {
         let log = self.etcd.read().await.log.clone();
         let queue = self.clone();
         tokio::spawn(async move {
-            while let Some(r) = rsvr.recv().await {
-                if let Some(x) = queue.queue.read().await.back() {
-                    if x.idx > 0 && r != x.idx { continue; }
-                    trace!(log, "dispatch {} [{}]", x.key, queue.queue.read().await.len());
-                    // TODO queue: implement picking best consumer strategy
-                    // TODO queue: implement dead queue - self send a message after a while, check timeout and remove
-                    
-                    if let Some((_cid, c)) = queue.clients.read().await.iter().next() {
-                        if let Some((wid, w)) = c.read().await.watchers.iter().next() {
-                            if let Err(_e) = w.client.send(Ok(WatchResponse {
-                                header: None,
-                                watch_id: *wid,
-                                created: false,
-                                canceled: false,
-                                compact_revision: 0,
-                                cancel_reason: "".to_string(),
-                                fragment: false,
-                                events: vec![ Event {
-                                    r#type: 0, // put
-                                    kv: Some(x.into()),
-                                    prev_kv: None,
-                                }],
-                            })).await {
-                                // TODO queue: remove client after few try
+            // The received value is only a wake-up. It used to be matched against
+            // the head of the queue (`if x.idx > 0 && r != x.idx { continue }`),
+            // which lined up only while exactly one message was outstanding:
+            // `put` notifies with the idx it just pushed to the FRONT, while the
+            // dispatcher reads the OLDEST from the back, so the second producer
+            // put stalled the queue permanently. It also threw away the kick that
+            // `delete` sends after an acknowledge, since 0 never equals a real
+            // idx - so even draining the queue never restarted delivery.
+            #[cfg(feature = "clickhouse")]
+            let ch_table = queue.ch_table.clone();
 
+            while rsvr.recv().await.is_some() {
+                // A ch: queue consumes itself: take everything pending, write it
+                // as one JSONEachRow batch, and drop the messages that landed.
+                // Nothing else in this loop applies - there is no watcher to pick.
+                #[cfg(feature = "clickhouse")]
+                if let Some(table) = &ch_table {
+                    queue.drain_to_clickhouse(table, &log).await;
+                    continue;
+                }
+
+                // drain every message no consumer has been handed yet, oldest
+                // first (newest is at the front, so walk from the back)
+                loop {
+                    let next = {
+                        let q = queue.queue.read().await;
+                        next_undelivered(&q).and_then(|idx| q.iter()
+                            .find(|m| m.idx == idx)
+                            .map(|m| (idx, m.key.clone(), KeyValue::from(m), q.len())))
+                    };
+                    let Some((idx, key, kv, depth)) = next else { break };
+
+                    // TODO queue: implement picking best consumer strategy
+                    let candidates: Vec<(ClientId, WatcherId, Sender<Result<WatchResponse, Status>>)> = {
+                        let clients = queue.clients.read().await;
+                        let mut v = Vec::new();
+                        for (cid, c) in clients.iter() {
+                            for (wid, w) in c.read().await.watchers.iter() {
+                                v.push((*cid, *wid, w.client.clone()));
+                            }
+                        }
+                        v
+                    };
+                    if candidates.is_empty() {
+                        debug!(log, "{}no consumer yet for {} [{}]", LP, key, depth);
+                        break; // the next put, ack or watcher registration wakes us
+                    }
+
+                    // Try each consumer in turn, and never block on one of them:
+                    // a watcher whose stream is gone or whose channel nobody is
+                    // draining would otherwise wedge the whole queue for good,
+                    // since `iter().next()` keeps handing back the same dead
+                    // entry. Anything that fails or stalls is dropped here and
+                    // the next producer put or watcher registration re-adds a
+                    // live one.
+                    let mut delivered = None;
+                    for (cid, wid, client) in candidates {
+                        let resp = WatchResponse {
+                            header: None,
+                            watch_id: wid,
+                            created: false,
+                            canceled: false,
+                            compact_revision: 0,
+                            cancel_reason: "".to_string(),
+                            fragment: false,
+                            events: vec![ Event {
+                                r#type: 0, // put
+                                kv: Some(kv.clone()),
+                                prev_kv: None,
+                            }],
+                        };
+                        match tokio::time::timeout(DISPATCH_TIMEOUT, client.send(Ok(resp))).await {
+                            Ok(Ok(())) => {
+                                debug!(log, "{}dispatch {} [{}]", LP, key, depth);
+                                delivered = Some(cid);
+                                break;
+                            }
+                            Ok(Err(_)) => {
+                                warn!(log, "{}consumer {} watcher {} is gone, dropping it", LP, cid, wid);
+                                queue.drop_watcher(&cid, wid).await;
+                            }
+                            Err(_) => {
+                                warn!(log, "{}consumer {} watcher {} did not accept {} within {:?}, dropping it",
+                                    LP, cid, wid, key, DISPATCH_TIMEOUT);
+                                queue.drop_watcher(&cid, wid).await;
                             }
                         }
                     }
-                    // try to send
+                    let Some(cid) = delivered else {
+                        // no consumer took it; leave it queued for the next one
+                        break;
+                    };
+                    // Mark it so the next wake moves on instead of re-sending the
+                    // same message; the consumer's acknowledge (delete) is what
+                    // drops it for good.
+                    // TODO queue: implement dead queue - redeliver a message that
+                    // was handed over but never acknowledged within a timeout
+                    let mut q = queue.queue.write().await;
+                    if let Some(m) = q.iter_mut().find(|m| m.idx == idx) {
+                        m.handled_by = Some(cid);
+                    }
                 }
             }
         });
@@ -275,11 +441,16 @@ impl Queue {
     pub(crate) async fn delete(&self, request: &QueueNameKey, _from_peer: &Option<String>, log: &Logger) {
         let q = if let Some(idx) = request.idx {
             let mut q = self.queue.write().await;
-            q.retain(|v| v.idx > idx); // TODO optimize for big queue size
+            // Remove ONLY the acknowledged message. `> idx` treated every ack as
+            // cumulative, but a consumer acknowledges one specific key, and they
+            // come back out of order (a burst acks e.g. 2,3,1,8,9,7,...). Acking
+            // a high idx therefore silently discarded every lower message still
+            // waiting to be dispatched - a steady, load-dependent message loss.
+            q.retain(|v| v.idx != idx); // TODO optimize for big queue size
             q.len() as i64
         } else {-1};
-        trace!(log, "remove [{}] # {:?} queue size: [{}]", request.input, request.idx, q);
-        let _ = self.sender.send(0).await;
+        debug!(log, "{}ack [{}] # {:?} queue size: [{}] cap={}", LP, request.input, request.idx, q, self.sender.capacity());
+        let _ = self.sender.try_send(0);
     }
 
     /// TODO queue: check if dispatcher is not available, then try become queue dispatcher AND set idx
@@ -301,14 +472,21 @@ impl EtcdNode {
 
         let qn = QueueNameKey::new(key);
         if qn.queue {
-            return match self.queues.read().await.get(&qn.queue_name).map(|q| q.clone()) {
-                None => {
-                    let q = Queue::new(&self, &qn).await;
-                    self.queues.write().await.insert(qn.queue_name.clone(), q.clone());
-                    Ok((q, qn))
-                }
-                Some(q) => Ok((q, qn))
-            };
+            // Scope the read guard: as the match scrutinee it lived for the whole
+            // match, so the create arm deadlocked against its own `write()`. It
+            // never showed because every queue used to be created by
+            // create_watcher (which takes the write lock directly) - a queue that
+            // nothing watches, like /q/ch:<table>/, is created by the first put
+            // and hit it immediately, wedging the whole node.
+            let existing = self.queues.read().await.get(&qn.queue_name).cloned();
+            if let Some(q) = existing {
+                return Ok((q, qn));
+            }
+            let q = Queue::new(&self, &qn).await;
+            let mut queues = self.queues.write().await;
+            // re-check: another put may have created it while we had no lock
+            let q = queues.entry(qn.queue_name.clone()).or_insert(q).clone();
+            return Ok((q, qn));
         }
         Err(())
     }
@@ -425,5 +603,69 @@ pub mod test {
         assert!(Queue::is_consumer(&("/q/name/c/client".split("/").collect())));
 
          */
+    }
+
+    fn msg(idx: u64) -> QueueMsg {
+        QueueMsg { idx, key: format!("/q/name/{}/k", idx), value: vec![],
+                   created: Instant::now(), handled_by: None }
+    }
+
+    /// Regression: a second producer put used to stall the queue for good.
+    /// `put` pushes to the front and notifies with the NEW idx, while dispatch
+    /// reads the OLDEST from the back - so `if x.idx > 0 && r != x.idx` lined up
+    /// only while exactly one message was outstanding.
+    #[test]
+    pub fn dispatch_walks_the_backlog_not_just_the_head() {
+        let mut q: VecDeque<QueueMsg> = VecDeque::new();
+        assert_eq!(next_undelivered(&q), None);
+
+        q.push_front(msg(1));
+        assert_eq!(next_undelivered(&q), Some(1));
+
+        // message 1 is still queued (not yet acknowledged) when 2 arrives
+        q.push_front(msg(2));
+        assert_eq!(next_undelivered(&q), Some(1), "FIFO: the older message first");
+
+        // hand 1 over, and the next wake must move on to 2 rather than re-send 1
+        q.iter_mut().find(|m| m.idx == 1).unwrap().handled_by = Some(Uuid::nil());
+        assert_eq!(next_undelivered(&q), Some(2));
+
+        q.iter_mut().find(|m| m.idx == 2).unwrap().handled_by = Some(Uuid::nil());
+        assert_eq!(next_undelivered(&q), None, "nothing left to hand over");
+    }
+
+    /// Regression: acknowledges come back out of order, so an ack must remove
+    /// only its own message. Removing everything below it discarded messages
+    /// that had not been dispatched yet.
+    #[test]
+    pub fn acknowledge_removes_only_its_own_message() {
+        let mut q: VecDeque<QueueMsg> = VecDeque::new();
+        for i in 1..=5 { q.push_front(msg(i)); }
+        // consumer finishes #4 first and acknowledges it
+        let idx = 4;
+        q.retain(|v| v.idx != idx);
+        assert_eq!(q.len(), 4);
+        let left: Vec<u64> = q.iter().rev().map(|m| m.idx).collect();
+        assert_eq!(left, vec![1, 2, 3, 5], "only #4 goes, the rest still owe delivery");
+        // and they are all still deliverable
+        assert_eq!(next_undelivered(&q), Some(1));
+    }
+
+    /// An acknowledge removes everything up to that idx and wakes the dispatcher
+    /// with 0; that wake must still deliver, which the old guard refused since 0
+    /// never equals a real idx.
+    #[test]
+    pub fn acknowledge_frees_the_next_message() {
+        let mut q: VecDeque<QueueMsg> = VecDeque::new();
+        q.push_front(msg(1));
+        q.push_front(msg(2));
+        q.iter_mut().for_each(|m| m.handled_by = Some(Uuid::nil()));
+        assert_eq!(next_undelivered(&q), None);
+
+        q.push_front(msg(3));
+        // Queue::delete does exactly this retain on acknowledge of idx 1
+        q.retain(|v| v.idx != 1);
+        assert_eq!(q.len(), 2);
+        assert_eq!(next_undelivered(&q), Some(3));
     }
 }

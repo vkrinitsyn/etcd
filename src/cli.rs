@@ -70,6 +70,16 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "")]
     pub listen_client_http_urls : String,
 
+    /// ClickHouse HTTP endpoint for /q/ch:<table>/ queues, e.g. http://127.0.0.1:8123
+    /// (may carry userinfo). Empty disables the built-in consumer, and such a
+    /// queue then behaves like any other rather than dropping messages.
+    #[arg(long, required = false, default_value = "")]
+    pub clickhouse_url: String,
+
+    /// Database for /q/ch:<table>/ queues whose name does not carry one.
+    #[arg(long, required = false, default_value = "")]
+    pub clickhouse_db: String,
+
     /// Maximum number of snapshot files to retain (0 is unlimited).
     #[arg(long, required = false, default_value = "5")]
     pub max_snapshots: u32,
