@@ -23,11 +23,36 @@ type ResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> +
 impl EtcdNode {
     pub(crate) async fn watch_notify(&self, mut receiver: Receiver<crate::kv::Kv>) {
         let observers = self.observers.clone();
+        let observer_ranges = self.observer_ranges.clone();
         let watchers = self.watchers.clone();
         let log = self.log.clone();
         tokio::spawn(async move {
             while let Some(kv) = receiver.recv().await {
-                if let Some(v) = observers.read().await.get(&kv.key).map(|v| v.clone()) {
+                // [range] Exact-key watchers first - unchanged, and still the
+                // fast path - then the ones registered over a range. Without the
+                // second part a prefix watch never fired at all: the watcher sat
+                // under its literal start key and the changed key never equalled
+                // it. That is how a client subscribes to a key range, and how
+                // rppd registers a queue consumer.
+                let mut targets: Vec<(crate::cluster::ClientId, i64)> =
+                    observers.read().await.get(&kv.key).cloned().unwrap_or_default();
+                {
+                    let ranges = observer_ranges.read().await;
+                    let obs = observers.read().await;
+                    for (start, end) in ranges.iter() {
+                        // the exact-key hit above already covered start == key
+                        if start == &kv.key {
+                            continue;
+                        }
+                        if crate::cluster::EtcdNode::in_range(&kv.key, start, end) {
+                            if let Some(v) = obs.get(start) {
+                                targets.extend(v.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    let v = targets;
                     for (cid, wid) in v { // expected watcher per client
                         if let Some(client_watcher) = watchers.read().await.get(&cid) {
                             if let Some(client) = client_watcher.read().await.watchers.get(&wid) {

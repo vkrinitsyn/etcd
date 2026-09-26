@@ -229,3 +229,74 @@ async fn test_watch() -> Result<()> {
 
     Ok(())
 }
+
+/// [range] A PREFIX watch, which never fired before.
+///
+/// `create_watcher` dropped `range_end` and registered the watcher under its
+/// literal start key, and `watch_notify` looked the changed key up in that map
+/// directly - so a watch on `/p/` sat under `/p/` and a put to `/p/x` matched
+/// nothing at all. Every prefix watch was silent. That is how a client
+/// subscribes to a key range, and how rppd registers a queue consumer
+/// (`rppd_function.schema_table` beginning with `/`).
+#[tokio::test]
+async fn test_watch_prefix() -> Result<()> {
+    use etcd_client::WatchOptions;
+    let (_node, mut client) = start_server().await;
+
+    let mut stream = client
+        .watch("wp/", Some(WatchOptions::new().with_prefix()))
+        .await?;
+
+    // under the prefix, and NOT equal to it - the exact-key path must not be
+    // what makes this pass
+    client.put("wp/one", "1", None).await?;
+
+    // The first frame on a new watch is the `created` ack, which carries no
+    // events - read past it rather than mistaking it for a delivery.
+    let events = next_events(&mut stream).await;
+    assert_eq!(events.len(), 1, "one put under the prefix, one event");
+    assert_eq!(events[0].0, b"wp/one".to_vec());
+    assert_eq!(events[0].1, b"1".to_vec());
+    Ok(())
+}
+
+/// ...and a key OUTSIDE the prefix must stay silent, or the fix traded a watch
+/// that never fires for one that fires on everything.
+#[tokio::test]
+async fn test_watch_prefix_ignores_outsiders() -> Result<()> {
+    use etcd_client::WatchOptions;
+    let (_node, mut client) = start_server().await;
+
+    let mut stream = client
+        .watch("inside/", Some(WatchOptions::new().with_prefix()))
+        .await?;
+
+    client.put("outside/key", "x", None).await?;
+    // Only a frame WITH events counts as waking the watcher; the created ack
+    // arrives regardless and is not a delivery.
+    let quiet = tokio::time::timeout(std::time::Duration::from_secs(2), next_events(&mut stream)).await;
+    match quiet {
+        Err(_) => {}                       // nothing delivered: correct
+        Ok(ev) => panic!("a put outside the prefix woke the watcher: {:?}", ev),
+    }
+
+    // and the watcher is still live for one that IS inside
+    client.put("inside/key", "y", None).await?;
+    let events = next_events(&mut stream).await;
+    assert_eq!(events[0].0, b"inside/key".to_vec());
+    Ok(())
+}
+
+/// Read watch frames until one actually carries events, returning (key, value)
+/// pairs. A new watch's first frame is the `created` ack and carries none.
+async fn next_events(stream: &mut etcd_client::WatchStream) -> Vec<(Vec<u8>, Vec<u8>)> {
+    loop {
+        let resp = stream.message().await.expect("watch stream").expect("watch open");
+        let evs: Vec<(Vec<u8>, Vec<u8>)> = resp.events().iter()
+            .filter_map(|e| e.kv().map(|kv| (kv.key().to_vec(), kv.value().to_vec())))
+            .collect();
+        if !evs.is_empty() {
+            return evs;
+        }
+    }
+}

@@ -21,6 +21,52 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "1")]
     pub term: u64,
 
+    /// Key prefixes that never propagate to peers, comma separated.
+    ///
+    /// A key under one of these lives on the node that wrote it and nowhere
+    /// else. Empty (the default) means every key propagates, which is
+    /// byte-for-byte the behaviour before this existed.
+    #[arg(long, required = false, default_value = "")]
+    pub local_prefix: String,
+
+    /// Sub-prefixes of `local_prefix` that DO propagate, comma separated.
+    ///
+    /// Carved out of the local subtree rather than listed as an allow-list, so
+    /// a branch nobody named stays local: the default for anything new is "does
+    /// not leave the node", which is the safe direction for a subtree that
+    /// exists because its contents are confidential.
+    #[arg(long, required = false, default_value = "")]
+    pub local_prefix_except: String,
+
+    /// Key prefixes served only to a loopback caller, comma separated.
+    ///
+    /// Independent of `local_prefix`: a value may legitimately propagate
+    /// between nodes while still being none of a remote client's business.
+    #[arg(long, required = false, default_value = "")]
+    pub local_only_prefix: String,
+
+    /// Key prefixes that propagate only to peers in this node's zone.
+    ///
+    /// Composes with `local_prefix`: a key may propagate and still be confined
+    /// to one zone. Empty means no key is zone-scoped, which is today's
+    /// behaviour.
+    #[arg(long, required = false, default_value = "")]
+    pub zone_prefix: String,
+
+    /// This node's zone. Empty means unzoned, and two unzoned nodes share the
+    /// same (unnamed) zone.
+    #[arg(long, required = false, default_value = "")]
+    pub zone: String,
+
+    /// Zone of each peer: `host:port=zone`, comma separated.
+    ///
+    /// Supplied by the embedder, which already knows the topology. The etcd
+    /// member protocol carries no zone and extending it would break API
+    /// compatibility, so labels come from configuration rather than from a
+    /// handshake.
+    #[arg(long, required = false, default_value = "")]
+    pub peer_zones: String,
+
 // all fields bellow copied from etcd configuration
 
     /// Human-readable name for this member.

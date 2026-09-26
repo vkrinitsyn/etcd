@@ -14,6 +14,9 @@ pub mod cluster;
 mod srv;
 pub mod queue;
 pub mod kv;
+pub mod prefix;
+/// [q-route] queue dispatcher + consumer registries, and the routing they buy
+pub mod route;
 mod peer;
 
 

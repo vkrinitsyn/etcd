@@ -26,6 +26,8 @@ const RECENT_WINDOW_SECS: u64 = 30;
 pub struct EtcdCluster {
     /// cluster nodes (not clients, see node watchers for clients)
     peers: Vec<EtcdPeerNodeType>,
+    /// this node's own zone, for comparing against a peer's
+    my_zone: String,
     /// 0 means no timeout
     connect_timeout_ms: u64,
     /// track recently added peer_ids to prevent rapid re-addition
@@ -54,6 +56,8 @@ pub enum PeerState {
 pub(crate) struct EtcdPeerNode {
     peer_id: NodeId,
     pub(crate) conn: String,
+    /// This peer's zone, from `peer_zones`. Empty means unzoned.
+    pub(crate) zone: String,
     pub(crate) state: PeerState,
     added_at: Instant,
     pub(crate) kv_client: Arc<Mutex<KvClient<Channel>>>,
@@ -69,7 +73,57 @@ pub(crate) enum BroadcastRequest {
 }
 
 
+/// The host part of a peer URL, for matching against a `peer_zones` entry.
+///
+/// Entries may be written `host:port` or bare `host`, and a peer's `conn` is a
+/// URL — so both sides are reduced to the same shape before comparing rather
+/// than requiring an operator to guess the stored form.
+fn host_key(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")).unwrap_or(s);
+    s.split('/').next().unwrap_or(s).trim().to_string()
+}
+
+/// Look up a peer's zone in a `host:port=zone,...` list.
+///
+/// Matches on `host:port` first, then on the bare host — so one entry can
+/// cover a node whose port an operator did not write down, without a
+/// host-only entry silently shadowing a more specific one.
+fn zone_of(conn: &str, peer_zones: &str) -> String {
+    let want = host_key(conn);
+    let bare = want.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_else(|| want.clone());
+    let mut fallback = String::new();
+    for e in peer_zones.split(',') {
+        let Some((h, z)) = e.split_once('=') else { continue };
+        let h = host_key(h);
+        if h == want {
+            return z.trim().to_string();
+        }
+        if h == bare {
+            fallback = z.trim().to_string();
+        }
+    }
+    fallback
+}
+
 impl EtcdCluster {
+    /// This node's zone, as last configured.
+    pub(crate) fn my_zone(&self) -> &str { &self.my_zone }
+
+    /// Re-label every peer from configuration.
+    ///
+    /// Called wherever the config is applied. The etcd member protocol carries
+    /// no zone, and extending it would break API compatibility, so the labels
+    /// come from the embedder — which already knows the topology.
+    pub(crate) fn apply_zones(&mut self, my_zone: &str, peer_zones: &str) {
+        self.my_zone = my_zone.trim().to_string();
+        for p in &self.peers {
+            if let Ok(mut n) = p.try_lock() {
+                n.zone = zone_of(&n.conn.clone(), peer_zones);
+            }
+        }
+    }
+
     /// send request to the clusters peer and get success response from more than half nodes 
     pub(crate) async fn connect(cfg: &EtcdConfig, node_id: NodeId, cluster_id: NodeId, log: &Logger) -> std::result::Result<Self, String> {
         let timeout_ms = cfg.election_timeout;
@@ -77,6 +131,7 @@ impl EtcdCluster {
 
         let mut cluster = EtcdCluster {
             peers: vec![],
+            my_zone: cfg.zone.clone(),
             connect_timeout_ms: timeout_ms as u64,
             recently_added: HashMap::new(),
             node_id,
@@ -95,6 +150,11 @@ impl EtcdCluster {
         }
     }
     
+    /// [peer-retry] How many peers are currently connected.
+    pub(crate) fn connected(&self) -> usize {
+        self.peers.len()
+    }
+
     pub(crate) async fn add_connections(&mut self, mut clients: HashSet<&str>) -> std::result::Result<usize, String> {
         let connect_timeout_ms = self.connect_timeout_ms;
         for p in &self.peers {
@@ -151,7 +211,40 @@ impl EtcdCluster {
                                                    EtcdPeerNode {
                                                        peer_id: s.member_id,
                                                        conn: url.to_string(),
-                                                       state: PeerState::Spare,
+                                                       // Unzoned until `apply_zones` labels it on
+                                                       // the next reconfigure. That window is
+                                                       // fail-safe: on a zoned node an unlabelled
+                                                       // peer compares unequal to my zone, so it
+                                                       // receives no zone-scoped key until it is
+                                                       // known to share one.
+                                                       zone: String::new(),
+                                                       // NOT `Spare`. A peer reaches this line
+                                                       // only after it answered `status` with a
+                                                       // cluster id matching ours, so it is a
+                                                       // verified member of this cluster - and
+                                                       // `broadcast_scoped` skips `Spare`
+                                                       // entirely, so a connected peer left
+                                                       // `Spare` receives nothing, forever.
+                                                       //
+                                                       // The only thing that ever promoted one
+                                                       // was the `member_promote` gRPC admin
+                                                       // call, which ytserv never makes: every
+                                                       // peer connected, every put succeeded
+                                                       // locally, `send_indices` was empty so
+                                                       // the broadcast returned `Ok(())`, and
+                                                       // the kv was per-node with nothing
+                                                       // logged anywhere.
+                                                       //
+                                                       // `InProgress` is the state that means
+                                                       // "receives writes, does not yet gate the
+                                                       // commit" (`quorum_total` counts only
+                                                       // `Online`), which is exactly right for a
+                                                       // peer that is connected but has not yet
+                                                       // proven it can replicate. The first
+                                                       // successful broadcast promotes it to
+                                                       // `Online`, mirroring the demote-on-
+                                                       // timeout below it.
+                                                       state: PeerState::InProgress,
                                                        added_at: Instant::now(),
                                                        kv_client: Arc::new(Mutex::new(KvClient::new(conn.clone()))),
                                                        mt_client: Arc::new(Mutex::new(mt)),
@@ -186,6 +279,23 @@ impl EtcdCluster {
     /// Spare peers are skipped entirely.
     /// Peers that timeout are demoted to Spare.
     pub(crate) async fn broadcast(&self, request: BroadcastRequest) -> std::result::Result<(), Status> {
+        self.broadcast_scoped(request, None).await
+    }
+
+    /// Broadcast, optionally confined to peers sharing this node's zone.
+    ///
+    /// `zone_scoped` is decided by the caller from the key's prefix, because
+    /// the key is what carries the policy — a peer cannot be asked whether it
+    /// should receive something.
+    ///
+    /// **A peer whose zone is unknown is excluded** from a zone-scoped
+    /// broadcast whenever this node is zoned. That is the fail-safe direction:
+    /// a peer added since the last reconfigure is unlabelled, and sending it a
+    /// zone-scoped key on the assumption that no label means "same zone" is
+    /// exactly the leak zoning exists to prevent.
+    pub(crate) async fn broadcast_scoped(&self, request: BroadcastRequest, zone_scoped: Option<&str>)
+        -> std::result::Result<(), Status>
+    {
         if self.peers.is_empty() {
             return Ok(());
         }
@@ -193,7 +303,13 @@ impl EtcdCluster {
         let mut online_indices = Vec::new();
         let mut syncing_indices = Vec::new();
         for (i, p) in self.peers.iter().enumerate() {
-            match p.lock().await.state {
+            let p = p.lock().await;
+            if let Some(my_zone) = zone_scoped {
+                if p.zone.trim() != my_zone.trim() {
+                    continue;
+                }
+            }
+            match p.state {
                 PeerState::Online => online_indices.push(i),
                 PeerState::InProgress => syncing_indices.push(i),
                 PeerState::Spare => {}
@@ -238,6 +354,9 @@ impl EtcdCluster {
         let mut online_reply_count = 0u32;
         let mut total_ms = 0u64;
         let mut timed_out_peers = Vec::new();
+        // InProgress peers that replicated this message successfully: they have
+        // now proven they can, which is what `Online` means.
+        let mut synced_peers = Vec::new();
 
         while let Some((idx, is_online, ok, elapsed_ms)) = receiver.recv().await {
             if is_online {
@@ -248,6 +367,8 @@ impl EtcdCluster {
                 } else {
                     timed_out_peers.push(idx);
                 }
+            } else if ok {
+                synced_peers.push(idx);
             }
             if online_reply_count as f32 > half && deadline_ms.load(Ordering::Relaxed) == 0 {
                 let avg = total_ms / online_reply_count as u64;
@@ -264,6 +385,19 @@ impl EtcdCluster {
             }
         }
 
+        // The mirror of the demotion above, and the half that was missing: a
+        // peer only ever left `InProgress` through the `member_promote` admin
+        // API, so in an embedded deployment it never left it at all. Replicating
+        // one message successfully is the evidence the state machine wanted.
+        for idx in &synced_peers {
+            let mut peer = self.peers[*idx].lock().await;
+            if peer.state == PeerState::InProgress {
+                info!(self.log, "{}peer {} promoted to Online (replicated successfully)",
+                    LP, peer.conn);
+                peer.state = PeerState::Online;
+            }
+        }
+
         if quorum_total == 0 || ok_count as f32 > half {
             Ok(())
         } else {
@@ -271,11 +405,29 @@ impl EtcdCluster {
         }
     }
 
+    /// One request to one peer.
+    ///
+    /// [q-route Phase 4] **The client is CLONED and both locks released before
+    /// the call.** It used to hold `peer.lock()` *and* `kv_client.lock()` for
+    /// the whole round trip, so every concurrent message to the same peer
+    /// serialized on them — and a hot p2p pair is exactly the case that sends
+    /// concurrent messages to one peer. The outer lock was the worse of the
+    /// two: it also blocked every *state* read about that peer, so a slow RPC
+    /// stalled `is_online`, `unicast` and `broadcast_scoped` for it.
+    ///
+    /// Cloning is cheap and correct: a tonic client is a thin handle over a
+    /// `Channel`, which multiplexes concurrent HTTP/2 streams. This removes a
+    /// serialization point, not an ordering guarantee — the queue's ordering
+    /// comes from `idx`, assigned by the dispatcher, never from the order two
+    /// peer RPCs happen to complete in.
     async fn peer_request(request: BroadcastRequest, peer: EtcdPeerNodeType, peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> bool {
+        let mut kv = {
+            let node = peer.lock().await;
+            let c = node.kv_client.lock().await.clone();
+            c
+        };
         match request {
             BroadcastRequest::Kv(br) => {
-                let node = peer.lock().await;
-                let mut kv = node.kv_client.lock().await;
                 match br {
                     KvEvent::Put(kr) => kv.put(kr, peer_id).await.is_ok(),
                     KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.is_ok(),
@@ -363,6 +515,71 @@ impl EtcdCluster {
             }
         }
         count
+    }
+
+    // ─── [q-route] unicast, for the queue routing in queue-p2p-route.md ─────
+
+    /// This node's own id, so a caller can tell `Local` from `Remote`.
+    pub(crate) fn me(&self) -> NodeId { self.node_id }
+
+    /// Is this peer `Online`, and therefore usable as a dispatcher?
+    ///
+    /// `InProgress` deliberately does **not** count. Such a peer receives
+    /// writes but is still syncing, and a dispatcher has to be able to *index*
+    /// and *route*, not merely store — electing one that is still catching up
+    /// puts the queue's ordering behind its recovery.
+    pub(crate) async fn is_online(&self, peer_id: NodeId) -> bool {
+        for p in &self.peers {
+            let n = p.lock().await;
+            if n.peer_id == peer_id {
+                return n.state == PeerState::Online;
+            }
+        }
+        false
+    }
+
+    /// Send one request to one peer.
+    ///
+    /// **Applies the same zone test as `broadcast_scoped`, and that is not
+    /// optional.** A unicast is still a write leaving this node, so a
+    /// zone-scoped key must not reach a peer in another zone — or one whose
+    /// zone is *unknown*, which is the fail-safe direction: a peer added since
+    /// the last reconfigure is unlabelled, and treating "no label" as "same
+    /// zone" is the leak zoning exists to prevent. Being targeted rather than
+    /// broadcast changes nothing about that.
+    ///
+    /// Returns `false` when the peer is unreachable, not Online, or excluded by
+    /// the zone test — the caller falls back to a broadcast and says so, rather
+    /// than silently dropping the message.
+    pub(crate) async fn unicast(&self, request: BroadcastRequest, peer_id: NodeId,
+        zone_scoped: Option<&str>) -> bool
+    {
+        let target = {
+            let mut found = None;
+            for p in &self.peers {
+                let n = p.lock().await;
+                if n.peer_id != peer_id {
+                    continue;
+                }
+                if n.state != PeerState::Online {
+                    return false;
+                }
+                if let Some(my_zone) = zone_scoped {
+                    if n.zone.trim() != my_zone.trim() {
+                        return false;
+                    }
+                }
+                found = Some(p.clone());
+                break;
+            }
+            found
+        };
+        let Some(target) = target else { return false };
+        let id = match MetadataValue::from_str(self.node_id.to_string().as_str()) {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        };
+        Self::peer_request(request, target, id).await
     }
 
     /// Announce this node to all connected peers and sync KV data from the fastest peer.
@@ -467,5 +684,43 @@ impl EtcdCluster {
             peers.push(p.lock().await.conn.clone());
         }
         peers.join(",")
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::{host_key, zone_of};
+
+    #[test]
+    fn a_peer_url_reduces_to_its_host_and_port() {
+        assert_eq!(host_key("http://10.0.0.7:2379"), "10.0.0.7:2379");
+        assert_eq!(host_key("https://node1:2379/"), "node1:2379");
+        assert_eq!(host_key(" 10.0.0.7:2379 "), "10.0.0.7:2379");
+        assert_eq!(host_key("node1"), "node1");
+    }
+
+    #[test]
+    fn a_zone_is_found_by_host_and_port_or_by_host_alone() {
+        let z = "10.0.0.7:2379=east,node2=west";
+        assert_eq!(zone_of("http://10.0.0.7:2379", z), "east");
+        // an operator who did not write the port still gets a match
+        assert_eq!(zone_of("http://node2:2379", z), "west");
+    }
+
+    #[test]
+    fn a_specific_entry_wins_over_a_host_only_one() {
+        // otherwise a broad entry could silently move a node between zones
+        let z = "node1=west,node1:2379=east";
+        assert_eq!(zone_of("http://node1:2379", z), "east");
+    }
+
+    #[test]
+    fn an_unlisted_peer_is_unzoned_which_excludes_it() {
+        // fail-safe: unlabelled compares unequal to a real zone, so a peer we
+        // have not been told about receives no zone-scoped key
+        assert_eq!(zone_of("http://node9:2379", "node1=east"), "");
+        assert_eq!(zone_of("http://node9:2379", ""), "");
+        // malformed entries are skipped, not guessed at
+        assert_eq!(zone_of("http://node1:2379", "node1,node1=,=east"), "");
     }
 }

@@ -1,4 +1,4 @@
-use crate::cluster::{ClientId, EtcdClientNode, EtcdNode, EtcdPeerNodeType, WatcherConsumer, WatcherId};
+use crate::cluster::{ClientId, EtcdClientNode, EtcdNode, WatcherConsumer, WatcherId};
 use crate::etcdpb::etcdserverpb::{PutRequest, PutResponse, WatchCancelRequest, WatchCreateRequest, WatchResponse};
 use crate::{KvEvent, LP};
 use std::collections::{HashMap, VecDeque};
@@ -33,7 +33,28 @@ pub struct Queue {
     pub(crate) fq_name: String,
 
     pub(crate) etcd: Arc<RwLock<EtcdNode>>,
-    dispatcher: Arc<RwLock<Option< EtcdPeerNodeType>>>,
+
+    /// [q-route] Where this queue's traffic goes: here, one named peer, or
+    /// nowhere known yet.
+    ///
+    /// Replaces an `Option<EtcdPeerNodeType>` in which `None` meant BOTH "I am
+    /// the dispatcher" and "nobody has been elected". Nothing ever wrote it, so
+    /// the second reading always won and every produced message was broadcast
+    /// to every peer — `2(N-1)` RPCs per round trip. See
+    /// `queue-p2p-route.md` and [`crate::route::Dispatch`].
+    dispatch: Arc<RwLock<crate::route::Dispatch>>,
+
+    /// The record as the registry holds it, for the Phase 3 fields.
+    record: Arc<RwLock<Option<crate::route::DispatchRecord>>>,
+
+    /// [q-route Phase 3] The consumer host this queue has been watching, and
+    /// since when. Hysteresis: a consumer that reconnects to a different node
+    /// would otherwise drag the dispatcher with it on every flap and churn the
+    /// registry cluster-wide.
+    pin_seen: Arc<RwLock<Option<(crate::cluster::NodeId, Instant)>>>,
+
+    /// When this queue last did anything, for the idle reaper.
+    idle_since: Arc<RwLock<Option<Instant>>>,
 
     /// store messages /queue/{q_name}/{idx}/{key}
     queue: Arc<RwLock<VecDeque<QueueMsg>>>,
@@ -62,6 +83,28 @@ type MsgNotifyType = u64;
 /// treated as dead. Bounded on purpose: an unbounded `send().await` on a watcher
 /// nobody is draining stalls every other consumer of the same queue.
 const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [q-route Phase 3] How long a queue's single consumer must stay on one node
+/// before the dispatcher follows it there.
+///
+/// Hysteresis, and it is not tuning. Moving a dispatcher rewrites a replicated
+/// key that every node reads, so a consumer flapping between two nodes would
+/// churn the registry for the whole cluster while saving one hop for itself.
+/// Thirty seconds is long against a reconnect and short against a deployment.
+const PIN_STABLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an empty, consumerless queue is kept before it is reaped.
+///
+/// `queue-p2p-route.md` lists teardown as an open question — *"nothing removes
+/// a queue from `EtcdNode::queues` — no TTL, no reaper"*. The registries made
+/// it pressing rather than merely untidy: a leaked queue now also leaks
+/// `/q/{name}` and `/q/{name}/c/{client}`, which are **replicated**, so one
+/// node's leak becomes every node's memory.
+///
+/// Ten minutes is long against a queue that is merely idle between bursts and
+/// short against a lifetime. The guards below, not this number, are what make
+/// it safe.
+const QUEUE_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// client that produce queue input  
 #[derive(Clone, Debug)]
@@ -197,6 +240,28 @@ impl Queue {
             }
         }
         drop(clients);
+        self.touched().await;
+
+        // [q-route Phase 2] Record which node hosts this consumer, so the
+        // dispatcher can route to it instead of broadcasting and hoping.
+        // Replicated like any key, so every node can resolve it.
+        //
+        // BEFORE the claim below, and the order matters: the claim asks whether
+        // the current dispatcher hosts a consumer, and it has to be able to see
+        // this one.
+        self.publish_consumer(&client_id).await;
+
+        // [q-route] **This node now holds a consumer, so it should dispatch.**
+        //
+        // A dispatcher at neither end costs two hops — producer node ->
+        // dispatcher -> consumer node. At the consumer it costs one, for EVERY
+        // producer at once. So a consumer's node claims the queue immediately
+        // and takes it over from a producer's node; it does not wait for the
+        // Phase 3 hysteresis, which exists for RELOCATING an established
+        // dispatcher, not for placing one.
+        let log = self.etcd.read().await.log.clone();
+        self.elect(crate::route::Claim::Consumer, &log).await;
+
         let _ = notify.send(0).await;
     }
 
@@ -261,6 +326,12 @@ impl Queue {
         };
         if empty {
             clients.remove(client_id);
+            // [q-route Phase 2] The last watcher for this client is gone, so
+            // this node no longer hosts it. Withdrawing is what stops the
+            // dispatcher unicasting into a node with nobody listening — which
+            // would look exactly like a slow consumer.
+            drop(clients);
+            self.withdraw_consumer(client_id).await;
         }
     }
 
@@ -269,7 +340,10 @@ impl Queue {
         Queue {
             fq_name: format!("/{}/{}", qn.prefix, qn.queue_name),
             etcd: Arc::new(RwLock::new(etcd.clone())),
-            dispatcher: Arc::new(RwLock::new(None)),
+            dispatch: Arc::new(RwLock::new(crate::route::Dispatch::Unknown)),
+            record: Arc::new(RwLock::new(None)),
+            pin_seen: Arc::new(RwLock::new(None)),
+            idle_since: Arc::new(RwLock::new(Some(Instant::now()))),
             queue: Arc::new(Default::default()),
             idx: Arc::new(AtomicU64::new(1)),
             // delivery: Arc::new(Default::default()),
@@ -293,6 +367,29 @@ impl Queue {
 
     /// EtcdNode required to notify consumers
     pub(crate) async fn put(&self, qn: QueueNameKey, x: PutRequest, from_peer: &Option<String>, _log: &Logger) -> Result<Response<PutResponse>, Status> {
+        // [q-route Phase 2] A DELIVERY arriving from the dispatcher
+        // (`/q/{name}/c/{cid}/{idx}/{key}`) is not a new message: it is this
+        // node being told to hand one to a consumer it hosts. Enqueuing it
+        // would put a second copy in a second queue, and the ack — which
+        // deletes by idx on the DISPATCHER — would never reach it.
+        if from_peer.is_some() && qn.consumer {
+            if let Some(cid) = qn.client_id {
+                let kv = KeyValue { key: qn.input.clone().into_bytes(), value: x.value.clone(),
+                    ..Default::default() };
+                let ok = self.deliver_local(&cid, kv, _log).await;
+                if !ok {
+                    // The registry said we host this consumer and we do not.
+                    // Refusing is what lets the dispatcher try another one
+                    // rather than count it delivered.
+                    return Err(Status::not_found(format!(
+                        "no live consumer {} on this node for {}", cid, self.fq_name)));
+                }
+                return Ok(Response::new(PutResponse::default()));
+            }
+        }
+
+        self.touched().await;
+        let dispatch = self.dispatch().await;
         let idx = qn.idx.unwrap_or(self.idx.fetch_add(1, Ordering::Relaxed));
         let msg = QueueMsg {
             idx,
@@ -302,12 +399,40 @@ impl Queue {
             handled_by: None,
         };
 
-        let depth = { let mut q = self.queue.write().await; q.push_front(msg); q.len() };
-        let notified = self.sender.try_send(idx);
-        debug!(_log, "{}queued #{} [{}] notify={:?} cap={}", LP, idx, depth,
-            notified.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.sender.capacity());
+        // **Only the dispatcher keeps the message.** A producer's node forwards
+        // and forgets.
+        //
+        // Keeping a copy everywhere was harmless while the dispatch loop could
+        // only see LOCAL consumers — a producer-only node had no candidates and
+        // fell straight out. Once the consumer registry let every node see
+        // every consumer, that same copy made every node a dispatcher: the
+        // producer's node and the real dispatcher would each deliver, and the
+        // consumer would get the message TWICE. It would also have leaked, since
+        // the ack deletes by idx on the dispatcher only.
+        if matches!(dispatch, crate::route::Dispatch::Remote(_)) && from_peer.is_none() {
+            trace!(_log, "{}[q-route] forwarding #{} for {} without a local copy",
+                LP, idx, self.fq_name);
+        } else {
+            let depth = { let mut q = self.queue.write().await; q.push_front(msg); q.len() };
+            let notified = self.sender.try_send(idx);
+            debug!(_log, "{}queued #{} [{}] notify={:?} cap={}", LP, idx, depth,
+                notified.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.sender.capacity());
+        }
 
-        if self.dispatcher.read().await.is_none() {
+        // [q-route] Replicate the message only as far as it has to go.
+        //
+        //   Local   this node dispatches: nothing leaves it (Phase 5). A
+        //           co-located producer/dispatcher/consumer is the single-node
+        //           and dev case, and it must never touch the network.
+        //   Remote  one unicast hop to the dispatcher.
+        //   Unknown no registry answer: broadcast, as before, and SAY SO. That
+        //           path used to be the default for every message on every
+        //           cluster; it is now the failure mode, and a log line is what
+        //           makes the difference visible.
+        //
+        // A message arriving FROM a peer is already where it belongs and is
+        // never re-sent, which is what stops a claim race becoming a loop.
+        if from_peer.is_none() {
             let r = PutRequest {
                 key: qn.input.into_bytes(),
                 value: x.value,
@@ -316,8 +441,41 @@ impl Queue {
                 ignore_value: true,
                 ignore_lease: true,
             };
-            let peers = self.etcd.read().await.peers.clone(); // copy smart link to peers
-            let _ = peers.read().await.broadcast(BroadcastRequest::Kv(KvEvent::Put(r))).await?;
+            let etcd = self.etcd.read().await.clone();
+            let zone = {
+                let policy = etcd.policy.read().await;
+                if policy.is_zone_scoped(&r.key) {
+                    Some(etcd.peers.read().await.my_zone().to_string())
+                } else { None }
+            };
+            match dispatch {
+                crate::route::Dispatch::Local => {}
+                crate::route::Dispatch::Remote(node) => {
+                    let peers = etcd.peers.clone();
+                    let sent = peers.read().await
+                        .unicast(BroadcastRequest::Kv(KvEvent::Put(r.clone())), node,
+                            zone.as_deref()).await;
+                    if !sent {
+                        // Unreachable, not Online, or excluded by the zone
+                        // test. Broadcasting rather than dropping is the safe
+                        // direction, and re-electing on the next touch is what
+                        // stops it being permanent.
+                        warn!(_log, "{}[q-route] dispatcher {} unreachable for {}; broadcasting \
+                            and re-electing", LP, node, self.fq_name);
+                        *self.dispatch.write().await = crate::route::Dispatch::Unknown;
+                        let _ = etcd.peers.read().await
+                            .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
+                                zone.as_deref()).await?;
+                    }
+                }
+                crate::route::Dispatch::Unknown => {
+                    debug!(_log, "{}[q-route] no dispatcher for {} yet; broadcasting",
+                        LP, self.fq_name);
+                    let _ = etcd.peers.read().await
+                        .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
+                            zone.as_deref()).await?;
+                }
+            }
         }
 
         Ok(Response::new(PutResponse::default()))
@@ -372,7 +530,28 @@ impl Queue {
                         }
                         v
                     };
-                    if candidates.is_empty() {
+                    // [q-route Phase 2] Consumers on other nodes, from the
+                    // registry. Tried only AFTER every local one: a local
+                    // delivery is a channel send and a remote one is a network
+                    // round trip, so preferring local is the direct-dispatch
+                    // short circuit in the one place it matters.
+                    //
+                    // **Only the dispatcher fans out.** Without this test every
+                    // node holding a copy would deliver to the same consumer —
+                    // the registry tells them all where it is. One dispatcher
+                    // is what makes `handled_by` mean anything.
+                    //
+                    // In the `Unknown` fallback nobody fans out, which is
+                    // exactly the pre-registry behaviour: a broadcast put a
+                    // copy on every node, and only the node actually hosting
+                    // the consumer delivered it.
+                    let remote = if queue.dispatch().await.is_local() {
+                        queue.remote_consumers().await
+                    } else {
+                        Vec::new()
+                    };
+
+                    if candidates.is_empty() && remote.is_empty() {
                         debug!(log, "{}no consumer yet for {} [{}]", LP, key, depth);
                         break; // the next put, ack or watcher registration wakes us
                     }
@@ -417,6 +596,40 @@ impl Queue {
                             }
                         }
                     }
+                    // [q-route Phase 2] Nothing local took it; offer it to a
+                    // consumer on another node. One unicast, to the node the
+                    // registry names — not a broadcast to everyone in the hope
+                    // that whoever hosts it notices.
+                    if delivered.is_none() {
+                        for (cid, node) in remote {
+                            let etcd = queue.etcd.read().await.clone();
+                            let dkey = format!("{}/c/{}/{}/{}",
+                                queue.fq_name, cid, idx, key.rsplit('/').next().unwrap_or(""));
+                            let zone = {
+                                let policy = etcd.policy.read().await;
+                                if policy.is_zone_scoped(dkey.as_bytes()) {
+                                    Some(etcd.peers.read().await.my_zone().to_string())
+                                } else { None }
+                            };
+                            let req = PutRequest {
+                                key: dkey.into_bytes(),
+                                value: kv.value.clone(),
+                                lease: 0, prev_kv: false, ignore_value: true, ignore_lease: true,
+                            };
+                            let sent = etcd.peers.read().await
+                                .unicast(BroadcastRequest::Kv(KvEvent::Put(req)), node,
+                                    zone.as_deref()).await;
+                            if sent {
+                                debug!(log, "{}[q-route] dispatch {} -> consumer {} on node {}",
+                                    LP, key, cid, node);
+                                delivered = Some(cid);
+                                break;
+                            }
+                            warn!(log, "{}[q-route] node {} would not take {} for consumer {}",
+                                LP, node, key, cid);
+                        }
+                    }
+
                     let Some(cid) = delivered else {
                         // no consumer took it; leave it queued for the next one
                         break;
@@ -431,6 +644,13 @@ impl Queue {
                         m.handled_by = Some(cid);
                     }
                 }
+
+                // [q-route Phase 3] With the queue drained, consider moving the
+                // dispatcher onto its consumer's node. Here rather than on a
+                // timer because this is the one moment the guard "nothing
+                // outstanding" is most likely to hold, and because the
+                // dispatcher is the only node that can evaluate it.
+                queue.pin_to_consumer(&log).await;
             }
         });
         self
@@ -453,11 +673,437 @@ impl Queue {
         let _ = self.sender.try_send(0);
     }
 
-    /// TODO queue: check if dispatcher is not available, then try become queue dispatcher AND set idx
-    pub(crate) async fn dispatcher(&self) -> Option<EtcdPeerNodeType> {
-        self.dispatcher.read().await.clone()
+    // ─── [q-route Phase 2] the consumer -> host registry ───────────────────
+
+    /// Record that this node hosts `client`.
+    async fn publish_consumer(&self, client: &ClientId) {
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+        let key = crate::route::consumer_key(&self.fq_name, client);
+        if let Err(e) = put_control(&etcd, &key, &me.to_string()).await {
+            warn!(etcd.log, "{}[q-route] cannot publish consumer {}: {}", LP, key, e);
+        }
     }
 
+    /// Withdraw it.
+    async fn withdraw_consumer(&self, client: &ClientId) {
+        let etcd = self.etcd.read().await.clone();
+        let key = crate::route::consumer_key(&self.fq_name, client);
+        if let Err(e) = etcd.kv_delete(key.clone().into_bytes()).await {
+            warn!(etcd.log, "{}[q-route] cannot withdraw consumer {}: {}", LP, key, e);
+        }
+    }
+
+    /// Consumers this queue has anywhere in the cluster, and where they live.
+    ///
+    /// Local ones are excluded: the dispatch loop already has their channels
+    /// and delivering to them costs nothing, so including them here would only
+    /// offer the network as an alternative to a local send.
+    async fn remote_consumers(&self) -> Vec<(ClientId, crate::cluster::NodeId)> {
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+        let local: Vec<ClientId> = self.clients.read().await.keys().copied().collect();
+        let prefix = format!("{}/c/", self.fq_name);
+        let mut out = Vec::new();
+        for (k, v) in etcd.kv_prefix(prefix.as_bytes()).await {
+            let key = String::from_utf8_lossy(&k).to_string();
+            let Some(cid) = crate::route::consumer_of(&key) else { continue };
+            if local.contains(&cid) {
+                continue;
+            }
+            let Ok(node) = String::from_utf8_lossy(&v).trim().parse::<crate::cluster::NodeId>()
+                else { continue };
+            if node == me {
+                // Our own registration, left behind by a watcher that went away
+                // without withdrawing. Routing to ourselves over the network
+                // would be a loop.
+                continue;
+            }
+            out.push((cid, node));
+        }
+        out.sort_by_key(|(_, n)| *n);
+        out
+    }
+
+    /// Does `node` host any consumer of this queue?
+    ///
+    /// The test that makes the dispatcher an **endpoint**: a node that hosts no
+    /// consumer is a third party, and routing through it costs an extra hop to
+    /// every producer.
+    async fn node_hosts_consumer(&self, node: crate::cluster::NodeId) -> bool {
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+        if node == me && !self.clients.read().await.is_empty() {
+            return true;
+        }
+        let prefix = format!("{}/c/", self.fq_name);
+        for (k, v) in etcd.kv_prefix(prefix.as_bytes()).await {
+            if crate::route::consumer_of(&String::from_utf8_lossy(&k)).is_none() {
+                continue;
+            }
+            if String::from_utf8_lossy(&v).trim().parse::<crate::cluster::NodeId>() == Ok(node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deliver one message to a locally-hosted consumer's watchers.
+    ///
+    /// The receiving end of a remote dispatch: the dispatcher unicasts the
+    /// delivery key to the node the registry names, and that node's `put` lands
+    /// here instead of enqueuing a second copy.
+    async fn deliver_local(&self, client: &ClientId, kv: KeyValue, log: &Logger) -> bool {
+        let watchers: Vec<(WatcherId, Sender<Result<WatchResponse, Status>>)> = {
+            let clients = self.clients.read().await;
+            match clients.get(client) {
+                None => Vec::new(),
+                Some(c) => c.read().await.watchers.iter()
+                    .map(|(wid, w)| (*wid, w.client.clone())).collect(),
+            }
+        };
+        for (wid, ch) in watchers {
+            let resp = WatchResponse {
+                header: None,
+                watch_id: wid,
+                created: false,
+                canceled: false,
+                compact_revision: 0,
+                cancel_reason: "".to_string(),
+                fragment: false,
+                events: vec![Event { r#type: 0, kv: Some(kv.clone()), prev_kv: None }],
+            };
+            match tokio::time::timeout(DISPATCH_TIMEOUT, ch.send(Ok(resp))).await {
+                Ok(Ok(())) => return true,
+                Ok(Err(_)) | Err(_) => {
+                    warn!(log, "{}[q-route] local consumer {} watcher {} would not take a \
+                        dispatched message, dropping it", LP, client, wid);
+                    self.drop_watcher(client, wid).await;
+                }
+            }
+        }
+        false
+    }
+
+    /// [q-route] Where this queue's traffic goes right now.
+    pub(crate) async fn dispatch(&self) -> crate::route::Dispatch {
+        *self.dispatch.read().await
+    }
+
+    /// [q-route] Resolve the dispatcher, electing this node if there is none or
+    /// the recorded one is not usable.
+    ///
+    /// Called on every first touch of a queue — `get_or_create_queue` and
+    /// `create_watcher` — and cheap enough to call again: the common path is a
+    /// vault read and a comparison.
+    ///
+    /// **Last-writer-wins is acceptable here and the reason is worth stating:**
+    /// two nodes claiming at once cost an extra hop for the loser's traffic
+    /// until the registry converges, not a lost or duplicated message. Delivery
+    /// ownership is `handled_by`, which this does not touch. Paying for a
+    /// consensus round to save one hop would be the wrong trade.
+    pub(crate) async fn elect(&self, why: crate::route::Claim, log: &Logger)
+        -> crate::route::Dispatch
+    {
+        use crate::route::{Claim, Dispatch, DispatchRecord, dispatcher_key};
+
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+        let key = dispatcher_key(&self.fq_name);
+
+        let found = etcd.kv_get(key.as_bytes()).await
+            .and_then(|v| DispatchRecord::parse(&String::from_utf8_lossy(&v)));
+
+        // Usable means: it is us, or it is a peer that is Online. An
+        // `InProgress` peer receives writes but is still syncing, and a
+        // dispatcher has to index and route rather than merely store.
+        let usable = match &found {
+            Some(r) if r.node == me => true,
+            Some(r) => etcd.peers.read().await.is_online(r.node).await,
+            None => false,
+        };
+
+        // **The dispatcher is an ENDPOINT, and a consumer endpoint wins.**
+        //
+        // A dispatcher placed at neither end costs two hops: producer node ->
+        // dispatcher -> consumer node. Placed at the consumer's node it costs
+        // ONE, for every producer at once — which is the whole point of p2p
+        // routing, and why a consumer's node takes the queue over from a
+        // producer's rather than waiting for the Phase 3 hysteresis.
+        //
+        // A producer claims only an unclaimed queue. Two consumers on two nodes
+        // leave the first in place: there is no single right answer then, and
+        // `pin_to_consumer` deliberately declines to pick one.
+        let hosts_consumer = match &found {
+            Some(r) if usable => self.node_hosts_consumer(r.node).await,
+            _ => false,
+        };
+        let take_over = matches!(why, Claim::Consumer) && !hosts_consumer;
+
+        if usable && !take_over {
+            let d = Dispatch::of(found.as_ref(), me);
+            *self.record.write().await = found;
+            *self.dispatch.write().await = d;
+            return d;
+        }
+        if take_over {
+            if let Some(r) = &found {
+                info!(log, "{}[q-route] {} dispatcher moves {} -> {}: this node hosts a \
+                    consumer and that one does not", LP, key, r.node, me);
+            }
+        }
+
+        // Claim it. A record naming a peer that has gone Spare is REPLACED, not
+        // kept: `queue-p2p-route.md` is explicit that a pinned dispatcher on a
+        // demoted peer must be re-elected rather than silently used.
+        if let (Some(r), false) = (&found, take_over) {
+            warn!(log, "{}[q-route] {} dispatcher {} is not Online; re-electing", LP, key, r.node);
+        }
+        let claim = DispatchRecord {
+            node: me,
+            // Phase 3 fields survive a re-election: the LINK is a property of
+            // the queue pair, not of whichever node happens to dispatch it.
+            reply_to: found.as_ref().and_then(|r| r.reply_to.clone()),
+            pinned: false,
+        };
+        if let Err(e) = put_control(&etcd, &key, &claim.render()).await {
+            warn!(log, "{}[q-route] cannot claim {}: {} - falling back to broadcast", LP, key, e);
+            *self.dispatch.write().await = Dispatch::Unknown;
+            return Dispatch::Unknown;
+        }
+        // Re-read to confirm: another node may have claimed it in the same
+        // instant, and adopting its answer is one comparison against a hop on
+        // every subsequent message.
+        let confirmed = etcd.kv_get(key.as_bytes()).await
+            .and_then(|v| DispatchRecord::parse(&String::from_utf8_lossy(&v)))
+            .unwrap_or(claim);
+        let d = Dispatch::of(Some(&confirmed), me);
+        debug!(log, "{}[q-route] {} dispatcher = {:?}", LP, key, d);
+        *self.record.write().await = Some(confirmed);
+        *self.dispatch.write().await = d;
+        d
+    }
+
+    /// Is this queue finished with — empty, unwatched, and idle?
+    ///
+    /// Four guards, and each is a way the obvious version loses a message:
+    ///
+    /// * **No messages.** Including dispatched-but-unacked ones: the ack
+    ///   deletes by idx *here*, so reaping would strand a consumer mid-work.
+    /// * **No local consumers.** A watcher is a live client stream.
+    /// * **No consumers anywhere.** The registry is cluster-wide, so a queue
+    ///   whose only consumer sits on another node is in use even though nothing
+    ///   is attached here.
+    /// * **Idle for [`QUEUE_IDLE`].** A queue between bursts looks identical to
+    ///   a finished one at any single instant.
+    async fn is_reapable(&self) -> bool {
+        if !self.queue.read().await.is_empty() {
+            return false;
+        }
+        if !self.clients.read().await.is_empty() {
+            return false;
+        }
+        if !self.remote_consumers().await.is_empty() {
+            return false;
+        }
+        match *self.idle_since.read().await {
+            Some(t) => t.elapsed() >= QUEUE_IDLE,
+            None => false,
+        }
+    }
+
+    /// Note that the queue has just been used, so the idle clock restarts.
+    async fn touched(&self) {
+        *self.idle_since.write().await = Some(Instant::now());
+    }
+
+    /// Remove this queue's registry keys.
+    ///
+    /// The dispatcher record only — consumer registrations are withdrawn by
+    /// whichever node held them, and a node deleting another's would be
+    /// asserting something it cannot know.
+    async fn forget_registry(&self, log: &Logger) {
+        let etcd = self.etcd.read().await.clone();
+        let key = crate::route::dispatcher_key(&self.fq_name);
+        if let Err(e) = etcd.kv_delete(key.clone().into_bytes()).await {
+            warn!(log, "{}[q-route] cannot clear {}: {}", LP, key, e);
+        }
+    }
+
+    /// [q-route Phase 3] **Relocate** the dispatcher onto its consumer's node.
+    ///
+    /// Placement is not this function's job: a consumer's node claims the queue
+    /// the moment it creates the watch (`Claim::Consumer` in `make_consumer`),
+    /// so the dispatcher is already at an endpoint. This handles the case that
+    /// placement cannot — a consumer that **moved**, leaving the dispatcher on
+    /// a node that no longer hosts it, which is a third party again and costs
+    /// every producer the extra hop.
+    ///
+    /// Three guards, and each exists for a failure rather than for neatness:
+    ///
+    /// * **One consumer only.** With several, there is no single right place,
+    ///   and pinning to one of them would make the others worse. Affinity is an
+    ///   optimization, never a constraint on where a consumer may live.
+    /// * **Stable for [`PIN_STABLE`].** Without it a reconnecting consumer drags
+    ///   the dispatcher with it and churns a replicated key cluster-wide.
+    /// * **Nothing outstanding.** Moving the dispatcher while messages are
+    ///   dispatched-but-unacked would strand them: `handled_by` and the queue
+    ///   they live in are on the old node, and the ack deletes by idx there.
+    ///
+    /// Leader-only in effect — it does nothing unless this node is the current
+    /// dispatcher, because the dispatcher is the one node that can know whether
+    /// anything is outstanding.
+    async fn pin_to_consumer(&self, log: &Logger) {
+        use crate::route::{Dispatch, DispatchRecord, dispatcher_key};
+
+        if !self.dispatch().await.is_local() {
+            return;
+        }
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+
+        // Exactly one consumer, anywhere.
+        let local: Vec<ClientId> = self.clients.read().await.keys().copied().collect();
+        let remote = self.remote_consumers().await;
+        let target = match (local.len(), remote.len()) {
+            (1, 0) => me,                 // already here: nothing to move
+            (0, 1) => remote[0].1,
+            _ => {
+                *self.pin_seen.write().await = None;
+                return;
+            }
+        };
+        if target == me {
+            *self.pin_seen.write().await = None;
+            return;
+        }
+        if !etcd.peers.read().await.is_online(target).await {
+            return;
+        }
+
+        // Stable for long enough?
+        let stable = {
+            let mut seen = self.pin_seen.write().await;
+            match *seen {
+                Some((n, since)) if n == target => since.elapsed() >= PIN_STABLE,
+                _ => {
+                    *seen = Some((target, Instant::now()));
+                    false
+                }
+            }
+        };
+        if !stable {
+            return;
+        }
+
+        // Nothing dispatched-but-unacked.
+        if self.queue.read().await.iter().any(|m| m.handled_by.is_some()) {
+            return;
+        }
+
+        let mut r = self.record.read().await.clone()
+            .unwrap_or_else(|| DispatchRecord::new(me));
+        r.node = target;
+        r.pinned = true;
+        let key = dispatcher_key(&self.fq_name);
+        if let Err(e) = put_control(&etcd, &key, &r.render()).await {
+            warn!(log, "{}[q-route] cannot pin {} to node {}: {}", LP, key, target, e);
+            return;
+        }
+        info!(log, "{}[q-route] {} dispatcher pinned to node {} (its only consumer's host)",
+            LP, key, target);
+        *self.record.write().await = Some(r);
+        *self.dispatch.write().await = Dispatch::Remote(target);
+        *self.pin_seen.write().await = None;
+    }
+
+    /// [q-route Phase 3] Declare this queue the reply half of a linked pair.
+    ///
+    /// Sets `reply_to` on the record so the two dispatchers can be placed
+    /// together. Idempotent; a no-op when the link is already recorded.
+    pub(crate) async fn link_reply_to(&self, other: &str, log: &Logger) {
+        use crate::route::{DispatchRecord, dispatcher_key};
+        let current = self.record.read().await.clone();
+        if current.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(other) {
+            return;
+        }
+        let etcd = self.etcd.read().await.clone();
+        let me = etcd.peers.read().await.me();
+        let mut r = current.unwrap_or_else(|| DispatchRecord::new(me));
+        r.reply_to = Some(other.to_string());
+        let key = dispatcher_key(&self.fq_name);
+        if let Err(e) = put_control(&etcd, &key, &r.render()).await {
+            warn!(log, "{}[q-route] cannot link {} -> {}: {}", LP, key, other, e);
+            return;
+        }
+        debug!(log, "{}[q-route] {} replies to {}", LP, key, other);
+        *self.record.write().await = Some(r);
+    }
+
+}
+
+impl EtcdNode {
+    /// Reap queues nothing is using any more.
+    ///
+    /// `queue-p2p-route.md` listed teardown as an open question. It became a
+    /// real one when the registries landed: a leaked `Queue` used to cost this
+    /// node some memory, and now also leaks `/q/{name}`, which is **replicated**
+    /// — so one node's leak is every node's.
+    ///
+    /// Safe to call as often as an embedder likes; the work is one read lock
+    /// per queue in the common case. Returns how many were reaped.
+    pub async fn reap_idle_queues(&self) -> usize {
+        let candidates: Vec<(String, Queue)> = {
+            self.queues.read().await.iter().map(|(k, q)| (k.clone(), q.clone())).collect()
+        };
+        let mut reaped = Vec::new();
+        for (name, q) in candidates {
+            if q.is_reapable().await {
+                reaped.push((name, q));
+            }
+        }
+        if reaped.is_empty() {
+            return 0;
+        }
+        // Two phases, and the split is not stylistic. `forget_registry` deletes
+        // a replicated key, which goes through `delete_impl`, which takes
+        // `queues.read()` — so awaiting it while holding `queues.write()` is a
+        // deadlock. Drop the map lock first, then clear the registry.
+        let mut dropped = Vec::new();
+        {
+            let mut map = self.queues.write().await;
+            for (name, q) in reaped {
+                // Re-check under the write lock: a producer or a watcher may
+                // have arrived between the scan and here, and reaping then
+                // would drop a queue somebody is holding.
+                if !q.is_reapable().await {
+                    continue;
+                }
+                map.remove(&name);
+                dropped.push((name, q));
+            }
+        }
+        for (name, q) in &dropped {
+            q.forget_registry(&self.log).await;
+            info!(self.log, "{}[q-route] reaped idle queue {}", LP, name);
+        }
+        dropped.len()
+    }
+}
+
+/// [q-route] Write a registry key through the plain KV path.
+///
+/// Deliberately **not** `EtcdNode::kv_put`: that goes through `put_impl`, which
+/// is the function deciding whether a key is a message — and `elect` is called
+/// from inside it. Beyond the borrow-checker's objection to the cycle, a
+/// registry write is by definition not queue traffic and should not be asking
+/// that question at all.
+async fn put_control(etcd: &EtcdNode, key: &str, value: &str) -> Result<(), Status> {
+    etcd.put_kv(PutRequest {
+        key: key.as_bytes().to_vec(),
+        value: value.as_bytes().to_vec(),
+        lease: 0, prev_kv: false, ignore_value: false, ignore_lease: false,
+    }, &None).await.map(|_| ())
 }
 
 impl EtcdNode {
@@ -469,6 +1115,17 @@ impl EtcdNode {
     /// if not a queue capable key, then return Err(())
     pub(crate) async fn get_or_create_queue(&self, r: &PutRequest) -> Result<(Queue, QueueNameKey), ()> {
         let key = String::from_utf8(r.key.clone()).map_err(|_|())?;
+
+        // [q-route] A registry key is NOT a message. `/q/{name}` and
+        // `/q/{name}/c/{client}` DESCRIBE the queue; enqueuing them would have
+        // the registry fill the queue it exists to route — and before this test
+        // existed, that is exactly what a put to either of them did. They fall
+        // through to the ordinary replicated KV path, which is where every node
+        // reads them from. `route::is_control` decides it structurally: a
+        // delivery carries an idx and a tail, a registration carries neither.
+        if crate::route::is_control(&key) {
+            return Err(());
+        }
 
         let qn = QueueNameKey::new(key);
         if qn.queue {
@@ -523,6 +1180,11 @@ impl EtcdNode {
                 }
             }
         }
+        // [range] `r.range_end` was dropped here, so a prefix watch registered
+        // under its literal start key and never matched anything put under it.
+        if !r.range_end.is_empty() {
+            self.observer_ranges.write().await.insert(r.key.clone(), r.range_end.clone());
+        }
         {
             let c = WatcherConsumer { key: r.key.clone(), client: sender.clone() };
             let mut watcher = self.watchers.write().await;
@@ -568,8 +1230,18 @@ impl EtcdNode {
         if let Some(c) =  self.watchers.write().await.get_mut(&cid) {
             trace!(self.log, "CancelRequest watching by client: {} of [{}] watchers", cid, c.read().await.watchers.len());
             if let Some(w) = c.write().await.watchers.remove(&r.watch_id) {
-                if let Some(o) = self.observers.write().await.get_mut(&w.key) {
-                    o.retain(|(o_cid, o_wid)| !(o_cid == &cid && o_wid == &r.watch_id));
+                let empty = {
+                    let mut obs = self.observers.write().await;
+                    if let Some(o) = obs.get_mut(&w.key) {
+                        o.retain(|(o_cid, o_wid)| !(o_cid == &cid && o_wid == &r.watch_id));
+                        o.is_empty()
+                    } else { false }
+                };
+                // [range] ...and drop the range with the last watcher that used
+                // it, or every cancelled prefix watch leaves a scan entry behind.
+                if empty {
+                    self.observers.write().await.remove(&w.key);
+                    self.observer_ranges.write().await.remove(&w.key);
                 }
                 debug!(self.log, "{}CancelRequest watching: {} {}", LP, cid, r.watch_id);
 

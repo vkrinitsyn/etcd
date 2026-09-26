@@ -2,8 +2,14 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use etcd_client::{Client, Error};
 use etcds::cluster::EtcdNode;
 
-pub const TESTING_RANGE: bool = false;
-pub const TESTING_PREFIX: bool = false;
+// [range] Both were `false`: `get_impl` ignored `range_end` entirely, so every
+// range and prefix read fell through to an exact-key lookup, missed, and
+// returned `count: 0`. These assertions could not pass, and switching them off
+// is how that stayed invisible - a prefix read is the shape of service
+// discovery and of the queue's consumer registry, and both silently read as
+// "nothing here".
+pub const TESTING_RANGE: bool = true;
+pub const TESTING_PREFIX: bool = true;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

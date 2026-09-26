@@ -19,6 +19,9 @@ This is an experimental Prof of Concept of the features bellow
 ## Features
 - etcd API v3 compatible client using protobuf to leverage existing ecosystem
 - priority is a [queue](https://github.com/vkrinitsyn/etcd/blob/main/queue.md#etcd-based-queue) implementation with order and delivery guarantee
+- point-to-point [routing](https://github.com/vkrinitsyn/etcd/blob/main/queue-p2p-route.md#point-to-point-routing-for-linked-queues)
+  for a linked request/reply queue pair, and using that route as transport for a
+  requested process
 - no message storage, cluster election, as use another cluster implementation
 - ability to build into another rust application as a component, see [rppd](https://github.com/vkrinitsyn/rppd?tab=readme-ov-file#rppd---rust-python-postgres-discovery)
 
