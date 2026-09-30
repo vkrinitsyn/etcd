@@ -451,8 +451,8 @@ impl Queue {
             match dispatch {
                 crate::route::Dispatch::Local => {}
                 crate::route::Dispatch::Remote(node) => {
-                    let peers = etcd.peers.clone();
-                    let sent = peers.read().await
+                    // [lockup] never under `peers.read()`: see `peer::BroadcastPlan`
+                    let sent = etcd
                         .unicast(BroadcastRequest::Kv(KvEvent::Put(r.clone())), node,
                             zone.as_deref()).await;
                     if !sent {
@@ -463,7 +463,7 @@ impl Queue {
                         warn!(_log, "{}[q-route] dispatcher {} unreachable for {}; broadcasting \
                             and re-electing", LP, node, self.fq_name);
                         *self.dispatch.write().await = crate::route::Dispatch::Unknown;
-                        let _ = etcd.peers.read().await
+                        let _ = etcd
                             .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
                                 zone.as_deref()).await?;
                     }
@@ -471,7 +471,7 @@ impl Queue {
                 crate::route::Dispatch::Unknown => {
                     debug!(_log, "{}[q-route] no dispatcher for {} yet; broadcasting",
                         LP, self.fq_name);
-                    let _ = etcd.peers.read().await
+                    let _ = etcd
                         .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
                             zone.as_deref()).await?;
                 }
@@ -616,7 +616,8 @@ impl Queue {
                                 value: kv.value.clone(),
                                 lease: 0, prev_kv: false, ignore_value: true, ignore_lease: true,
                             };
-                            let sent = etcd.peers.read().await
+                            // [lockup] never under `peers.read()`
+                            let sent = etcd
                                 .unicast(BroadcastRequest::Kv(KvEvent::Put(req)), node,
                                     zone.as_deref()).await;
                             if sent {

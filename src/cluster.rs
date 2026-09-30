@@ -235,16 +235,15 @@ impl EtcdNode {
                     continue;   // everyone connected
                 }
                 let set: HashSet<&str> = urls.iter().map(|s| s.as_str()).collect();
-                match node.peers.write().await.add_connections(set).await {
-                    Ok(n) if n > 0 => info!(node.log, "{}peer retry: connected {} more peer(s), \
+                // [lockup] dialled with the peer lock released - see `add_peers`
+                match node.add_peers(set).await {
+                    n if n > 0 => info!(node.log, "{}peer retry: connected {} more peer(s), \
                         {} of {} total", LP, n, node.peers.read().await.connected(), urls.len()),
                     // At WARN, not debug: this is a cluster that cannot share a
                     // key, and the fixture (and the guide) run at log_level
                     // "warning" - a diagnosis nobody can see is not one.
-                    Ok(_) => warn!(node.log, "{}peer retry: still {} of {} peer(s) connected, \
+                    _ => warn!(node.log, "{}peer retry: still {} of {} peer(s) connected, \
                         none of {:?} answered", LP, have, urls.len(), urls),
-                    Err(e) => warn!(node.log, "{}peer retry ({} of {} connected): {}",
-                        LP, have, urls.len(), e),
                 }
             }
         });
@@ -318,13 +317,10 @@ impl EtcdNode {
 
     async fn reconfigure(&self, cfg: EtcdConfig) {
         let peers = cfg.peers();
-        match self.peers.write().await.add_connections(peers).await {
-            Ok(cnt) => if cnt > 0 {
-                info!(self.log, "{}reconfigure: added {} peer(s)", LP, cnt);
-            },
-            Err(e) => {
-                error!(self.log, "{}Error adding peers: {}", LP, e);
-            }
+        // [lockup] dialled with the peer lock released - see `add_peers`
+        let cnt = self.add_peers(peers).await;
+        if cnt > 0 {
+            info!(self.log, "{}reconfigure: added {} peer(s)", LP, cnt);
         }
 
         if cfg.term > 0 {
@@ -361,6 +357,51 @@ impl EtcdNode {
         // config is: a peer added after the last reconfigure would otherwise
         // carry no zone and be treated as sharing ours.
         self.peers.write().await.apply_zones(&current.zone, &current.peer_zones);
+    }
+
+    /// [lockup] Send to the peers, with the peer lock held only while choosing
+    /// them - never across a network wait. See `peer::BroadcastPlan`.
+    pub(crate) async fn broadcast_scoped(&self, request: crate::peer::BroadcastRequest, zone_scoped: Option<&str>)
+        -> Result<(), Status>
+    {
+        let plan = self.peers.read().await.plan(zone_scoped).await;
+        plan.send(request).await
+    }
+
+    /// [lockup] `broadcast_scoped` to every zone.
+    pub(crate) async fn broadcast(&self, request: crate::peer::BroadcastRequest) -> Result<(), Status> {
+        self.broadcast_scoped(request, None).await
+    }
+
+    /// [lockup] One request to one `Online` peer, the lock released before it
+    /// is sent. `false` when the peer is not held, not Online, excluded by the
+    /// zone test, or did not answer.
+    pub(crate) async fn unicast(&self, request: crate::peer::BroadcastRequest, peer_id: NodeId,
+        zone_scoped: Option<&str>) -> bool
+    {
+        let (target, me) = {
+            let peers = self.peers.read().await;
+            (peers.unicast_target(peer_id, zone_scoped).await, peers.me())
+        };
+        let Some(target) = target else { return false };
+        let id = tonic::metadata::MetadataValue::from_str(me.to_string().as_str()).ok();
+        EtcdCluster::peer_request(request, target, id).await
+    }
+
+    /// [lockup] Dial `clients` with the peer lock released, then hold the ones
+    /// that answered - `add_connections` did the dialling inside `peers.write()`,
+    /// so every broadcast, put and member list waited on the network. Returns how
+    /// many were added.
+    pub(crate) async fn add_peers(&self, clients: HashSet<&str>) -> usize {
+        let (urls, (cluster_id, timeout_ms, log)) = {
+            let peers = self.peers.read().await;
+            (peers.not_held(clients).await, peers.dial_params())
+        };
+        if urls.is_empty() {
+            return 0;
+        }
+        let dialled = EtcdCluster::dial(urls, cluster_id, timeout_ms, &log).await;
+        self.peers.write().await.admit(dialled).await
     }
 
     pub(crate) fn response_header(&self) -> ResponseHeader {
@@ -750,5 +791,212 @@ mod peering_tests {
 		}
 		assert_eq!(state, Some(PeerState::Online),
 			"a peer that replicated a message has proven what Online means");
+	}
+
+	/// [lockup] The lab's synchronized restart, driven the way ytserv drives etcd:
+	/// every node starts with NO peers (ytserv's `init` passes none), is served, and
+	/// only then learns its peers - from `sync_etcd_peers`, a `Config` event naming
+	/// all three plus a `/cluster/peers/*` put per node - on every node at once.
+	/// Afterwards every node must still answer, and a key written on any node must
+	/// reach the other two. On the lab two of three nodes stopped answering
+	/// `member_list` and a put on one of them hung and never replicated.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn three_nodes_peering_at_once_stay_live() {
+		use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
+		let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+		let urls: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{}", p)).collect();
+		let ids = ["44444444-4444-5444-8444-444444444441", "44444444-4444-5444-8444-444444444442",
+		           "44444444-4444-5444-8444-444444444443"];
+		let mut nodes = Vec::new();
+		for i in 0..3 {
+			let n = node(ids[i], &format!("127.0.0.1:{}", ports[i]), "").await;
+			let served = n.clone();
+			tokio::spawn(async move { let _ = served.serve().await; });
+			nodes.push(n);
+		}
+		for p in &ports {
+			for _ in 0..50 {
+				if std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok() { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}
+		// what ytserv's sync_etcd_peers sends, to every node at once - twice, as a
+		// roster that fills in one peer at a time sends it again
+		let all = urls.join(",");
+		for round in 0..2 {
+			let mut sends = Vec::new();
+			for (i, n) in nodes.iter().enumerate() {
+				let ev = n.event.clone();
+				let (me, all, urls) = (urls[i].clone(), all.clone(), urls.clone());
+				sends.push(tokio::spawn(async move {
+					let mut c = crate::cli::EtcdConfig::default();
+					c.listen_client_urls = me;
+					c.initial_advertise_peer_urls = all.clone();
+					c.listen_peer_urls = all;
+					ev.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
+					for (j, u) in urls.iter().enumerate() {
+						ev.send(EtcdEvents::Data(KvEvent::Put(PutRequest {
+							key: format!("/cluster/peers/{}", j).into_bytes(),
+							value: format!("{} r{}", u, round).into_bytes(),
+							..Default::default()
+						}))).await.unwrap();
+					}
+				}));
+			}
+			for s in sends { s.await.unwrap(); }
+		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
+
+		// every node still answers: the peer set can be read
+		for (i, n) in nodes.iter().enumerate() {
+			let held = tokio::time::timeout(Duration::from_secs(3), async {
+				n.peers.read().await.peer_info().await.len()
+			}).await;
+			assert!(held.is_ok(), "node {} no longer answers: its peer set stays locked", i);
+		}
+		// and a key written on any node reaches the other two
+		for (i, n) in nodes.iter().enumerate() {
+			let key = format!("/live/{}", i).into_bytes();
+			let put = tokio::time::timeout(Duration::from_secs(5), n.put(tonic::Request::new(PutRequest {
+				key: key.clone(), value: b"v".to_vec(), ..Default::default()
+			}))).await;
+			assert!(put.is_ok(), "a put on node {} hangs", i);
+			for (j, m) in nodes.iter().enumerate() {
+				let mut seen = false;
+				for _ in 0..100 {
+					if m.vault.read().await.contains_key(&key) { seen = true; break; }
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+				assert!(seen, "the key written on node {} never reached node {}", i, j);
+			}
+		}
+	}
+
+	/// [lockup] The same start with what rppd adds on the lab: a queue consumer on
+	/// every node (`/q/analytics/consumer/<client>`, registered through
+	/// `new_watcher` as embedded rppd does) and queue messages produced on every
+	/// node while the peers are still being learned.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn three_nodes_with_queue_consumers_stay_live() {
+		use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
+		use crate::etcdpb::etcdserverpb::{WatchRequest, WatchCreateRequest, watch_request};
+		let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+		let urls: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{}", p)).collect();
+		let ids = ["55555555-5555-5555-8555-555555555551", "55555555-5555-5555-8555-555555555552",
+		           "55555555-5555-5555-8555-555555555553"];
+		let mut nodes = Vec::new();
+		for i in 0..3 {
+			let n = node(ids[i], &format!("127.0.0.1:{}", ports[i]), "").await;
+			let served = n.clone();
+			tokio::spawn(async move { let _ = served.serve().await; });
+			nodes.push(n);
+		}
+		for p in &ports {
+			for _ in 0..50 {
+				if std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok() { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}
+		// a consumer per node, the way embedded rppd registers one
+		let mut keep = Vec::new();
+		for (i, n) in nodes.iter().enumerate() {
+			let client = uuid::Uuid::parse_str(&format!("66666666-6666-5666-8666-66666666666{}", i)).unwrap();
+			let (req_tx, req_rx) = tokio::sync::mpsc::channel(100);
+			let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel(100);
+			n.new_watcher(req_rx, resp_tx, &client).await;
+			req_tx.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+				WatchCreateRequest { key: format!("/q/analytics/consumer/{}", client).into_bytes(), ..Default::default() }
+			)) }).await.unwrap();
+			tokio::spawn(async move { while resp_rx.recv().await.is_some() {} });
+			keep.push(req_tx);
+		}
+		// peers learned and messages produced, on every node at once
+		let all = urls.join(",");
+		let mut sends = Vec::new();
+		for (i, n) in nodes.iter().enumerate() {
+			let ev = n.event.clone();
+			let (me, all, urls) = (urls[i].clone(), all.clone(), urls.clone());
+			sends.push(tokio::spawn(async move {
+				for round in 0..2 {
+					let mut c = crate::cli::EtcdConfig::default();
+					c.listen_client_urls = me.clone();
+					c.initial_advertise_peer_urls = all.clone();
+					c.listen_peer_urls = all.clone();
+					ev.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
+					for (j, u) in urls.iter().enumerate() {
+						ev.send(EtcdEvents::Data(KvEvent::Put(PutRequest {
+							key: format!("/cluster/peers/{}", j).into_bytes(),
+							value: format!("{} r{}", u, round).into_bytes(), ..Default::default()
+						}))).await.unwrap();
+						ev.send(EtcdEvents::Data(KvEvent::Put(PutRequest {
+							key: format!("/q/analytics/p/m{}-{}-{}", i, j, round).into_bytes(),
+							value: b"msg".to_vec(), ..Default::default()
+						}))).await.unwrap();
+					}
+				}
+			}));
+		}
+		for s in sends {
+			tokio::time::timeout(Duration::from_secs(10), s).await
+				.expect("sending the peering events blocked: an event loop is stuck").unwrap();
+		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		for (i, n) in nodes.iter().enumerate() {
+			let held = tokio::time::timeout(Duration::from_secs(3), async {
+				n.peers.read().await.peer_info().await.len()
+			}).await;
+			assert!(held.is_ok(), "node {} no longer answers: its peer set stays locked", i);
+		}
+		for (i, n) in nodes.iter().enumerate() {
+			let key = format!("/live2/{}", i).into_bytes();
+			let put = tokio::time::timeout(Duration::from_secs(5), n.put(tonic::Request::new(PutRequest {
+				key: key.clone(), value: b"v".to_vec(), ..Default::default()
+			}))).await;
+			assert!(put.is_ok(), "a put on node {} hangs", i);
+			for (j, m) in nodes.iter().enumerate() {
+				let mut seen = false;
+				for _ in 0..100 {
+					if m.vault.read().await.contains_key(&key) { seen = true; break; }
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+				assert!(seen, "the key written on node {} never reached node {}", i, j);
+			}
+		}
+		drop(keep);
+	}
+
+	/// [lockup] A peer that does not answer must not stop this node.
+	///
+	/// The shape of the lab lock-up, made deterministic: B's put replicates to A,
+	/// and A never answers (the test holds A's store, so A's put handler waits).
+	/// While that broadcast is in flight a writer arrives on B's peer set - what
+	/// `reconfigure` and the peer retry are - and then a reader: a member list,
+	/// the next put. With the broadcast inside `peers.read()`, the fair lock put
+	/// the writer behind it and the reader behind the writer, and none of them
+	/// ever finished - while no peer is `Online` (every peer, after a start) a
+	/// broadcast had no deadline at all.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_peer_that_does_not_answer_does_not_stop_this_node() {
+		let (a, b, _) = pair().await;
+		let stuck = a.vault.write().await;
+		let b2 = b.clone();
+		let put = tokio::spawn(async move {
+			b2.put(tonic::Request::new(PutRequest {
+				key: b"/lockup/k".to_vec(), value: b"v".to_vec(), ..Default::default()
+			})).await
+		});
+		tokio::time::sleep(Duration::from_millis(300)).await; // the broadcast is waiting on A
+		let b3 = b.clone();
+		let writer = tokio::spawn(async move { let _w = b3.peers.write().await; });
+		tokio::time::sleep(Duration::from_millis(100)).await; // the writer is queued
+		let read = tokio::time::timeout(Duration::from_secs(2), async {
+			b.peers.read().await.connected()
+		}).await;
+		assert!(read.is_ok(), "B's peer set stayed locked while a broadcast waited on a silent peer");
+		assert!(tokio::time::timeout(Duration::from_secs(2), writer).await.is_ok(),
+			"the writer never got B's peer set");
+		let done = tokio::time::timeout(crate::peer::PEER_RPC_TIMEOUT + Duration::from_secs(3), put).await;
+		assert!(done.is_ok(), "the put waited on the silent peer past PEER_RPC_TIMEOUT");
+		drop(stuck);
 	}
 }

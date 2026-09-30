@@ -127,9 +127,9 @@ impl Cluster for EtcdNode {
     async fn member_add(&self, request: Request<MemberAddRequest>) -> Result<Response<MemberAddResponse>, Status> {
         let ma = request.into_inner();
         let peers: HashSet<&str> = HashSet::from_iter(ma.peer_ur_ls.iter().map(|p| p.as_str()));
-        self.peers.write().await.add_connections(peers).await
-            .map(|_r| Response::new(MemberAddResponse::default()))
-            .map_err(|e| Status::invalid_argument(e))
+        // [lockup] dialled with the peer lock released - it dials back the caller
+        self.add_peers(peers).await;
+        Ok(Response::new(MemberAddResponse::default()))
     }
 
     async fn member_remove(&self, _request: Request<MemberRemoveRequest>) -> Result<Response<MemberRemoveResponse>, Status> {

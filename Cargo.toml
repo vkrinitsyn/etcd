@@ -1,6 +1,6 @@
 [package]
 name = "etcds"
-version = "0.20.0"
+version = "0.20.1"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>"]
 edition = "2024"
 readme = "README.md"

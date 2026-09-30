@@ -20,6 +20,13 @@ use crate::kv::Kv;
 
 const RECENT_WINDOW_SECS: u64 = 30;
 
+/// [lockup] The longest one peer call may take - a `status` while dialling, a
+/// put, delete or txn while replicating. A peer that never answers is a failed
+/// call, not a wait: before this the calls had no limit, and a broadcast sets
+/// its adaptive deadline only once most `Online` peers replied - never while
+/// every peer is still `InProgress`, which is every peer after a start.
+pub(crate) const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// represent cluster structure
 /// hold configs and capable to update
 #[derive(Clone)]
@@ -155,134 +162,152 @@ impl EtcdCluster {
         self.peers.len()
     }
 
-    pub(crate) async fn add_connections(&mut self, mut clients: HashSet<&str>) -> std::result::Result<usize, String> {
-        let connect_timeout_ms = self.connect_timeout_ms;
+    /// [lockup] The urls in `clients` this node does not hold a peer for yet.
+    pub(crate) async fn not_held(&self, mut clients: HashSet<&str>) -> Vec<String> {
         for p in &self.peers {
             clients.remove(p.lock().await.conn.as_str());
         }
-        self.recently_added.retain(|_, t| t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS));
-        let mut cnt = 0;
-        for url in clients {
-            if url.starts_with("http") {
-                let connect_timeout_ms = if connect_timeout_ms > 0 { connect_timeout_ms } else { 1000 };
-                match Endpoint::from_str(&url) {
-                    Ok(conn) => {
-                       let conn = if connect_timeout_ms > 0 {
-                           conn.connect_timeout(Duration::from_millis(connect_timeout_ms))
-                       } else {
-                           conn
-                       };
-                       match conn.connect().await {
-                           Ok(conn) => {
-                               let mut mt = MaintenanceClient::new(conn.clone());
-                               match mt.status(StatusRequest::default()).await {
-                                   Ok(node) => {
-                                       let status = node.into_inner();
-                                       match status.header {
-                                           None => {
-                                               error!(self.log, "{}connecting maintenance {} - no header in response", LP, url);
-                                           }
-                                           Some(s) => {
-                                               if s.cluster_id != self.cluster_id {
-                                                   error!(self.log, "{}connecting maintenance {} - wrong cluster,\
-                                                    running on ClusterID [{}], but connecting node from {}", LP,
-                                                       url, self.cluster_id, s.cluster_id);
-                                                   continue;
-                                               }
-                                               // dedup by peer_id
-                                               let mut exists = false;
-                                               for p in &self.peers {
-                                                   if p.lock().await.peer_id == s.member_id {
-                                                       info!(self.log, "{}peer_id {} already connected, skipping {}", LP, s.member_id, url);
-                                                       exists = true;
-                                                       break;
-                                                   }
-                                               }
-                                               if exists { continue; }
-                                               // recently added check
-                                               if let Some(t) = self.recently_added.get(&s.member_id) {
-                                                   if t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS) {
-                                                       info!(self.log, "{}peer_id {} recently added ({:?} ago), skipping {}", LP, s.member_id, t.elapsed(), url);
-                                                       continue;
-                                                   }
-                                               }
-                                               self.recently_added.insert(s.member_id, Instant::now());
-                                               self.peers.push(Arc::new(Mutex::new(
-                                                   EtcdPeerNode {
-                                                       peer_id: s.member_id,
-                                                       conn: url.to_string(),
-                                                       // Unzoned until `apply_zones` labels it on
-                                                       // the next reconfigure. That window is
-                                                       // fail-safe: on a zoned node an unlabelled
-                                                       // peer compares unequal to my zone, so it
-                                                       // receives no zone-scoped key until it is
-                                                       // known to share one.
-                                                       zone: String::new(),
-                                                       // NOT `Spare`. A peer reaches this line
-                                                       // only after it answered `status` with a
-                                                       // cluster id matching ours, so it is a
-                                                       // verified member of this cluster - and
-                                                       // `broadcast_scoped` skips `Spare`
-                                                       // entirely, so a connected peer left
-                                                       // `Spare` receives nothing, forever.
-                                                       //
-                                                       // The only thing that ever promoted one
-                                                       // was the `member_promote` gRPC admin
-                                                       // call, which ytserv never makes: every
-                                                       // peer connected, every put succeeded
-                                                       // locally, `send_indices` was empty so
-                                                       // the broadcast returned `Ok(())`, and
-                                                       // the kv was per-node with nothing
-                                                       // logged anywhere.
-                                                       //
-                                                       // `InProgress` is the state that means
-                                                       // "receives writes, does not yet gate the
-                                                       // commit" (`quorum_total` counts only
-                                                       // `Online`), which is exactly right for a
-                                                       // peer that is connected but has not yet
-                                                       // proven it can replicate. The first
-                                                       // successful broadcast promotes it to
-                                                       // `Online`, mirroring the demote-on-
-                                                       // timeout below it.
-                                                       state: PeerState::InProgress,
-                                                       added_at: Instant::now(),
-                                                       kv_client: Arc::new(Mutex::new(KvClient::new(conn.clone()))),
-                                                       mt_client: Arc::new(Mutex::new(mt)),
-                                                       cluster_client: Arc::new(Mutex::new(ClusterClient::new(conn))),
-                                                   })));
-                                               cnt += 1;
-                                           }
-                                       }
-                                   }
-                                   Err(e) => {
-                                       error!(self.log, "{}connecting maintenance {} with error {}", LP, url, e);
-                                   }
-                               }
-                           }
-                           Err(e) => {
-                               error!(self.log, "{}connecting endpoint {} with error {}", LP, url, e);
-                           }
-                       }
-                    }
-                    Err(e) => {
-                        error!(self.log, "{}making endpoint to {} with error {}", LP, url, e);
-                    }
+        clients.into_iter().filter(|u| u.starts_with("http")).map(|u| u.to_string()).collect()
+    }
+
+    /// [lockup] What `dial` needs, so it can run with the peer lock released.
+    pub(crate) fn dial_params(&self) -> (NodeId, u64, Logger) {
+        (self.cluster_id, self.connect_timeout_ms, self.log.clone())
+    }
+
+    /// [lockup] Connect to each url and ask its `status`: a peer is one that
+    /// answers with this cluster's id.
+    ///
+    /// Network only, and it takes no lock - a caller must not hold the peer lock
+    /// around it either. Each url is a connect and a round trip, and while a
+    /// writer holds the lock every broadcast, put and member list on this node
+    /// waits behind it. `add_connections` used to do exactly this inside
+    /// `peers.write()`, with no limit on `status`.
+    pub(crate) async fn dial(urls: Vec<String>, cluster_id: NodeId, connect_timeout_ms: u64, log: &Logger)
+        -> Vec<(NodeId, String, Channel, MaintenanceClient<Channel>)>
+    {
+        let connect_timeout_ms = if connect_timeout_ms > 0 { connect_timeout_ms } else { 1000 };
+        let mut found = Vec::new();
+        for url in urls {
+            let endpoint = match Endpoint::from_str(&url) {
+                Ok(e) => e.connect_timeout(Duration::from_millis(connect_timeout_ms)),
+                Err(e) => {
+                    error!(log, "{}making endpoint to {} with error {}", LP, url, e);
+                    continue;
                 }
+            };
+            let conn = match endpoint.connect().await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(log, "{}connecting endpoint {} with error {}", LP, url, e);
+                    continue;
+                }
+            };
+            let mut mt = MaintenanceClient::new(conn.clone());
+            let status = match tokio::time::timeout(PEER_RPC_TIMEOUT, mt.status(StatusRequest::default())).await {
+                Ok(Ok(s)) => s.into_inner(),
+                Ok(Err(e)) => {
+                    error!(log, "{}connecting maintenance {} with error {}", LP, url, e);
+                    continue;
+                }
+                Err(_) => {
+                    error!(log, "{}connecting maintenance {}: no answer in {:?}", LP, url, PEER_RPC_TIMEOUT);
+                    continue;
+                }
+            };
+            match status.header {
+                None => error!(log, "{}connecting maintenance {} - no header in response", LP, url),
+                Some(h) if h.cluster_id != cluster_id => error!(log, "{}connecting maintenance {} - wrong cluster,\
+                    running on ClusterID [{}], but connecting node from {}", LP, url, cluster_id, h.cluster_id),
+                Some(h) => found.push((h.member_id, url, conn, mt)),
             }
         }
-        Ok(cnt)
+        found
     }
 
-    /// Broadcast request to cluster peers with adaptive timeout.
-    /// Only Online peers count toward quorum. InProgress peers receive
-    /// the write (for sync) but their result is ignored for quorum.
-    /// Spare peers are skipped entirely.
-    /// Peers that timeout are demoted to Spare.
-    pub(crate) async fn broadcast(&self, request: BroadcastRequest) -> std::result::Result<(), Status> {
-        self.broadcast_scoped(request, None).await
+    /// [lockup] Hold the dialled peers this node does not hold yet - by peer id,
+    /// since one node can be reached under more than one url. Short and free of
+    /// network waits: the only part of adding a peer that needs the lock.
+    pub(crate) async fn admit(&mut self, dialled: Vec<(NodeId, String, Channel, MaintenanceClient<Channel>)>) -> usize {
+        self.recently_added.retain(|_, t| t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS));
+        let mut cnt = 0;
+        for (member_id, url, conn, mt) in dialled {
+            let mut exists = false;
+            for p in &self.peers {
+                if p.lock().await.peer_id == member_id {
+                    info!(self.log, "{}peer_id {} already connected, skipping {}", LP, member_id, url);
+                    exists = true;
+                    break;
+                }
+            }
+            if exists { continue; }
+            if let Some(t) = self.recently_added.get(&member_id) {
+                if t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS) {
+                    info!(self.log, "{}peer_id {} recently added ({:?} ago), skipping {}", LP, member_id, t.elapsed(), url);
+                    continue;
+                }
+            }
+            self.recently_added.insert(member_id, Instant::now());
+            self.peers.push(Arc::new(Mutex::new(EtcdPeerNode {
+                peer_id: member_id,
+                conn: url,
+                // Unzoned until `apply_zones` labels it on
+                // the next reconfigure. That window is
+                // fail-safe: on a zoned node an unlabelled
+                // peer compares unequal to my zone, so it
+                // receives no zone-scoped key until it is
+                // known to share one.
+                zone: String::new(),
+                // NOT `Spare`. A peer reaches this line
+                // only after it answered `status` with a
+                // cluster id matching ours, so it is a
+                // verified member of this cluster - and
+                // `broadcast_scoped` skips `Spare`
+                // entirely, so a connected peer left
+                // `Spare` receives nothing, forever.
+                //
+                // The only thing that ever promoted one
+                // was the `member_promote` gRPC admin
+                // call, which ytserv never makes: every
+                // peer connected, every put succeeded
+                // locally, `send_indices` was empty so
+                // the broadcast returned `Ok(())`, and
+                // the kv was per-node with nothing
+                // logged anywhere.
+                //
+                // `InProgress` is the state that means
+                // "receives writes, does not yet gate the
+                // commit" (`quorum_total` counts only
+                // `Online`), which is exactly right for a
+                // peer that is connected but has not yet
+                // proven it can replicate. The first
+                // successful broadcast promotes it to
+                // `Online`, mirroring the demote-on-
+                // timeout below it.
+                state: PeerState::InProgress,
+                added_at: Instant::now(),
+                kv_client: Arc::new(Mutex::new(KvClient::new(conn.clone()))),
+                mt_client: Arc::new(Mutex::new(mt)),
+                cluster_client: Arc::new(Mutex::new(ClusterClient::new(conn))),
+            })));
+            cnt += 1;
+        }
+        cnt
     }
 
-    /// Broadcast, optionally confined to peers sharing this node's zone.
+    /// Dial `clients` and hold the ones that answered, in one go - for `connect`
+    /// at start, and for tests. A running node adds peers through
+    /// `EtcdNode::add_peers`, which keeps the lock off the network.
+    pub(crate) async fn add_connections(&mut self, clients: HashSet<&str>) -> std::result::Result<usize, String> {
+        let urls = self.not_held(clients).await;
+        let dialled = Self::dial(urls, self.cluster_id, self.connect_timeout_ms, &self.log).await;
+        Ok(self.admit(dialled).await)
+    }
+
+    /// [lockup] The peers one broadcast goes to: chosen under the peer lock, sent
+    /// to after it is released (`BroadcastPlan::send`, via `EtcdNode::broadcast_scoped`).
+    ///
+    /// Optionally confined to peers sharing this node's zone.
     ///
     /// `zone_scoped` is decided by the caller from the key's prefix, because
     /// the key is what carries the policy — a peer cannot be asked whether it
@@ -293,116 +318,22 @@ impl EtcdCluster {
     /// a peer added since the last reconfigure is unlabelled, and sending it a
     /// zone-scoped key on the assumption that no label means "same zone" is
     /// exactly the leak zoning exists to prevent.
-    pub(crate) async fn broadcast_scoped(&self, request: BroadcastRequest, zone_scoped: Option<&str>)
-        -> std::result::Result<(), Status>
-    {
-        if self.peers.is_empty() {
-            return Ok(());
-        }
-
-        let mut online_indices = Vec::new();
-        let mut syncing_indices = Vec::new();
-        for (i, p) in self.peers.iter().enumerate() {
-            let p = p.lock().await;
+    pub(crate) async fn plan(&self, zone_scoped: Option<&str>) -> BroadcastPlan {
+        let mut targets = Vec::new();
+        for p in self.peers.iter() {
+            let n = p.lock().await;
             if let Some(my_zone) = zone_scoped {
-                if p.zone.trim() != my_zone.trim() {
+                if n.zone.trim() != my_zone.trim() {
                     continue;
                 }
             }
-            match p.state {
-                PeerState::Online => online_indices.push(i),
-                PeerState::InProgress => syncing_indices.push(i),
+            match n.state {
+                PeerState::Online => targets.push((p.clone(), true)),
+                PeerState::InProgress => targets.push((p.clone(), false)),
                 PeerState::Spare => {}
             }
         }
-
-        let quorum_total = online_indices.len();
-        let send_indices: Vec<usize> = online_indices.iter().chain(syncing_indices.iter()).copied().collect();
-        if send_indices.is_empty() {
-            return Ok(());
-        }
-
-        let start = Instant::now();
-        let deadline_ms = Arc::new(AtomicU16::new(0));
-        // peer index + result
-        let (reply, mut receiver) = channel(send_indices.len());
-        let peer_id = Some(MetadataValue::from_str(self.node_id.to_string().as_str())
-            .map_err(|e| Status::invalid_argument(format!("{}", e)))?);
-
-        for &idx in &send_indices {
-            let reply_c = reply.clone();
-            let r = request.clone();
-            let p = self.peers[idx].clone();
-            let peer_id = peer_id.clone();
-            let deadline_ms = deadline_ms.clone();
-            let start = start;
-            let is_online = online_indices.contains(&idx);
-
-            tokio::spawn(async move {
-                let result = tokio::select! {
-                    ok = Self::peer_request(r, p, peer_id) => ok,
-                    _ = Self::await_deadline(&deadline_ms, start) => false,
-                };
-                let elapsed = start.elapsed().as_millis() as u16;
-                let _ = reply_c.send((idx, is_online, result, elapsed)).await;
-            });
-        }
-        drop(reply);
-
-        let half = quorum_total as f32 / 2.0;
-        let mut ok_count = 0u32;
-        let mut online_reply_count = 0u32;
-        let mut total_ms = 0u64;
-        let mut timed_out_peers = Vec::new();
-        // InProgress peers that replicated this message successfully: they have
-        // now proven they can, which is what `Online` means.
-        let mut synced_peers = Vec::new();
-
-        while let Some((idx, is_online, ok, elapsed_ms)) = receiver.recv().await {
-            if is_online {
-                online_reply_count += 1;
-                total_ms += elapsed_ms as u64;
-                if ok {
-                    ok_count += 1;
-                } else {
-                    timed_out_peers.push(idx);
-                }
-            } else if ok {
-                synced_peers.push(idx);
-            }
-            if online_reply_count as f32 > half && deadline_ms.load(Ordering::Relaxed) == 0 {
-                let avg = total_ms / online_reply_count as u64;
-                let deadline = (avg * 2).min(u16::MAX as u64) as u16;
-                deadline_ms.store(deadline.max(1), Ordering::Relaxed);
-            }
-        }
-
-        for idx in &timed_out_peers {
-            let mut peer = self.peers[*idx].lock().await;
-            if peer.state == PeerState::Online {
-                info!(self.log, "{}peer {} demoted to Spare (timeout)", LP, peer.conn);
-                peer.state = PeerState::Spare;
-            }
-        }
-
-        // The mirror of the demotion above, and the half that was missing: a
-        // peer only ever left `InProgress` through the `member_promote` admin
-        // API, so in an embedded deployment it never left it at all. Replicating
-        // one message successfully is the evidence the state machine wanted.
-        for idx in &synced_peers {
-            let mut peer = self.peers[*idx].lock().await;
-            if peer.state == PeerState::InProgress {
-                info!(self.log, "{}peer {} promoted to Online (replicated successfully)",
-                    LP, peer.conn);
-                peer.state = PeerState::Online;
-            }
-        }
-
-        if quorum_total == 0 || ok_count as f32 > half {
-            Ok(())
-        } else {
-            Err(Status::aborted("wont commit more than half"))
-        }
+        BroadcastPlan { targets, node_id: self.node_id, log: self.log.clone() }
     }
 
     /// One request to one peer.
@@ -420,21 +351,27 @@ impl EtcdCluster {
     /// serialization point, not an ordering guarantee — the queue's ordering
     /// comes from `idx`, assigned by the dispatcher, never from the order two
     /// peer RPCs happen to complete in.
-    async fn peer_request(request: BroadcastRequest, peer: EtcdPeerNodeType, peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> bool {
+    ///
+    /// [lockup] Bounded by `PEER_RPC_TIMEOUT`: a peer that never answers is a
+    /// failed send, which the broadcast then counts as one.
+    pub(crate) async fn peer_request(request: BroadcastRequest, peer: EtcdPeerNodeType, peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> bool {
         let mut kv = {
             let node = peer.lock().await;
             let c = node.kv_client.lock().await.clone();
             c
         };
-        match request {
-            BroadcastRequest::Kv(br) => {
-                match br {
-                    KvEvent::Put(kr) => kv.put(kr, peer_id).await.is_ok(),
-                    KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.is_ok(),
-                    KvEvent::Txn(kr) => kv.txn(kr, peer_id).await.is_ok(),
+        let call = async move {
+            match request {
+                BroadcastRequest::Kv(br) => {
+                    match br {
+                        KvEvent::Put(kr) => kv.put(kr, peer_id).await.is_ok(),
+                        KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.is_ok(),
+                        KvEvent::Txn(kr) => kv.txn(kr, peer_id).await.is_ok(),
+                    }
                 }
             }
-        }
+        };
+        tokio::time::timeout(PEER_RPC_TIMEOUT, call).await.unwrap_or(false)
     }
 
     /// Poll the shared deadline until it's set, then sleep until it expires.
@@ -538,7 +475,8 @@ impl EtcdCluster {
         false
     }
 
-    /// Send one request to one peer.
+    /// [lockup] The peer a unicast goes to, chosen under the peer lock -
+    /// `EtcdNode::unicast` sends after releasing it.
     ///
     /// **Applies the same zone test as `broadcast_scoped`, and that is not
     /// optional.** A unicast is still a write leaving this node, so a
@@ -548,38 +486,26 @@ impl EtcdCluster {
     /// zone" is the leak zoning exists to prevent. Being targeted rather than
     /// broadcast changes nothing about that.
     ///
-    /// Returns `false` when the peer is unreachable, not Online, or excluded by
-    /// the zone test — the caller falls back to a broadcast and says so, rather
-    /// than silently dropping the message.
-    pub(crate) async fn unicast(&self, request: BroadcastRequest, peer_id: NodeId,
-        zone_scoped: Option<&str>) -> bool
-    {
-        let target = {
-            let mut found = None;
-            for p in &self.peers {
-                let n = p.lock().await;
-                if n.peer_id != peer_id {
-                    continue;
-                }
-                if n.state != PeerState::Online {
-                    return false;
-                }
-                if let Some(my_zone) = zone_scoped {
-                    if n.zone.trim() != my_zone.trim() {
-                        return false;
-                    }
-                }
-                found = Some(p.clone());
-                break;
+    /// `None` when the peer is not held, not Online, or excluded by the zone test
+    /// — the caller falls back to a broadcast and says so, rather than silently
+    /// dropping the message.
+    pub(crate) async fn unicast_target(&self, peer_id: NodeId, zone_scoped: Option<&str>) -> Option<EtcdPeerNodeType> {
+        for p in &self.peers {
+            let n = p.lock().await;
+            if n.peer_id != peer_id {
+                continue;
             }
-            found
-        };
-        let Some(target) = target else { return false };
-        let id = match MetadataValue::from_str(self.node_id.to_string().as_str()) {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        };
-        Self::peer_request(request, target, id).await
+            if n.state != PeerState::Online {
+                return None;
+            }
+            if let Some(my_zone) = zone_scoped {
+                if n.zone.trim() != my_zone.trim() {
+                    return None;
+                }
+            }
+            return Some(p.clone());
+        }
+        None
     }
 
     /// Announce this node to all connected peers and sync KV data from the fastest peer.
@@ -684,6 +610,120 @@ impl EtcdCluster {
             peers.push(p.lock().await.conn.clone());
         }
         peers.join(",")
+    }
+}
+
+
+/// [lockup] A broadcast's targets, taken under the peer lock and sent to after it
+/// is released.
+///
+/// Every network wait used to run INSIDE the caller's read lock
+/// (`self.peers.read().await.broadcast_scoped(..)`). tokio's `RwLock` is fair: a
+/// writer queued behind that reader - `reconfigure`, the peer retry, an incoming
+/// `member_add` - makes every later reader wait too, so one slow or silent peer
+/// stopped the whole node, and two nodes waiting on each other that way never
+/// recovered. On the lab two of three nodes stopped answering after a
+/// synchronized restart: member lists timed out and a put hung without reaching
+/// anyone.
+pub(crate) struct BroadcastPlan {
+    /// the peer, and whether it is `Online` (counts toward the quorum)
+    targets: Vec<(EtcdPeerNodeType, bool)>,
+    node_id: NodeId,
+    log: Logger,
+}
+
+impl BroadcastPlan {
+    /// Send to every target with adaptive timeout. Only Online peers count
+    /// toward quorum; InProgress peers receive the write (for sync) but their
+    /// result is ignored for quorum. Peers that time out are demoted to Spare,
+    /// and an InProgress peer that replicated is promoted to Online. Takes no
+    /// lock but each peer's own.
+    pub(crate) async fn send(self, request: BroadcastRequest) -> std::result::Result<(), Status> {
+        if self.targets.is_empty() {
+            return Ok(());
+        }
+        let quorum_total = self.targets.iter().filter(|(_, online)| *online).count();
+
+        let start = Instant::now();
+        let deadline_ms = Arc::new(AtomicU16::new(0));
+        // target index + result
+        let (reply, mut receiver) = channel(self.targets.len());
+        let peer_id = Some(MetadataValue::from_str(self.node_id.to_string().as_str())
+            .map_err(|e| Status::invalid_argument(format!("{}", e)))?);
+
+        for (idx, (p, is_online)) in self.targets.iter().enumerate() {
+            let reply_c = reply.clone();
+            let r = request.clone();
+            let p = p.clone();
+            let peer_id = peer_id.clone();
+            let deadline_ms = deadline_ms.clone();
+            let is_online = *is_online;
+
+            tokio::spawn(async move {
+                let result = tokio::select! {
+                    ok = EtcdCluster::peer_request(r, p, peer_id) => ok,
+                    _ = EtcdCluster::await_deadline(&deadline_ms, start) => false,
+                };
+                let elapsed = start.elapsed().as_millis() as u16;
+                let _ = reply_c.send((idx, is_online, result, elapsed)).await;
+            });
+        }
+        drop(reply);
+
+        let half = quorum_total as f32 / 2.0;
+        let mut ok_count = 0u32;
+        let mut online_reply_count = 0u32;
+        let mut total_ms = 0u64;
+        let mut timed_out_peers = Vec::new();
+        // InProgress peers that replicated this message successfully: they have
+        // now proven they can, which is what `Online` means.
+        let mut synced_peers = Vec::new();
+
+        while let Some((idx, is_online, ok, elapsed_ms)) = receiver.recv().await {
+            if is_online {
+                online_reply_count += 1;
+                total_ms += elapsed_ms as u64;
+                if ok {
+                    ok_count += 1;
+                } else {
+                    timed_out_peers.push(idx);
+                }
+            } else if ok {
+                synced_peers.push(idx);
+            }
+            if online_reply_count as f32 > half && deadline_ms.load(Ordering::Relaxed) == 0 {
+                let avg = total_ms / online_reply_count as u64;
+                let deadline = (avg * 2).min(u16::MAX as u64) as u16;
+                deadline_ms.store(deadline.max(1), Ordering::Relaxed);
+            }
+        }
+
+        for idx in &timed_out_peers {
+            let mut peer = self.targets[*idx].0.lock().await;
+            if peer.state == PeerState::Online {
+                info!(self.log, "{}peer {} demoted to Spare (timeout)", LP, peer.conn);
+                peer.state = PeerState::Spare;
+            }
+        }
+
+        // The mirror of the demotion above, and the half that was missing: a
+        // peer only ever left `InProgress` through the `member_promote` admin
+        // API, so in an embedded deployment it never left it at all. Replicating
+        // one message successfully is the evidence the state machine wanted.
+        for idx in &synced_peers {
+            let mut peer = self.targets[*idx].0.lock().await;
+            if peer.state == PeerState::InProgress {
+                info!(self.log, "{}peer {} promoted to Online (replicated successfully)",
+                    LP, peer.conn);
+                peer.state = PeerState::Online;
+            }
+        }
+
+        if quorum_total == 0 || ok_count as f32 > half {
+            Ok(())
+        } else {
+            Err(Status::aborted("wont commit more than half"))
+        }
     }
 }
 

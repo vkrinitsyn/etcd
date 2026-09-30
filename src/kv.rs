@@ -232,11 +232,11 @@ impl EtcdNode {
         // XPEER header, so a caller could otherwise assert peerhood and
         // have its write silently skip replication.
         if from_peer.is_none() && self.policy.read().await.propagates(&r.key) {
-            let peers = self.peers.read().await;
             let scope = if self.policy.read().await.is_zone_scoped(&r.key) {
-                Some(peers.my_zone().to_string())
+                Some(self.peers.read().await.my_zone().to_string())
             } else { None };
-            let _ = peers.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
+            // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
+            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
                 PutRequest {
                     prev_kv: false,
                     ignore_value: true, ..r.clone()
@@ -282,11 +282,11 @@ impl EtcdNode {
         // [prefix] same rule as put: a local key's deletion is local too,
         // or a peer would keep a value this node has dropped.
         if from_peer.is_none() && self.policy.read().await.propagates(&r.key) {
-            let peers = self.peers.read().await;
             let scope = if self.policy.read().await.is_zone_scoped(&r.key) {
-                Some(peers.my_zone().to_string())
+                Some(self.peers.read().await.my_zone().to_string())
             } else { None };
-            let _ = peers.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Delete(
+            // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
+            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Delete(
                 DeleteRangeRequest {
                     prev_kv: false, range_end: r.range_end, key: r.key
                 })), scope.as_deref()).await?;
@@ -354,7 +354,7 @@ impl EtcdNode {
             }
             drop(policy);
             if !any_local {
-                let _ = self.peers.read().await.broadcast(BroadcastRequest::Kv(KvEvent::Txn(r))).await?;
+                let _ = self.broadcast(BroadcastRequest::Kv(KvEvent::Txn(r))).await?;
             }
         }
 
