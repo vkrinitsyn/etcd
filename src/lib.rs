@@ -8,6 +8,8 @@ rust_i18n::i18n!("locales");
 
 #[cfg(feature = "clickhouse")]
 pub(crate) mod clickhouse;
+#[cfg(feature = "tracer")]
+mod metrics;
 pub mod etcdpb;
 pub mod cli;
 pub mod cluster;
@@ -42,6 +44,9 @@ pub enum EtcdMgmtEvent {
     /// change tracer runtime
     #[cfg(feature = "tracer")]
     Tracer(Option<opentelemetry_sdk::trace::SdkTracer>),
+    /// [otel] change the meter: `etcd.kv.ops`, `etcd.kv.duration` (metrics.rs)
+    #[cfg(feature = "tracer")]
+    Meter(Option<opentelemetry::metrics::Meter>),
     /// Node management event to stop
     Stop,
     /// Node management event to soft restart 

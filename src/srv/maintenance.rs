@@ -40,10 +40,14 @@ impl Maintenance for EtcdNode {
         }))
     }
 
-    async fn hash(&self, _request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
+    async fn hash(&self, request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
+        let remote = request.remote_addr();
+        let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (k, v) in vault.iter() {
+        // [E4] over what peers share and this caller may see: a local key differs
+        // per node by design, and a local-only one is not a remote caller's
+        for (k, v) in vault.iter().filter(|(k, _)| policy.propagates(k) && policy.may_serve(k, remote)) {
             k.hash(&mut hasher);
             v.value.hash(&mut hasher);
         }
@@ -53,10 +57,13 @@ impl Maintenance for EtcdNode {
         }))
     }
 
-    async fn hash_kv(&self, _request: Request<HashKvRequest>) -> Result<Response<HashKvResponse>, Status> {
+    async fn hash_kv(&self, request: Request<HashKvRequest>) -> Result<Response<HashKvResponse>, Status> {
+        let remote = request.remote_addr();
+        let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (k, v) in vault.iter() {
+        // [E4] as `hash`
+        for (k, v) in vault.iter().filter(|(k, _)| policy.propagates(k) && policy.may_serve(k, remote)) {
             k.hash(&mut hasher);
             v.value.hash(&mut hasher);
             v.version.hash(&mut hasher);
@@ -72,10 +79,13 @@ impl Maintenance for EtcdNode {
 
     type SnapshotStream = SnapshotResultStream;
 
-    async fn snapshot(&self, _request: Request<SnapshotRequest>) -> SnapshotResult<SnapshotResultStream> {
+    async fn snapshot(&self, request: Request<SnapshotRequest>) -> SnapshotResult<SnapshotResultStream> {
+        let remote = request.remote_addr();
+        let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
         let mut blob = Vec::new();
-        for v in vault.values() {
+        // [E4] a remote caller's snapshot leaves out what it may not read
+        for v in vault.values().filter(|v| policy.may_serve(&v.key, remote)) {
             let kv: KeyValue = v.into();
             let encoded = kv.encode_to_vec();
             let len = encoded.len() as u32;

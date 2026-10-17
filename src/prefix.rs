@@ -36,8 +36,64 @@ pub struct PrefixPolicy {
     local_except: Vec<String>,
     /// keys under these are served only to a loopback caller
     local_only: Vec<String>,
+    /// ...except keys under these, which are served to anyone (D15: the branches
+    /// meant to travel, so a peer's forwarded write of one is not refused - E1)
+    local_only_except: Vec<String>,
     /// keys under these propagate only to peers in the same zone
     zone: Vec<String>,
+    /// keys under these are written only by the embedder in-process, never through
+    /// the gRPC API: a mirror the node keeps from its own source of truth (ytserv's
+    /// `/secret/`), which a client must not be able to overwrite
+    readonly: Vec<String>,
+}
+
+/// Is this caller on the network - an address that is not loopback? `None` (a
+/// unix socket, an in-process call) is not.
+pub fn is_remote(remote: Option<std::net::SocketAddr>) -> bool {
+    remote.is_some_and(|a| !a.ip().is_loopback())
+}
+
+/// The first key after every key that starts with `p`: etcd's prefix range end.
+/// `None` when there is none (`p` empty, or all `0xff`).
+fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
+    let mut e = p.to_vec();
+    while let Some(&last) = e.last() {
+        if last == 0xff {
+            e.pop();
+        } else {
+            *e.last_mut().unwrap() += 1;
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Might the request range `[key, end)` hold a key that starts with `p`? An empty
+/// `end` is the single key `key`; `end == [0]` is every key from `key` on.
+fn range_overlaps(key: &[u8], end: &[u8], p: &[u8]) -> bool {
+    if end.is_empty() {
+        return key.starts_with(p);
+    }
+    let below_hi = match prefix_end(p) {
+        Some(hi) => key < hi.as_slice(),
+        None => true,
+    };
+    let above_lo = end == [0u8] || end > p;
+    below_hi && above_lo
+}
+
+/// Is every key of `[key, end)` under `p`?
+fn range_within(key: &[u8], end: &[u8], p: &[u8]) -> bool {
+    if !key.starts_with(p) {
+        return false;
+    }
+    if end.is_empty() {
+        return true;
+    }
+    match prefix_end(p) {
+        Some(hi) => end != [0u8] && end <= hi.as_slice(),
+        None => true,
+    }
 }
 
 fn split(spec: &str) -> Vec<String> {
@@ -55,7 +111,20 @@ impl PrefixPolicy {
             local_except: split(local_except),
             local_only: split(local_only),
             zone: split(zone),
+            ..Default::default()
         }
+    }
+
+    /// Branches of `local_only` served to remote callers too (D15).
+    pub fn with_local_only_except(mut self, spec: &str) -> Self {
+        self.local_only_except = split(spec);
+        self
+    }
+
+    /// Prefixes no gRPC caller may write (`writable`).
+    pub fn with_readonly(mut self, spec: &str) -> Self {
+        self.readonly = split(spec);
+        self
     }
 
     /// Does a key under this prefix stay inside its zone?
@@ -90,7 +159,7 @@ impl PrefixPolicy {
     /// Nothing configured: every key propagates and every key is served.
     /// This is the default, and it is byte-for-byte today's behaviour.
     pub fn is_empty(&self) -> bool {
-        self.local.is_empty() && self.local_only.is_empty() && self.zone.is_empty()
+        self.local.is_empty() && self.local_only.is_empty() && self.zone.is_empty() && self.readonly.is_empty()
     }
 
     /// May this key be broadcast to peers?
@@ -125,10 +194,38 @@ impl PrefixPolicy {
         if !self.local_only.iter().any(|p| k.starts_with(p.as_str())) {
             return true;
         }
-        match remote {
-            None => true,
-            Some(a) => a.ip().is_loopback(),
+        if self.local_only_except.iter().any(|p| k.starts_with(p.as_str())) {
+            return true;
         }
+        !is_remote(remote)
+    }
+
+    /// May a caller at `remote` read, watch or count the range `[key, end)`? No
+    /// when it is remote and the range may hold a `local_only` key that no
+    /// exception covers (E2/E3: a range or a watch used to be checked by its first
+    /// key alone, so `key = "", range_end = "\0"` returned every key).
+    pub fn range_may_serve(&self, key: &[u8], end: &[u8], remote: Option<std::net::SocketAddr>) -> bool {
+        if self.local_only.is_empty() || !is_remote(remote) {
+            return true;
+        }
+        if !self.local_only.iter().any(|p| range_overlaps(key, end, p.as_bytes())) {
+            return true;
+        }
+        // it touches a local-only subtree: served only when it lies wholly inside
+        // one of that subtree's exceptions
+        self.local_only_except.iter().any(|e| range_within(key, end, e.as_bytes()))
+    }
+
+    /// May a gRPC caller write this key? Never under a `readonly` prefix: only the
+    /// embedder writes there, in-process.
+    pub fn writable(&self, key: &[u8]) -> bool {
+        !self.readonly.iter().any(|p| key.starts_with(p.as_bytes()))
+    }
+
+    /// May a gRPC caller delete the range `[key, end)`? Not when it may reach a
+    /// `readonly` key.
+    pub fn range_writable(&self, key: &[u8], end: &[u8]) -> bool {
+        !self.readonly.iter().any(|p| range_overlaps(key, end, p.as_bytes()))
     }
 }
 
@@ -228,6 +325,69 @@ mod tests {
         assert!(!p.is_zone_scoped(b"/secret/encrypted/db_pw"));
         // with no zone prefixes, a differing zone is irrelevant
         assert!(p.propagates_to_zone(b"/secret/encrypted/db_pw", "east", "west"));
+    }
+
+    fn far() -> Option<std::net::SocketAddr> { "10.0.0.7:2379".parse().ok() }
+
+    #[test]
+    fn an_exception_to_local_only_is_served_to_peers() {
+        // D15: the branches meant to travel must reach a peer's KV API, or a
+        // forwarded write of one is refused (E1)
+        let p = skv().with_local_only_except("/secret/encrypted/");
+        assert!(p.may_serve(b"/secret/encrypted/db_pw", far()));
+        assert!(!p.may_serve(b"/secret/db_pw", far()));
+        assert!(!p.may_serve(b"/secret/@meta/keyver", far()));
+    }
+
+    #[test]
+    fn a_remote_range_over_a_local_only_subtree_is_refused() {
+        let p = skv();
+        // E2: everything, from a remote caller
+        assert!(!p.range_may_serve(b"", &[0], far()));
+        // a range that starts before the subtree and runs into it
+        assert!(!p.range_may_serve(b"/r", b"/t", far()));
+        // the subtree's own prefix range, and a single key in it
+        assert!(!p.range_may_serve(b"/secret/", b"/secret0", far()));
+        assert!(!p.range_may_serve(b"/secret/db_pw", b"", far()));
+        // ranges that never reach it
+        assert!(p.range_may_serve(b"/q/", b"/q0", far()));
+        assert!(p.range_may_serve(b"/a", b"/b", far()));
+        assert!(p.range_may_serve(b"/t", &[0], far()), "from past the subtree on");
+        // loopback and in-process are local
+        assert!(p.range_may_serve(b"", &[0], "127.0.0.1:2379".parse().ok()));
+        assert!(p.range_may_serve(b"", &[0], None));
+    }
+
+    #[test]
+    fn a_range_wholly_inside_an_exception_is_served() {
+        let p = skv().with_local_only_except("/secret/encrypted/");
+        assert!(p.range_may_serve(b"/secret/encrypted/", b"/secret/encrypted0", far()));
+        assert!(p.range_may_serve(b"/secret/encrypted/db_pw", b"", far()));
+        assert!(!p.range_may_serve(b"/secret/", b"/secret0", far()), "the whole subtree is more than the exception");
+    }
+
+    #[test]
+    fn a_readonly_prefix_refuses_every_api_write() {
+        let p = PrefixPolicy::default().with_readonly("/secret/");
+        assert!(!p.is_empty());
+        assert!(!p.writable(b"/secret/encrypted/x"));
+        assert!(p.writable(b"/q/ch:orders/1"));
+        assert!(!p.range_writable(b"", &[0]), "a delete of everything reaches it");
+        assert!(!p.range_writable(b"/secret/", b"/secret0"));
+        assert!(p.range_writable(b"/q/", b"/q0"));
+        // and nothing else changes
+        assert!(p.propagates(b"/secret/x"));
+        assert!(p.may_serve(b"/secret/x", far()));
+    }
+
+    #[test]
+    fn prefix_ends_follow_etcd() {
+        assert_eq!(prefix_end(b"/secret/"), Some(b"/secret0".to_vec()));
+        assert_eq!(prefix_end(&[b'a', 0xff]), Some(b"b".to_vec()));
+        assert_eq!(prefix_end(&[0xff, 0xff]), None);
+        assert!(is_remote(far()));
+        assert!(!is_remote(None));
+        assert!(!is_remote("[::1]:1".parse().ok()));
     }
 
     #[test]

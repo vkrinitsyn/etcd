@@ -91,6 +91,8 @@ impl Watch for EtcdNode {
     async fn watch(&self, request: Request<Streaming<WatchRequest>>) -> WatchResult<ResponseStream> {
         // request
         let (sender, receiver) = mpsc::channel::<Result<WatchResponse, Status>>(10);
+        // [E3] the caller, from the connection - a watch used to stream any key
+        let remote = request.remote_addr();
         let mut stream = request.into_inner();
         let etcd = self.clone();
         tokio::spawn(async move {
@@ -99,6 +101,23 @@ impl Watch for EtcdNode {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(r) => {
+                        if let Some(RequestUnion::CreateRequest(c)) = &r.request_union {
+                            if !etcd.policy.read().await.range_may_serve(&c.key, &c.range_end, remote) {
+                                // refused, as etcd refuses a watch: created and
+                                // canceled at once, with the reason
+                                let _ = sender.send(Ok(WatchResponse {
+                                    header: None,
+                                    watch_id: c.watch_id,
+                                    created: true,
+                                    canceled: true,
+                                    compact_revision: 0,
+                                    cancel_reason: "this key prefix is served only on a local connection".to_string(),
+                                    fragment: false,
+                                    events: vec![],
+                                })).await;
+                                continue;
+                            }
+                        }
                         cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
                     }
                     Err(e) => {

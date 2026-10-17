@@ -8,6 +8,14 @@ use tonic::{async_trait, Request, Response, Status};
 
 
 impl EtcdNode {
+    /// [otel] One KV call, on the instruments (metrics.rs), when the host gave a meter
+    #[cfg(feature = "tracer")]
+    pub(crate) async fn metric_kv(&self, op: &'static str, ok: bool, took: std::time::Duration) {
+        if let Some(i) = self.meter.read().await.as_ref() {
+            i.kv(op, ok, took);
+        }
+    }
+
     /// Refuse a key that is served only locally, when the caller is not.
     ///
     /// Applied at the **handler** boundary because that is where the connection
@@ -31,6 +39,17 @@ impl EtcdNode {
         Err(Status::permission_denied(
             "this key prefix is served only on a local connection"))
     }
+
+    /// Refuse an API write under a `readonly` prefix: only the embedder writes
+    /// there, in-process, and it does not come through these handlers.
+    async fn deny_readonly(&self, key: &[u8], range_end: &[u8]) -> Result<(), Status> {
+        let p = self.policy.read().await;
+        let ok = if range_end.is_empty() { p.writable(key) } else { p.range_writable(key, range_end) };
+        if ok {
+            return Ok(());
+        }
+        Err(Status::permission_denied("this key prefix is written only by the node itself"))
+    }
 }
 
 #[async_trait]
@@ -38,12 +57,35 @@ impl Kv for EtcdNode {
     
     /// TODO implement all variation
     async fn range(&self, request: Request<RangeRequest>) -> Result<Response<RangeResponse>, Status> {
-        self.deny_remote(&request.get_ref().key, request.remote_addr()).await?;
+        let remote = request.remote_addr();
+        self.deny_remote(&request.get_ref().key, remote).await?;
+        // [E2] a range is checked over its whole span, not by its first key: a
+        // count of a restricted span is refused outright (a count cannot be
+        // filtered), and the keys of any other span are filtered one by one
+        let (key, end, count_only) = {
+            let r = request.get_ref();
+            (r.key.clone(), r.range_end.clone(), r.count_only)
+        };
+        let span_ok = self.policy.read().await.range_may_serve(&key, &end, remote);
+        if !span_ok && count_only {
+            return Err(Status::permission_denied("this key prefix is served only on a local connection"));
+        }
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("get"));
-        let result = self.get_impl(request).await;
+        let _started = std::time::Instant::now();
+        let got = self.get_impl(request).await;
+        #[cfg(feature = "tracer")]
+        self.metric_kv("get", got.is_ok(), _started.elapsed()).await;
+        let mut result = got?;
+        if !span_ok {
+            let p = self.policy.read().await;
+            let r = result.get_mut();
+            let before = r.kvs.len();
+            r.kvs.retain(|kv| p.may_serve(&kv.key, remote));
+            r.count -= (before - r.kvs.len()) as i64;
+        }
         // #[cfg(feature = "tracer")] let _ = _s.map(|mut s| s.end());
-        result
+        Ok(result)
     }
 
     /// TODO implement all variation of Requests ignores
@@ -52,10 +94,14 @@ impl Kv for EtcdNode {
     /// 3. else if send to 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         self.deny_remote(&request.get_ref().key, request.remote_addr()).await?;
+        self.deny_readonly(&request.get_ref().key, &[]).await?;
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("put"));
 
+        let _started = std::time::Instant::now();
         let result = self.put_impl(request).await;
+        #[cfg(feature = "tracer")]
+        self.metric_kv("put", result.is_ok(), _started.elapsed()).await;
         // #[cfg(feature = "tracer")] let _ = _s.map(|mut s| s.end());
         result
     }
@@ -65,9 +111,13 @@ impl Kv for EtcdNode {
     /// TODO implement kv owner and queue consumer access 
     async fn delete_range(&self, request: Request<DeleteRangeRequest>) -> Result<Response<DeleteRangeResponse>, Status> {
         self.deny_remote(&request.get_ref().key, request.remote_addr()).await?;
+        self.deny_readonly(&request.get_ref().key, &request.get_ref().range_end).await?;
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("delete"));
+        let _started = std::time::Instant::now();
         let result = self.delete_impl(request).await;
+        #[cfg(feature = "tracer")]
+        self.metric_kv("delete", result.is_ok(), _started.elapsed()).await;
         // #[cfg(feature = "tracer")] let _ = _s.map(|mut s| s.end()); 
         result
     }
@@ -78,10 +128,15 @@ impl Kv for EtcdNode {
         let remote = request.remote_addr();
         for k in crate::kv::txn_keys(request.get_ref()) {
             self.deny_remote(&k, remote).await?;
+            self.deny_readonly(&k, &[]).await?;
         }
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("txn"));
-        self.txn_impl(request).await
+        let _started = std::time::Instant::now();
+        let result = self.txn_impl(request).await;
+        #[cfg(feature = "tracer")]
+        self.metric_kv("txn", result.is_ok(), _started.elapsed()).await;
+        result
     }
 
     async fn compact(&self, _request: Request<CompactionRequest>) -> Result<Response<CompactionResponse>, Status> {

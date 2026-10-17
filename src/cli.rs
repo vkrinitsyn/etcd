@@ -1,13 +1,16 @@
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use clap::Parser;
-use clap_serde_derive::{
-    clap::{self},
-    serde::Serialize,
-    ClapSerde,
-};
+use serde::{Deserialize, Serialize};
 
-#[derive(ClapSerde, Clone, Debug)]
+/// The node's settings: command-line arguments (clap) and a config file (serde).
+///
+/// [no-agpl] Plain `clap::Args` + serde. `clap-serde-derive` made this before - an
+/// `Opt` twin of every field and a merge - and it is AGPL-3.0, which the binaries
+/// linking this crate cannot ship under. `Default` stays what it was: each type's
+/// default (empty, 0, false); the `default_value`s are clap's, see `with_defaults`.
+#[derive(clap::Args, Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EtcdConfig {
     /// Node UUID
     #[arg(long, required = false, default_value = "")]
@@ -44,6 +47,18 @@ pub struct EtcdConfig {
     /// between nodes while still being none of a remote client's business.
     #[arg(long, required = false, default_value = "")]
     pub local_only_prefix: String,
+
+    /// Branches of `local_only_prefix` that ARE served to remote callers, comma
+    /// separated - the branches meant to travel, whose writes a peer forwards
+    /// through the KV API (without this a forwarded write is refused). Empty: none.
+    #[arg(long, required = false, default_value = "")]
+    pub local_only_prefix_except: String,
+
+    /// Key prefixes no API caller may write, comma separated: put, delete and txn
+    /// are refused there, and only the embedder writes them, in-process (a mirror
+    /// it keeps from its own source of truth). Empty: none.
+    #[arg(long, required = false, default_value = "")]
+    pub readonly_prefix: String,
 
     /// Key prefixes that propagate only to peers in this node's zone.
     ///
@@ -458,8 +473,8 @@ pub struct EtcdConfig {
     // pub client_transport_security: ClientConfig,
 }
 
-#[derive(ClapSerde, Serialize)]
-#[derive(Debug)]
+#[derive(clap::Args, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
 pub struct ClientConfig {
     /// Path to the client server TLS cert file.
     #[arg(long)]
@@ -495,22 +510,54 @@ pub struct EtcdCliArgs {
 
     /// Rest of arguments
     #[command(flatten)]
-    pub config: <EtcdConfig as ClapSerde>::Opt,
+    pub config: EtcdConfig,
+
+    /// The settings named on the command line (arg ids, which are the field
+    /// names): they win over the config file. Filled by `parse_args`.
+    #[arg(skip)]
+    pub given: HashSet<String>,
 }
 
 impl EtcdCliArgs {
+    /// The command line, and which settings it named rather than defaulted.
+    pub fn parse_args() -> Self {
+        Self::parse_args_from(std::env::args_os())
+    }
+
+    /// `parse_args` over the given arguments, the program name first.
+    pub fn parse_args_from<I, T>(args: I) -> Self
+    where I: IntoIterator<Item = T>, T: Into<std::ffi::OsString> + Clone {
+        let m = <Self as clap::CommandFactory>::command().get_matches_from(args);
+        let mut a = <Self as clap::FromArgMatches>::from_arg_matches(&m).unwrap_or_else(|e| e.exit());
+        a.given = m.ids()
+            .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
+            .map(|id| id.as_str().to_string())
+            .collect();
+        a
+    }
+
+    /// The config file's settings, under the ones the command line named; the
+    /// rest as clap defaults them. (Before, every default overrode the file too:
+    /// the merged twin held a value for each field that had a `default_value`.)
     pub fn parse_from<R: Read>(&mut self, input: BufReader<R>) -> Result<EtcdConfig, String> {
-        serde_yaml::from_reader::<_, <EtcdConfig as ClapSerde>::Opt>(input)
-            .map_err(|e| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e)) 
-            .map(|config| EtcdConfig::from(config).merge(&mut self.config))
+        let err = |e: serde_yaml::Error| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e);
+        let file: serde_yaml::Value = serde_yaml::from_reader(input).map_err(err)?;
+        let mut merged = serde_yaml::to_value(&self.config).map_err(err)?;
+        if let (serde_yaml::Value::Mapping(m), serde_yaml::Value::Mapping(f)) = (&mut merged, file) {
+            for (k, v) in f {
+                if k.as_str().map_or(false, |name| !self.given.contains(name)) {
+                    m.insert(k, v);
+                }
+            }
+        }
+        serde_yaml::from_value(merged).map_err(err)
     }
 }
 
 impl EtcdConfig {
+    /// Every setting at its clap `default_value`.
     pub fn with_defaults() -> Self {
-        let args = <EtcdCliArgs as Parser>::parse_from(["etcd"]);
-        let mut config = args.config;
-        EtcdConfig::from(&mut config)
+        <EtcdCliArgs as Parser>::parse_from(["etcd"]).config
     }
 
     pub fn peers(&self) -> HashSet<&str> {
@@ -525,5 +572,32 @@ impl EtcdConfig {
             }
         }
         clients
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_two_defaults_stay_what_they_were() {
+        // the type defaults: what clap-serde-derive's Default gave without #[default]
+        let d = EtcdConfig::default();
+        assert_eq!((d.name.as_str(), d.term, d.listen_client_urls.as_str()), ("", 0, ""));
+        // clap's default_values
+        let c = EtcdConfig::with_defaults();
+        assert_eq!((c.name.as_str(), c.term, c.listen_client_urls.as_str()), ("default", 1, "localhost:2379"));
+        assert!(c.pre_vote && !c.enable_v2);
+    }
+
+    #[test]
+    fn a_named_argument_wins_over_the_file_and_the_file_over_a_default() {
+        let mut a = EtcdCliArgs::parse_args_from(["etcd", "--name", "cli-name"]);
+        assert!(a.given.contains("name") && !a.given.contains("term"), "{:?}", a.given);
+        let file = "name: file-name\nterm: 7\nzone: z1\n";
+        let c = a.parse_from(BufReader::new(file.as_bytes())).unwrap();
+        assert_eq!(c.name, "cli-name", "named on the command line");
+        assert_eq!((c.term, c.zone.as_str()), (7, "z1"), "from the file");
+        assert_eq!(c.listen_client_urls, "localhost:2379", "neither: clap's default");
+        assert!(a.parse_from(BufReader::new("term: [not a number]".as_bytes())).is_err());
     }
 }

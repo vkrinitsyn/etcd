@@ -513,6 +513,7 @@ impl EtcdCluster {
         &self,
         my_client_urls: Vec<String>,
         vault: &Arc<RwLock<HashMap<KvKey, Kv>>>,
+        policy: &crate::prefix::PrefixPolicy,
         log: &Logger,
     ) -> std::result::Result<usize, String> {
         if self.peers.is_empty() {
@@ -581,7 +582,9 @@ impl EtcdCluster {
             kv.range(range_req).await
                 .map_err(|e| format!("range query to {}: {}", peer_conn, e))?
         };
-        let kvs = resp.into_inner().kvs;
+        // [E2] only what propagates: a peer's `local` keys are its own, and copying
+        // them made them this node's too
+        let kvs: Vec<_> = resp.into_inner().kvs.into_iter().filter(|kv| policy.propagates(&kv.key)).collect();
         let count = kvs.len();
         if count > 0 {
             let mut vault = vault.write().await;

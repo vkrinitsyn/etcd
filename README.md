@@ -90,3 +90,12 @@ according to those terms.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in `etcd` by you, shall be licensed as Apache-2.0 and MIT, without any additional
 terms or conditions.
+
+## End-to-end tests
+
+The etcd API v3 surface a YaXAHA node exposes, built on this crate, is tested
+from the yaxaha-tests repository (DBinvent/yaxaha) next to this one:
+`yaxaha-tests/topology/93_etcd.sh` drives a seven-node docker cluster with the
+`yxetcd` example of this repository (`cargo build --release --example yxetcd`).
+`yaxaha-tests/nightly/nightly.sh` builds that example and runs the suite every
+night this repository (or another watched one) changed.

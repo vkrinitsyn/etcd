@@ -5,7 +5,7 @@ extern crate slog;
 
 use std::{fs::File, io::BufReader};
 use std::process::ExitCode;
-use clap::Parser;
+
 use slog::Logger;
 use sloggers::Build;
 use sloggers::terminal::{Destination, TerminalLoggerBuilder};
@@ -15,7 +15,7 @@ use sloggers::types::{Severity, SourceLocation};
 #[tokio::main]
 async fn main() -> ExitCode {
     // Parse whole args with clap
-    let mut args = EtcdCliArgs::parse();
+    let mut args = EtcdCliArgs::parse_args();
    
     // Get config file
     let config = if let Ok(f) = File::open(&args.config_path) {
@@ -28,7 +28,7 @@ async fn main() -> ExitCode {
         }
     } else {
         // If there is not config file return only config parsed from clap
-        EtcdConfig::from(&mut args.config)
+        args.config.clone()
     };
     let log = logger(&config);
     match EtcdNode::init(

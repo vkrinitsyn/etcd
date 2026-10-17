@@ -74,7 +74,9 @@ impl EtcdNode {
         let term = Arc::new(AtomicU64::new(cfg.term));
         let policy = crate::prefix::PrefixPolicy::new(
             &cfg.local_prefix, &cfg.local_prefix_except, &cfg.local_only_prefix,
-            &cfg.zone_prefix);
+            &cfg.zone_prefix)
+            .with_local_only_except(&cfg.local_only_prefix_except)
+            .with_readonly(&cfg.readonly_prefix);
         let c = EtcdNode {
             cfg: Arc::new(RwLock::new(cfg)),
             vault: Arc::new(Default::default()),
@@ -91,6 +93,7 @@ impl EtcdNode {
             event,
             log: log.clone(),
             #[cfg(feature = "tracer")] tracer: Arc::new(RwLock::new(tracer)),
+            #[cfg(feature = "tracer")] meter: Arc::new(RwLock::new(None)),
         };
         // Announce self to peers and sync KV data from fastest responder
         {
@@ -105,7 +108,8 @@ impl EtcdNode {
                 .collect();
             drop(cfg);
 
-            match c.peers.read().await.announce_and_sync(my_urls, &c.vault, &log).await {
+            let pol = c.policy.read().await.clone();
+            match c.peers.read().await.announce_and_sync(my_urls, &c.vault, &pol, &log).await {
                 Ok(n) => if n > 0 {
                     info!(log, "{}startup sync: loaded {} keys", LP, n);
                 },
@@ -143,6 +147,10 @@ impl EtcdNode {
                         EtcdMgmtEvent::Tracer(c) => {
                             *grpc_client.tracer.write().await = c;
                         }
+                        #[cfg(feature = "tracer")]
+                        EtcdMgmtEvent::Meter(m) => {
+                            *grpc_client.meter.write().await = m.map(crate::metrics::Instruments::new);
+                        }
                         EtcdMgmtEvent::Stop => {
                             info!(grpc_client.log, "{}received Stop event, shutting down event loop", LP);
                             break;
@@ -160,8 +168,11 @@ impl EtcdNode {
                                 })
                                 .collect();
                             drop(cfg);
+                            // bound first: a guard in the match scrutinee would be held
+                            // for the whole sync, network waits included
+                            let pol = grpc_client.policy.read().await.clone();
                             match grpc_client.peers.read().await
-                                .announce_and_sync(my_urls, &grpc_client.vault, &grpc_client.log).await {
+                                .announce_and_sync(my_urls, &grpc_client.vault, &pol, &grpc_client.log).await {
                                 Ok(n) => if n > 0 {
                                     info!(grpc_client.log, "{}restart sync: loaded {} keys", LP, n);
                                 },
@@ -345,6 +356,8 @@ impl EtcdNode {
         current.local_prefix = cfg.local_prefix;
         current.local_prefix_except = cfg.local_prefix_except;
         current.local_only_prefix = cfg.local_only_prefix;
+        current.local_only_prefix_except = cfg.local_only_prefix_except;
+        current.readonly_prefix = cfg.readonly_prefix;
         // Rebuilt here and only here, so the cache cannot drift from the config
         // it was built from.
         current.zone_prefix = cfg.zone_prefix;
@@ -352,7 +365,9 @@ impl EtcdNode {
         current.peer_zones = cfg.peer_zones;
         *self.policy.write().await = crate::prefix::PrefixPolicy::new(
             &current.local_prefix, &current.local_prefix_except, &current.local_only_prefix,
-            &current.zone_prefix);
+            &current.zone_prefix)
+            .with_local_only_except(&current.local_only_prefix_except)
+            .with_readonly(&current.readonly_prefix);
         // Labels come from configuration, so they are re-applied wherever the
         // config is: a peer added after the last reconfigure would otherwise
         // carry no zone and be treated as sharing ours.
@@ -557,8 +572,9 @@ pub struct EtcdNode {
     pub(crate) policy: Arc<RwLock<crate::prefix::PrefixPolicy>>,
     pub event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
-    #[cfg(feature = "tracer")] pub(crate) tracer: Arc<RwLock<Option<opentelemetry_sdk::trace::SdkTracer>>>
-
+    #[cfg(feature = "tracer")] pub(crate) tracer: Arc<RwLock<Option<opentelemetry_sdk::trace::SdkTracer>>>,
+    /// [otel] the KV instruments, on the meter the host handed (metrics.rs)
+    #[cfg(feature = "tracer")] pub(crate) meter: Arc<RwLock<Option<crate::metrics::Instruments>>>,
 }
 
 pub(crate) type EtcdObserverType = Vec<(ClientId, WatcherId)>;
