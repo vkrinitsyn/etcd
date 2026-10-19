@@ -433,7 +433,7 @@ impl EtcdNode {
     //
     // In-process access for a host application. These go through the same
     // `*_impl` paths a gRPC call does, so the propagation and zone rules apply
-    // identically — an embedder cannot bypass a policy by not using the wire.
+    // identically - an embedder cannot bypass a policy by not using the wire.
     //
     // What they *do* bypass is `deny_remote`, and correctly: an in-process
     // caller has no socket address, which the policy already treats as local.
@@ -458,7 +458,7 @@ impl EtcdNode {
     ///
     /// The pair is then scheduled together: the reply queue's dispatcher is
     /// placed on the requester's node, so the reply leg is one hop instead of
-    /// two. Idempotent, and an optimization only — an undeclared pair still
+    /// two. Idempotent, and an optimization only - an undeclared pair still
     /// works, at Phase 1/2 cost.
     ///
     /// An embedder API rather than something inferred from queue names: a

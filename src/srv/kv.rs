@@ -22,7 +22,7 @@ impl EtcdNode {
     /// is still visible: `Request::remote_addr()` is populated by tonic's
     /// `TcpConnectInfo`, and by the time a request reaches `*_impl` it has been
     /// consumed into its inner message. `None` means a transport that cannot
-    /// place the caller — a unix socket, or an in-process call — and is treated
+    /// place the caller - a unix socket, or an in-process call - and is treated
     /// as local, since refusing those would refuse ourselves.
     ///
     /// This is a property of the connection, taken from the kernel. It is not

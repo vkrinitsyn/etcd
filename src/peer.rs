@@ -83,7 +83,7 @@ pub(crate) enum BroadcastRequest {
 /// The host part of a peer URL, for matching against a `peer_zones` entry.
 ///
 /// Entries may be written `host:port` or bare `host`, and a peer's `conn` is a
-/// URL — so both sides are reduced to the same shape before comparing rather
+/// URL - so both sides are reduced to the same shape before comparing rather
 /// than requiring an operator to guess the stored form.
 fn host_key(s: &str) -> String {
     let s = s.trim();
@@ -93,7 +93,7 @@ fn host_key(s: &str) -> String {
 
 /// Look up a peer's zone in a `host:port=zone,...` list.
 ///
-/// Matches on `host:port` first, then on the bare host — so one entry can
+/// Matches on `host:port` first, then on the bare host - so one entry can
 /// cover a node whose port an operator did not write down, without a
 /// host-only entry silently shadowing a more specific one.
 fn zone_of(conn: &str, peer_zones: &str) -> String {
@@ -121,7 +121,7 @@ impl EtcdCluster {
     ///
     /// Called wherever the config is applied. The etcd member protocol carries
     /// no zone, and extending it would break API compatibility, so the labels
-    /// come from the embedder — which already knows the topology.
+    /// come from the embedder - which already knows the topology.
     pub(crate) fn apply_zones(&mut self, my_zone: &str, peer_zones: &str) {
         self.my_zone = my_zone.trim().to_string();
         for p in &self.peers {
@@ -310,7 +310,7 @@ impl EtcdCluster {
     /// Optionally confined to peers sharing this node's zone.
     ///
     /// `zone_scoped` is decided by the caller from the key's prefix, because
-    /// the key is what carries the policy — a peer cannot be asked whether it
+    /// the key is what carries the policy - a peer cannot be asked whether it
     /// should receive something.
     ///
     /// **A peer whose zone is unknown is excluded** from a zone-scoped
@@ -341,14 +341,14 @@ impl EtcdCluster {
     /// [q-route Phase 4] **The client is CLONED and both locks released before
     /// the call.** It used to hold `peer.lock()` *and* `kv_client.lock()` for
     /// the whole round trip, so every concurrent message to the same peer
-    /// serialized on them — and a hot p2p pair is exactly the case that sends
+    /// serialized on them - and a hot p2p pair is exactly the case that sends
     /// concurrent messages to one peer. The outer lock was the worse of the
     /// two: it also blocked every *state* read about that peer, so a slow RPC
     /// stalled `is_online`, `unicast` and `broadcast_scoped` for it.
     ///
     /// Cloning is cheap and correct: a tonic client is a thin handle over a
     /// `Channel`, which multiplexes concurrent HTTP/2 streams. This removes a
-    /// serialization point, not an ordering guarantee — the queue's ordering
+    /// serialization point, not an ordering guarantee - the queue's ordering
     /// comes from `idx`, assigned by the dispatcher, never from the order two
     /// peer RPCs happen to complete in.
     ///
@@ -463,7 +463,7 @@ impl EtcdCluster {
     ///
     /// `InProgress` deliberately does **not** count. Such a peer receives
     /// writes but is still syncing, and a dispatcher has to be able to *index*
-    /// and *route*, not merely store — electing one that is still catching up
+    /// and *route*, not merely store - electing one that is still catching up
     /// puts the queue's ordering behind its recovery.
     pub(crate) async fn is_online(&self, peer_id: NodeId) -> bool {
         for p in &self.peers {
@@ -480,14 +480,14 @@ impl EtcdCluster {
     ///
     /// **Applies the same zone test as `broadcast_scoped`, and that is not
     /// optional.** A unicast is still a write leaving this node, so a
-    /// zone-scoped key must not reach a peer in another zone — or one whose
+    /// zone-scoped key must not reach a peer in another zone - or one whose
     /// zone is *unknown*, which is the fail-safe direction: a peer added since
     /// the last reconfigure is unlabelled, and treating "no label" as "same
     /// zone" is the leak zoning exists to prevent. Being targeted rather than
     /// broadcast changes nothing about that.
     ///
     /// `None` when the peer is not held, not Online, or excluded by the zone test
-    /// — the caller falls back to a broadcast and says so, rather than silently
+    /// - the caller falls back to a broadcast and says so, rather than silently
     /// dropping the message.
     pub(crate) async fn unicast_target(&self, peer_id: NodeId, zone_scoped: Option<&str>) -> Option<EtcdPeerNodeType> {
         for p in &self.peers {

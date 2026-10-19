@@ -1,21 +1,21 @@
-//! `yxetcd` — a tiny etcd v3 client for testing a LIVE cluster node.
+//! `yxetcd` - a tiny etcd v3 client for testing a LIVE cluster node.
 //!
 //! The crate's own tests (`tests/client.rs`, `tests/queue.rs`, …) start an
 //! `EtcdNode` in-process and talk to it. That covers the implementation; it does
 //! not cover the thing the product page actually claims:
 //!
 //!   "A node can expose a standard etcd API v3 key-value surface, so anything
-//!    that already speaks etcd — service discovery, configuration, leader
-//!    election in your own stack — needs no bespoke client."
+//!    that already speaks etcd - service discovery, configuration, leader
+//!    election in your own stack - needs no bespoke client."
 //!
 //! The only honest way to test *that* is from outside, over the network, with
-//! the ordinary client — so this uses `etcd-client`, the third-party crate, and
+//! the ordinary client - so this uses `etcd-client`, the third-party crate, and
 //! nothing from `etcds` itself. If this binary works against a ytserv node, a
 //! stranger's etcd tooling works against it too; if it needed anything from the
 //! crate under test, the claim would still be unproven.
 //!
 //! The surface lives on the node's ordinary port (7421), multiplexed onto the
-//! same tonic server as the peer gRPC — there is no separate etcd listener and
+//! same tonic server as the peer gRPC - there is no separate etcd listener and
 //! no HTTP gateway, so `curl` cannot stand in for this.
 //!
 //! ```text

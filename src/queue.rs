@@ -40,7 +40,7 @@ pub struct Queue {
     /// Replaces an `Option<EtcdPeerNodeType>` in which `None` meant BOTH "I am
     /// the dispatcher" and "nobody has been elected". Nothing ever wrote it, so
     /// the second reading always won and every produced message was broadcast
-    /// to every peer — `2(N-1)` RPCs per round trip. See
+    /// to every peer - `2(N-1)` RPCs per round trip. See
     /// `queue-p2p-route.md` and [`crate::route::Dispatch`].
     dispatch: Arc<RwLock<crate::route::Dispatch>>,
 
@@ -95,8 +95,8 @@ const PIN_STABLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long an empty, consumerless queue is kept before it is reaped.
 ///
-/// `queue-p2p-route.md` lists teardown as an open question — *"nothing removes
-/// a queue from `EtcdNode::queues` — no TTL, no reaper"*. The registries made
+/// `queue-p2p-route.md` lists teardown as an open question - *"nothing removes
+/// a queue from `EtcdNode::queues` - no TTL, no reaper"*. The registries made
 /// it pressing rather than merely untidy: a leaked queue now also leaks
 /// `/q/{name}` and `/q/{name}/c/{client}`, which are **replicated**, so one
 /// node's leak becomes every node's memory.
@@ -253,7 +253,7 @@ impl Queue {
 
         // [q-route] **This node now holds a consumer, so it should dispatch.**
         //
-        // A dispatcher at neither end costs two hops — producer node ->
+        // A dispatcher at neither end costs two hops - producer node ->
         // dispatcher -> consumer node. At the consumer it costs one, for EVERY
         // producer at once. So a consumer's node claims the queue immediately
         // and takes it over from a producer's node; it does not wait for the
@@ -328,7 +328,7 @@ impl Queue {
             clients.remove(client_id);
             // [q-route Phase 2] The last watcher for this client is gone, so
             // this node no longer hosts it. Withdrawing is what stops the
-            // dispatcher unicasting into a node with nobody listening — which
+            // dispatcher unicasting into a node with nobody listening - which
             // would look exactly like a slow consumer.
             drop(clients);
             self.withdraw_consumer(client_id).await;
@@ -370,8 +370,8 @@ impl Queue {
         // [q-route Phase 2] A DELIVERY arriving from the dispatcher
         // (`/q/{name}/c/{cid}/{idx}/{key}`) is not a new message: it is this
         // node being told to hand one to a consumer it hosts. Enqueuing it
-        // would put a second copy in a second queue, and the ack — which
-        // deletes by idx on the DISPATCHER — would never reach it.
+        // would put a second copy in a second queue, and the ack - which
+        // deletes by idx on the DISPATCHER - would never reach it.
         if from_peer.is_some() && qn.consumer {
             if let Some(cid) = qn.client_id {
                 let kv = KeyValue { key: qn.input.clone().into_bytes(), value: x.value.clone(),
@@ -403,7 +403,7 @@ impl Queue {
         // and forgets.
         //
         // Keeping a copy everywhere was harmless while the dispatch loop could
-        // only see LOCAL consumers — a producer-only node had no candidates and
+        // only see LOCAL consumers - a producer-only node had no candidates and
         // fell straight out. Once the consumer registry let every node see
         // every consumer, that same copy made every node a dispatcher: the
         // producer's node and the real dispatcher would each deliver, and the
@@ -537,7 +537,7 @@ impl Queue {
                     // short circuit in the one place it matters.
                     //
                     // **Only the dispatcher fans out.** Without this test every
-                    // node holding a copy would deliver to the same consumer —
+                    // node holding a copy would deliver to the same consumer -
                     // the registry tells them all where it is. One dispatcher
                     // is what makes `handled_by` mean anything.
                     //
@@ -598,7 +598,7 @@ impl Queue {
                     }
                     // [q-route Phase 2] Nothing local took it; offer it to a
                     // consumer on another node. One unicast, to the node the
-                    // registry names — not a broadcast to everyone in the hope
+                    // registry names - not a broadcast to everyone in the hope
                     // that whoever hosts it notices.
                     if delivered.is_none() {
                         for (cid, node) in remote {
@@ -794,8 +794,8 @@ impl Queue {
     /// [q-route] Resolve the dispatcher, electing this node if there is none or
     /// the recorded one is not usable.
     ///
-    /// Called on every first touch of a queue — `get_or_create_queue` and
-    /// `create_watcher` — and cheap enough to call again: the common path is a
+    /// Called on every first touch of a queue - `get_or_create_queue` and
+    /// `create_watcher` - and cheap enough to call again: the common path is a
     /// vault read and a comparison.
     ///
     /// **Last-writer-wins is acceptable here and the reason is worth stating:**
@@ -828,7 +828,7 @@ impl Queue {
         //
         // A dispatcher placed at neither end costs two hops: producer node ->
         // dispatcher -> consumer node. Placed at the consumer's node it costs
-        // ONE, for every producer at once — which is the whole point of p2p
+        // ONE, for every producer at once - which is the whole point of p2p
         // routing, and why a consumer's node takes the queue over from a
         // producer's rather than waiting for the Phase 3 hysteresis.
         //
@@ -885,7 +885,7 @@ impl Queue {
         d
     }
 
-    /// Is this queue finished with — empty, unwatched, and idle?
+    /// Is this queue finished with - empty, unwatched, and idle?
     ///
     /// Four guards, and each is a way the obvious version loses a message:
     ///
@@ -920,7 +920,7 @@ impl Queue {
 
     /// Remove this queue's registry keys.
     ///
-    /// The dispatcher record only — consumer registrations are withdrawn by
+    /// The dispatcher record only - consumer registrations are withdrawn by
     /// whichever node held them, and a node deleting another's would be
     /// asserting something it cannot know.
     async fn forget_registry(&self, log: &Logger) {
@@ -936,7 +936,7 @@ impl Queue {
     /// Placement is not this function's job: a consumer's node claims the queue
     /// the moment it creates the watch (`Claim::Consumer` in `make_consumer`),
     /// so the dispatcher is already at an endpoint. This handles the case that
-    /// placement cannot — a consumer that **moved**, leaving the dispatcher on
+    /// placement cannot - a consumer that **moved**, leaving the dispatcher on
     /// a node that no longer hosts it, which is a third party again and costs
     /// every producer the extra hop.
     ///
@@ -951,7 +951,7 @@ impl Queue {
     ///   dispatched-but-unacked would strand them: `handled_by` and the queue
     ///   they live in are on the old node, and the ack deletes by idx there.
     ///
-    /// Leader-only in effect — it does nothing unless this node is the current
+    /// Leader-only in effect - it does nothing unless this node is the current
     /// dispatcher, because the dispatcher is the one node that can know whether
     /// anything is outstanding.
     async fn pin_to_consumer(&self, log: &Logger) {
@@ -1049,7 +1049,7 @@ impl EtcdNode {
     /// `queue-p2p-route.md` listed teardown as an open question. It became a
     /// real one when the registries landed: a leaked `Queue` used to cost this
     /// node some memory, and now also leaks `/q/{name}`, which is **replicated**
-    /// — so one node's leak is every node's.
+    /// - so one node's leak is every node's.
     ///
     /// Safe to call as often as an embedder likes; the work is one read lock
     /// per queue in the common case. Returns how many were reaped.
@@ -1068,7 +1068,7 @@ impl EtcdNode {
         }
         // Two phases, and the split is not stylistic. `forget_registry` deletes
         // a replicated key, which goes through `delete_impl`, which takes
-        // `queues.read()` — so awaiting it while holding `queues.write()` is a
+        // `queues.read()` - so awaiting it while holding `queues.write()` is a
         // deadlock. Drop the map lock first, then clear the registry.
         let mut dropped = Vec::new();
         {
@@ -1095,7 +1095,7 @@ impl EtcdNode {
 /// [q-route] Write a registry key through the plain KV path.
 ///
 /// Deliberately **not** `EtcdNode::kv_put`: that goes through `put_impl`, which
-/// is the function deciding whether a key is a message — and `elect` is called
+/// is the function deciding whether a key is a message - and `elect` is called
 /// from inside it. Beyond the borrow-checker's objection to the cycle, a
 /// registry write is by definition not queue traffic and should not be asking
 /// that question at all.
@@ -1119,7 +1119,7 @@ impl EtcdNode {
 
         // [q-route] A registry key is NOT a message. `/q/{name}` and
         // `/q/{name}/c/{client}` DESCRIBE the queue; enqueuing them would have
-        // the registry fill the queue it exists to route — and before this test
+        // the registry fill the queue it exists to route - and before this test
         // existed, that is exactly what a put to either of them did. They fall
         // through to the ordinary replicated KV path, which is where every node
         // reads them from. `route::is_control` decides it structurally: a

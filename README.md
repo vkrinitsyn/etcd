@@ -93,9 +93,9 @@ terms or conditions.
 
 ## End-to-end tests
 
-The etcd API v3 surface a YaXAHA node exposes, built on this crate, is tested
-from the yaxaha-tests repository (DBinvent/yaxaha) next to this one:
-`yaxaha-tests/topology/93_etcd.sh` drives a seven-node docker cluster with the
+The etcd API v3 surface a YT Cluster node exposes, built on this crate, is tested
+from the yt-cluster-tests repository (DBinvent/yt-cluster-tests) next to this one:
+`yt-cluster-tests/topology/93_etcd.sh` drives a seven-node docker cluster with the
 `yxetcd` example of this repository (`cargo build --release --example yxetcd`).
-`yaxaha-tests/nightly/nightly.sh` builds that example and runs the suite every
+`yt-cluster-tests/nightly/nightly.sh` builds that example and runs the suite every
 night this repository (or another watched one) changed.

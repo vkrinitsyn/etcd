@@ -3,15 +3,15 @@
 //!
 //! Both rules are **properties of the key**, deliberately, not of the caller.
 //! `srv::peer` decides "did this come from a peer" by reading the `XPEER`
-//! metadata header, which any client can set — so a policy phrased in terms of
+//! metadata header, which any client can set - so a policy phrased in terms of
 //! peers would be enforced by the caller rather than by us. A prefix cannot be
 //! spoofed.
 //!
 //! ## Two independent policies
 //!
-//! * **`local`** — a matching key is never broadcast. It exists on the node
+//! * **`local`** - a matching key is never broadcast. It exists on the node
 //!   that wrote it and nowhere else.
-//! * **`local_only`** — a matching key is answered only on a loopback
+//! * **`local_only`** - a matching key is answered only on a loopback
 //!   connection, and refused over the network.
 //!
 //! They are separate because they answer different questions, and a key can
@@ -22,7 +22,7 @@
 //!
 //! A caller usually wants "this subtree is local, **except** these branches".
 //! Expressing that as an allow-list of the propagating branches would break the
-//! moment a new branch is added — the default would be "propagates", which is
+//! moment a new branch is added - the default would be "propagates", which is
 //! the wrong way round for anything confidential. So `local` is the subtree and
 //! `local_except` carves out what does travel, and a typo in a branch name
 //! fails safe: it stays local.
@@ -144,7 +144,7 @@ impl PrefixPolicy {
     /// May this key be broadcast to a peer in `peer_zone`?
     ///
     /// An empty zone on either side means "unzoned", and two unzoned nodes are
-    /// in the same (unnamed) zone — which is a flat cluster, and is today's
+    /// in the same (unnamed) zone - which is a flat cluster, and is today's
     /// behaviour unchanged.
     pub fn propagates_to_zone(&self, key: &[u8], my_zone: &str, peer_zone: &str) -> bool {
         if !self.propagates(key) {
@@ -180,8 +180,8 @@ impl PrefixPolicy {
 
     /// May this key be served to a caller at `remote`?
     ///
-    /// `None` means the transport could not place the caller — a unix socket,
-    /// or an in-process call — and is treated as local. Refusing those would
+    /// `None` means the transport could not place the caller - a unix socket,
+    /// or an in-process call - and is treated as local. Refusing those would
     /// refuse ourselves.
     ///
     /// **Loopback is not identity.** On a shared host every local process is

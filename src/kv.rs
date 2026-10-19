@@ -212,7 +212,7 @@ impl EtcdNode {
     }
 
     /// An ordinary key: store it, notify watchers, replicate if the policy says
-    /// so. **Never queue traffic** — the queue path is the `Ok` arm above.
+    /// so. **Never queue traffic** - the queue path is the `Ok` arm above.
     ///
     /// Split out of `put_impl` so `Queue::elect` can write the dispatcher
     /// registry without going back through the queue-aware entry point. That is

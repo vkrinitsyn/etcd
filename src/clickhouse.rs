@@ -2,7 +2,7 @@
 //! `/queue/clickhouse:<table>/...`.
 //!
 //! A message put on such a queue carries a JSON object as its value, and the
-//! queue writes it straight into that ClickHouse table as `JSONEachRow` — no
+//! queue writes it straight into that ClickHouse table as `JSONEachRow` - no
 //! watcher, no consumer process, no database round trip in between. The whole
 //! batch waiting at flush time goes out in one request, which is what
 //! JSONEachRow is for.

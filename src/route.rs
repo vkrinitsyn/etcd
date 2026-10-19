@@ -24,8 +24,8 @@
 //!
 //! Phase 1 needs only a node id. Phase 3 adds `reply_to`, which is what lets a
 //! linked pair place its two dispatchers deliberately instead of arbitrarily.
-//! The format is therefore extensible and **reads an old value unchanged** — a
-//! bare node id is a valid record — because the registry is replicated and a
+//! The format is therefore extensible and **reads an old value unchanged** - a
+//! bare node id is a valid record - because the registry is replicated and a
 //! mid-upgrade cluster will have both forms in it at once.
 
 use crate::cluster::NodeId;
@@ -106,13 +106,13 @@ impl DispatchRecord {
 ///
 /// Two shapes, and both are decided by **structure**:
 ///
-/// * `/q/{name}` — the dispatcher record. Three segments, nothing after the
+/// * `/q/{name}` - the dispatcher record. Three segments, nothing after the
 ///   queue name.
-/// * `/q/{name}/c/{client}` — a consumer's host. Five segments: a consumer key
+/// * `/q/{name}/c/{client}` - a consumer's host. Five segments: a consumer key
 ///   with neither an idx nor a tail, where a *delivery* has both
 ///   (`/q/{name}/c/{cid}/{idx}/{key}`).
 ///
-/// Everything else — producer puts, deliveries, acks — is queue traffic.
+/// Everything else - producer puts, deliveries, acks - is queue traffic.
 pub fn is_control(key: &str) -> bool {
     let n: Vec<&str> = key.trim_end_matches('/').split('/').collect();
     if n.len() < 3 {
@@ -130,7 +130,7 @@ pub fn is_control(key: &str) -> bool {
     }
 }
 
-/// `/q/{name}` — where the dispatcher record for `fq_name` lives.
+/// `/q/{name}` - where the dispatcher record for `fq_name` lives.
 ///
 /// `fq_name` is already `/{prefix}/{queue_name}`, so this is the identity
 /// function. It exists as a named thing anyway, because "the queue's own key is
@@ -140,7 +140,7 @@ pub fn dispatcher_key(fq_name: &str) -> String {
     fq_name.to_string()
 }
 
-/// `/q/{name}/c/{client}` — where that consumer's host node is recorded.
+/// `/q/{name}/c/{client}` - where that consumer's host node is recorded.
 pub fn consumer_key(fq_name: &str, client: &uuid::Uuid) -> String {
     format!("{}/c/{}", fq_name, client)
 }
@@ -160,7 +160,7 @@ pub fn consumer_of(key: &str) -> Option<uuid::Uuid> {
 /// Why a node is claiming a queue's dispatcher slot.
 ///
 /// The dispatcher is an **endpoint**, never a third party: it sits on the node
-/// holding the consumer(s), or — failing that — on a node holding a producer.
+/// holding the consumer(s), or - failing that - on a node holding a producer.
 /// A dispatcher at neither end costs two hops (`producer -> dispatcher ->
 /// consumer`) where one would do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +169,7 @@ pub enum Claim {
     /// from a dispatcher that hosts none: placing the dispatcher at the
     /// consumer collapses the leg to one hop for *every* producer at once.
     Consumer,
-    /// This node has a producer. Claims only an unclaimed queue — taking one
+    /// This node has a producer. Claims only an unclaimed queue - taking one
     /// from a consumer's node would move the dispatcher away from the end that
     /// benefits most.
     Producer,
@@ -179,7 +179,7 @@ pub enum Claim {
 ///
 /// Three cases and not two, which is the point. `Queue::dispatcher` was an
 /// `Option<EtcdPeerNodeType>` where `None` meant both *"I am the dispatcher"*
-/// and *"nobody has been elected"* — and because nothing ever wrote it, the
+/// and *"nobody has been elected"* - and because nothing ever wrote it, the
 /// broadcast fallback for the second case fired for every message on every
 /// cluster. Separating them is what makes the fallback rare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +188,7 @@ pub enum Dispatch {
     Local,
     /// another node dispatches: one unicast hop
     Remote(NodeId),
-    /// not resolved yet — broadcast, and say so
+    /// not resolved yet - broadcast, and say so
     Unknown,
 }
 
@@ -208,7 +208,7 @@ impl Dispatch {
 
 /// Peer RPCs one leg costs: producer node → dispatcher → consumer node.
 ///
-/// Not used in the hot path — it exists so the table in `queue-p2p-route.md` is
+/// Not used in the hot path - it exists so the table in `queue-p2p-route.md` is
 /// checked by a test rather than asserted in prose, and so a routing change
 /// that quietly reintroduces the broadcast, or puts the dispatcher back at a
 /// third party, shows up as a number.
