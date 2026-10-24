@@ -540,17 +540,19 @@ impl EtcdCliArgs {
     /// rest as clap defaults them. (Before, every default overrode the file too:
     /// the merged twin held a value for each field that had a `default_value`.)
     pub fn parse_from<R: Read>(&mut self, input: BufReader<R>) -> Result<EtcdConfig, String> {
-        let err = |e: serde_yaml::Error| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e);
-        let file: serde_yaml::Value = serde_yaml::from_reader(input).map_err(err)?;
-        let mut merged = serde_yaml::to_value(&self.config).map_err(err)?;
-        if let (serde_yaml::Value::Mapping(m), serde_yaml::Value::Mapping(f)) = (&mut merged, file) {
+        let err = |e: &dyn std::fmt::Display| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e);
+        // serde-saphyr (no unsafe code, unlike serde_yaml's libyaml port) has no YAML
+        // value type of its own: the file and the settings meet as JSON values
+        let file: serde_json::Value = serde_saphyr::from_reader(input).map_err(|e| err(&e))?;
+        let mut merged = serde_json::to_value(&self.config).map_err(|e| err(&e))?;
+        if let (serde_json::Value::Object(m), serde_json::Value::Object(f)) = (&mut merged, file) {
             for (k, v) in f {
-                if k.as_str().map_or(false, |name| !self.given.contains(name)) {
+                if !self.given.contains(&k) {
                     m.insert(k, v);
                 }
             }
         }
-        serde_yaml::from_value(merged).map_err(err)
+        serde_json::from_value(merged).map_err(|e| err(&e))
     }
 }
 
@@ -599,5 +601,27 @@ mod tests {
         assert_eq!((c.term, c.zone.as_str()), (7, "z1"), "from the file");
         assert_eq!(c.listen_client_urls, "localhost:2379", "neither: clap's default");
         assert!(a.parse_from(BufReader::new("term: [not a number]".as_bytes())).is_err());
+    }
+
+    /// An empty file, or one of comments only, sets nothing: the command line and
+    /// the defaults stand (serde_yaml read it as null, and serde-saphyr does too)
+    #[test]
+    fn an_empty_or_comment_only_file_changes_nothing() {
+        for file in ["", "# nothing set here\n", "---\n"] {
+            let mut a = EtcdCliArgs::parse_args_from(["etcd", "--name", "cli-name"]);
+            let c = a.parse_from(BufReader::new(file.as_bytes())).unwrap_or_else(|e| panic!("{:?}: {}", file, e));
+            assert_eq!((c.name.as_str(), c.term, c.listen_client_urls.as_str()), ("cli-name", 1, "localhost:2379"), "{:?}", file);
+        }
+    }
+
+    /// A file that does not parse, or that sets a value of the wrong type, is
+    /// refused, and the message names the file
+    #[test]
+    fn a_bad_file_is_refused_naming_the_file() {
+        let mut a = EtcdCliArgs::parse_args_from(["etcd", "--config", "/etc/etcd/etcd.yml"]);
+        for file in ["name: [unclosed\n", "term: seven\n"] {
+            let e = a.parse_from(BufReader::new(file.as_bytes())).err().unwrap_or_else(|| panic!("{:?} accepted", file));
+            assert!(e.starts_with("Error in configuration file [/etc/etcd/etcd.yml]:"), "{:?}: {}", file, e);
+        }
     }
 }

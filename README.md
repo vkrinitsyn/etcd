@@ -22,8 +22,17 @@ This is an experimental Prof of Concept of the features bellow
 - point-to-point [routing](https://github.com/vkrinitsyn/etcd/blob/main/queue-p2p-route.md#point-to-point-routing-for-linked-queues)
   for a linked request/reply queue pair, and using that route as transport for a
   requested process
+- a queue named `ch:<table>` writes its messages straight into a ClickHouse table
+  ([clickhouse.md](clickhouse.md), feature `clickhouse`)
 - no message storage, cluster election, as use another cluster implementation
 - ability to build into another rust application as a component, see [rppd](https://github.com/vkrinitsyn/rppd?tab=readme-ov-file#rppd---rust-python-postgres-discovery)
+
+## Documentation
+
+- [queue.md](queue.md) - using a queue: produce, consume, acknowledge, and what delivery guarantees
+- [clickhouse.md](clickhouse.md) - queues that insert into ClickHouse
+- [queue-p2p-route.md](queue-p2p-route.md) - how a message is routed between nodes
+- [agent.md](agent.md) - for coding agents and embedders: the API, the configuration, YT Cluster's use of it, and the known gaps
 
 ## Supported APIs
 
@@ -48,7 +57,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-etcd-client = "0.14"
+etcd-client = "0.21"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -76,6 +85,20 @@ async fn main() -> Result<(), Error> {
 
 Examples can be found in [`examples`](./examples).
 
+
+## Checks
+
+```shell
+cargo audit      # known vulnerabilities (RustSec) in the dependencies Cargo.lock pins
+cargo geiger     # unsafe code in etcds and in each dependency it uses
+```
+
+`cargo install cargo-audit cargo-geiger` installs them; with cargo-make,
+`cargo make audit` and `cargo make geiger` run the same. A library keeps no `Cargo.lock` in git, so the audit reads the one the
+last build resolved; `cargo generate-lockfile` makes one. geiger reads
+every dependency file in the target directory, so give it one of its own
+(`CARGO_TARGET_DIR=target/geiger`), or an old build's can name a source file
+that is gone.
 
 ## License
 
