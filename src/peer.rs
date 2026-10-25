@@ -153,7 +153,7 @@ impl EtcdCluster {
         if input_size == 0 || connected as f32 > half {
             Ok(cluster)
         } else {
-            Err(format!("cant connect to more than half peers [{}/{}]", connected, input_size))
+            Err(tr!("peer.half", connected = connected, total = input_size))
         }
     }
     
@@ -192,14 +192,14 @@ impl EtcdCluster {
             let endpoint = match Endpoint::from_str(&url) {
                 Ok(e) => e.connect_timeout(Duration::from_millis(connect_timeout_ms)),
                 Err(e) => {
-                    error!(log, "{}making endpoint to {} with error {}", LP, url, e);
+                    error!(log, "{}{}", LP, tr!("peer.endpoint", url = url, err = e));
                     continue;
                 }
             };
             let conn = match endpoint.connect().await {
                 Ok(c) => c,
                 Err(e) => {
-                    error!(log, "{}connecting endpoint {} with error {}", LP, url, e);
+                    error!(log, "{}{}", LP, tr!("peer.connect", url = url, err = e));
                     continue;
                 }
             };
@@ -207,18 +207,18 @@ impl EtcdCluster {
             let status = match tokio::time::timeout(PEER_RPC_TIMEOUT, mt.status(StatusRequest::default())).await {
                 Ok(Ok(s)) => s.into_inner(),
                 Ok(Err(e)) => {
-                    error!(log, "{}connecting maintenance {} with error {}", LP, url, e);
+                    error!(log, "{}{}", LP, tr!("peer.status", url = url, err = e));
                     continue;
                 }
                 Err(_) => {
-                    error!(log, "{}connecting maintenance {}: no answer in {:?}", LP, url, PEER_RPC_TIMEOUT);
+                    error!(log, "{}{}", LP, tr!("peer.status_timeout", url = url, timeout = format!("{:?}", PEER_RPC_TIMEOUT)));
                     continue;
                 }
             };
             match status.header {
-                None => error!(log, "{}connecting maintenance {} - no header in response", LP, url),
-                Some(h) if h.cluster_id != cluster_id => error!(log, "{}connecting maintenance {} - wrong cluster,\
-                    running on ClusterID [{}], but connecting node from {}", LP, url, cluster_id, h.cluster_id),
+                None => error!(log, "{}{}", LP, tr!("peer.no_header", url = url)),
+                Some(h) if h.cluster_id != cluster_id => error!(log, "{}{}", LP,
+                    tr!("peer.wrong_cluster", url = url, ours = cluster_id, theirs = h.cluster_id)),
                 Some(h) => found.push((h.member_id, url, conn, mt)),
             }
         }
@@ -235,7 +235,7 @@ impl EtcdCluster {
             let mut exists = false;
             for p in &self.peers {
                 if p.lock().await.peer_id == member_id {
-                    info!(self.log, "{}peer_id {} already connected, skipping {}", LP, member_id, url);
+                    info!(self.log, "{}{}", LP, tr!("peer.already", id = member_id, url = url));
                     exists = true;
                     break;
                 }
@@ -243,7 +243,7 @@ impl EtcdCluster {
             if exists { continue; }
             if let Some(t) = self.recently_added.get(&member_id) {
                 if t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS) {
-                    info!(self.log, "{}peer_id {} recently added ({:?} ago), skipping {}", LP, member_id, t.elapsed(), url);
+                    info!(self.log, "{}{}", LP, tr!("peer.recent", id = member_id, ago = format!("{:?}", t.elapsed()), url = url));
                     continue;
                 }
             }
@@ -396,7 +396,7 @@ impl EtcdCluster {
         for p in &self.peers {
             let mut node = p.lock().await;
             if node.peer_id == peer_id && node.state == PeerState::Spare {
-                info!(log, "{}peer {} ({}) promoted to InProgress", LP, node.conn, peer_id);
+                info!(log, "{}{}", LP, tr!("peer.state", peer = node.conn, id = peer_id, state = "InProgress"));
                 node.state = PeerState::InProgress;
                 return true;
             }
@@ -409,7 +409,7 @@ impl EtcdCluster {
         for p in &self.peers {
             let mut node = p.lock().await;
             if node.peer_id == peer_id && node.state == PeerState::InProgress {
-                info!(log, "{}peer {} ({}) promoted to Online", LP, node.conn, peer_id);
+                info!(log, "{}{}", LP, tr!("peer.state", peer = node.conn, id = peer_id, state = "Online"));
                 node.state = PeerState::Online;
                 return true;
             }
@@ -423,7 +423,7 @@ impl EtcdCluster {
         for p in &self.peers {
             let mut node = p.lock().await;
             if node.peer_id == peer_id && node.state != PeerState::Spare {
-                info!(log, "{}peer {} ({}) demoted to Spare", LP, node.conn, peer_id);
+                info!(log, "{}{}", LP, tr!("peer.state", peer = node.conn, id = peer_id, state = "Spare"));
                 node.state = PeerState::Spare;
                 return true;
             }
@@ -529,8 +529,8 @@ impl EtcdCluster {
             let node = p.lock().await;
             let mut cc = node.cluster_client.lock().await;
             match cc.member_add(add_req.clone()).await {
-                Ok(_) => info!(log, "{}announced self to peer {}", LP, node.conn),
-                Err(e) => error!(log, "{}failed to announce to peer {}: {}", LP, node.conn, e),
+                Ok(_) => info!(log, "{}{}", LP, tr!("peer.announced", peer = node.conn)),
+                Err(e) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = node.conn, err = e)),
             }
         }
 
@@ -563,13 +563,13 @@ impl EtcdCluster {
 
         let peer_idx = match best_peer {
             Some(idx) => idx,
-            None => return Err("no peer responded to status query".to_string()),
+            None => return Err(tr!("peer.no_status")),
         };
 
         // Phase C: pull all KV data from chosen peer
         let peer = &self.peers[peer_idx];
         let peer_conn = peer.lock().await.conn.clone();
-        info!(log, "{}syncing KV data from {}", LP, peer_conn);
+        info!(log, "{}{}", LP, tr!("peer.syncing", peer = peer_conn));
 
         let range_req = RangeRequest {
             key: vec![],
@@ -580,7 +580,7 @@ impl EtcdCluster {
             let node = peer.lock().await;
             let mut kv = node.kv_client.lock().await;
             kv.range(range_req).await
-                .map_err(|e| format!("range query to {}: {}", peer_conn, e))?
+                .map_err(|e| tr!("peer.range", peer = peer_conn, err = e))?
         };
         // [E2] only what propagates: a peer's `local` keys are its own, and copying
         // them made them this node's too
@@ -593,7 +593,7 @@ impl EtcdCluster {
                 vault.insert(key, Kv::from(kv));
             }
         }
-        info!(log, "{}synced {} keys from {}", LP, count, peer_conn);
+        info!(log, "{}{}", LP, tr!("peer.synced", count = count, peer = peer_conn));
         Ok(count)
     }
 
@@ -704,7 +704,7 @@ impl BroadcastPlan {
         for idx in &timed_out_peers {
             let mut peer = self.targets[*idx].0.lock().await;
             if peer.state == PeerState::Online {
-                info!(self.log, "{}peer {} demoted to Spare (timeout)", LP, peer.conn);
+                info!(self.log, "{}{}", LP, tr!("peer.timeout_spare", peer = peer.conn));
                 peer.state = PeerState::Spare;
             }
         }
@@ -716,8 +716,7 @@ impl BroadcastPlan {
         for idx in &synced_peers {
             let mut peer = self.targets[*idx].0.lock().await;
             if peer.state == PeerState::InProgress {
-                info!(self.log, "{}peer {} promoted to Online (replicated successfully)",
-                    LP, peer.conn);
+                info!(self.log, "{}{}", LP, tr!("peer.replicated_online", peer = peer.conn));
                 peer.state = PeerState::Online;
             }
         }
@@ -725,7 +724,7 @@ impl BroadcastPlan {
         if quorum_total == 0 || ok_count as f32 > half {
             Ok(())
         } else {
-            Err(Status::aborted("wont commit more than half"))
+            Err(Status::aborted(tr!("peer.quorum")))
         }
     }
 }
@@ -765,5 +764,241 @@ mod zone_tests {
         assert_eq!(zone_of("http://node9:2379", ""), "");
         // malformed entries are skipped, not guessed at
         assert_eq!(zone_of("http://node1:2379", "node1,node1=,=east"), "");
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    //! The peer state machine and the network edges of peering: who is accepted,
+    //! what a new node loads from a peer, what a zone keeps in, and what a peer
+    //! that fails a write costs it.
+    use super::*;
+    use crate::cluster::EtcdNode;
+    use crate::etcdpb::etcdserverpb::kv_server::Kv as _;
+    use crate::etcdpb::etcdserverpb::PutRequest;
+
+    const CLUSTER: &str = "11111111-1111-5111-8111-111111111111";
+
+    fn discard() -> Logger {
+        Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    async fn until<F, Fut>(f: F) -> bool where F: Fn() -> Fut, Fut: std::future::Future<Output = bool> {
+        for _ in 0..150 {
+            if f().await { return true; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn cfg(node: &str, listen: &str, peers: &str) -> EtcdConfig {
+        let mut c = EtcdConfig::with_defaults();
+        c.cluster = CLUSTER.to_string();
+        c.node = node.to_string();
+        c.listen_client_urls = listen.to_string();
+        c.initial_advertise_peer_urls = peers.to_string();
+        c
+    }
+
+    async fn init(c: EtcdConfig) -> EtcdNode {
+        EtcdNode::init(c, discard(), #[cfg(feature = "tracer")] None).await.unwrap()
+    }
+
+    /// A node served on a port of its own; returns it and its url.
+    async fn served(node: &str, mut c: EtcdConfig) -> (EtcdNode, String) {
+        let port = free_port();
+        c.node = node.to_string();
+        c.listen_client_urls = format!("127.0.0.1:{}", port);
+        let n = init(c).await;
+        n.serve().await.unwrap();
+        assert!(until(|| async { tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() }).await);
+        (n, format!("http://127.0.0.1:{}", port))
+    }
+
+    const A: &str = "88888888-8888-5888-8888-888888888881";
+    const B: &str = "88888888-8888-5888-8888-888888888882";
+
+    /// A starting node loads the keys of the peer that answers - except those
+    /// its own policy keeps local.
+    #[tokio::test]
+    async fn a_starting_node_loads_its_peers_keys() {
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        a.kv_put(b"/shared/k".to_vec(), b"1".to_vec()).await.unwrap();
+        a.kv_put(b"/mine/k".to_vec(), b"2".to_vec()).await.unwrap();
+
+        let mut c = cfg(B, "127.0.0.1:0", &a_url);
+        c.local_prefix = "/mine/".to_string();
+        let b = init(c).await;
+        assert_eq!(b.kv_get(b"/shared/k").await.as_deref(), Some(&b"1"[..]), "loaded at start");
+        assert_eq!(b.kv_get(b"/mine/k").await, None, "a local key is not copied");
+        assert_eq!(b.get_peer_urls().await, a_url);
+    }
+
+    /// A node that can reach no more than half its peers refuses to start.
+    #[tokio::test]
+    async fn too_few_reachable_peers_fail_the_start() {
+        let closed = format!("http://127.0.0.1:{}", free_port());
+        let e = EtcdNode::init(cfg(B, "127.0.0.1:0", &closed), discard(),
+            #[cfg(feature = "tracer")] None).await.err().expect("refused");
+        assert!(e.starts_with("ETCD-E030 ") && e.contains("[0/1]"), "{}", e);
+    }
+
+    /// Only a url that answers `status` with this cluster's id is a peer.
+    #[tokio::test]
+    async fn dial_keeps_only_members_of_this_cluster() {
+        let (_a, a_url) = served(A, cfg(A, "", "")).await;
+        let mut other = cfg(B, "", "");
+        other.cluster = "99999999-9999-5999-8999-999999999999".to_string();
+        let (_s, stranger_url) = served(B, other).await;
+        let cluster_id = {
+            let (a, b) = uuid::Uuid::parse_str(CLUSTER).unwrap().as_u64_pair();
+            a ^ b
+        };
+        let closed = format!("http://127.0.0.1:{}", free_port());
+        let found = EtcdCluster::dial(
+            vec!["not a url".to_string(), closed, stranger_url, a_url.clone()], cluster_id, 0, &discard()).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, a_url);
+    }
+
+    /// One peer is admitted once, by id, whatever url it is dialled under; and
+    /// one that was added moments ago is not re-added.
+    #[tokio::test]
+    async fn a_peer_is_admitted_once() {
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        let b = init(cfg(B, "127.0.0.1:0", &a_url)).await;
+        let mut peers = b.peers.write().await;
+        assert_eq!(peers.connected(), 1);
+        let (cluster_id, ms, log) = peers.dial_params();
+        let alias = a_url.replace("127.0.0.1", "localhost");
+        let again = EtcdCluster::dial(vec![alias.clone()], cluster_id, ms, &log).await;
+        assert_eq!(again[0].0, a.node_id, "the same node under another url");
+        assert_eq!(peers.admit(again).await, 0, "already held");
+
+        peers.peers.clear(); // as if it had been dropped
+        let again = EtcdCluster::dial(vec![alias], cluster_id, ms, &log).await;
+        assert_eq!(peers.admit(again).await, 0, "added within RECENT_WINDOW_SECS: not again");
+        assert_eq!(peers.connected(), 0);
+    }
+
+    /// Spare -> InProgress -> Online through `member_promote`, the admin call;
+    /// Online cannot be promoted, and an unknown id is not found.
+    #[tokio::test]
+    async fn member_promote_walks_the_states() {
+        use crate::etcdpb::etcdserverpb::cluster_server::Cluster;
+        use crate::etcdpb::etcdserverpb::{MemberListRequest, MemberPromoteRequest};
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        let b = init(cfg(B, "127.0.0.1:0", &a_url)).await;
+        let id = a.node_id;
+        let state = || async { b.peers.read().await.peer_state(id).await };
+        let promote = |i: u64| { let b = b.clone(); async move {
+            b.member_promote(tonic::Request::new(MemberPromoteRequest { id: i })).await } };
+
+        assert_eq!(state().await, Some(PeerState::InProgress), "a verified peer starts InProgress");
+        let list = b.member_list(tonic::Request::new(MemberListRequest::default())).await.unwrap().into_inner();
+        assert_eq!(list.members.len(), 1);
+        assert!(list.members[0].is_learner, "not Online yet: a learner");
+        assert_eq!(list.members[0].peer_ur_ls, vec![a_url.clone()]);
+
+        promote(id).await.unwrap();
+        assert_eq!(state().await, Some(PeerState::Online));
+        assert_eq!(b.peers.read().await.online_count().await, 1);
+        assert_eq!(promote(id).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+        assert!(b.peers.read().await.demote_to_spare(id, &b.log).await);
+        assert!(!b.peers.read().await.demote_to_spare(id, &b.log).await, "already Spare");
+        assert_eq!(b.peers.read().await.online_count().await, 0);
+        promote(id).await.unwrap();
+        assert_eq!(state().await, Some(PeerState::InProgress), "Spare goes back to syncing first");
+        assert!(!b.peers.read().await.promote_to_syncing(id, &b.log).await, "only from Spare");
+        assert!(!b.peers.read().await.promote_to_online(12345, &b.log).await);
+        assert_eq!(promote(12345).await.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    /// An Online peer that fails a write is demoted to Spare, and with no
+    /// quorum the put answers `aborted` - after applying it locally.
+    #[tokio::test]
+    async fn an_online_peer_that_fails_a_write_is_demoted_and_the_put_aborted() {
+        let mut ac = cfg(A, "", "");
+        ac.readonly_prefix = "/ro/".to_string(); // A refuses a write there, from anyone
+        let (a, a_url) = served(A, ac).await;
+        let b = init(cfg(B, "127.0.0.1:0", &a_url)).await;
+        assert!(b.peers.read().await.promote_to_online(a.node_id, &b.log).await);
+
+        let e = b.put(tonic::Request::new(PutRequest { key: b"/ro/k".to_vec(), value: b"v".to_vec(),
+            ..Default::default() })).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::Aborted);
+        assert!(b.kv_get(b"/ro/k").await.is_some(), "applied here before the broadcast");
+        assert_eq!(b.peers.read().await.peer_state(a.node_id).await, Some(PeerState::Spare));
+
+        // a Spare peer is sent nothing, so the next put has no quorum to miss
+        b.put(tonic::Request::new(PutRequest { key: b"/ok".to_vec(), value: b"v".to_vec(),
+            ..Default::default() })).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(a.kv_get(b"/ok").await.is_none(), "not replicated to a Spare peer");
+    }
+
+    /// A key under `zone_prefix` goes only to peers labelled with this node's
+    /// zone; an unlabelled or other-zone peer gets nothing, by broadcast or by
+    /// unicast.
+    #[tokio::test]
+    async fn a_zone_scoped_key_reaches_only_the_same_zone() {
+        use crate::{EtcdEvents, EtcdMgmtEvent};
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        let mut bc = cfg(B, "127.0.0.1:0", &a_url);
+        bc.zone = "east".to_string();
+        bc.zone_prefix = "/z/".to_string();
+        let b = init(bc.clone()).await;
+
+        // A unlabelled: excluded from a zone-scoped write, fail-safe
+        b.kv_put(b"/z/1".to_vec(), b"v".to_vec()).await.unwrap();
+        b.kv_put(b"/flat".to_vec(), b"v".to_vec()).await.unwrap();
+        assert!(until(|| async { a.kv_get(b"/flat").await.is_some() }).await, "an unscoped key travels");
+        assert!(a.kv_get(b"/z/1").await.is_none());
+        let plan = b.peers.read().await.plan(Some("east")).await;
+        assert!(plan.targets.is_empty());
+        assert!(b.peers.read().await.unicast_target(a.node_id, Some("east")).await.is_none());
+
+        // labelled east, as B is: now it does
+        bc.peer_zones = format!("{}=east", a_url.trim_start_matches("http://"));
+        b.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(bc))).await.unwrap();
+        assert!(until(|| async { b.peers.read().await.plan(Some("east")).await.targets.len() == 1 }).await);
+        b.kv_put(b"/z/2".to_vec(), b"v".to_vec()).await.unwrap();
+        assert!(until(|| async { a.kv_get(b"/z/2").await.is_some() }).await);
+        assert!(b.peers.read().await.unicast_target(a.node_id, Some("west")).await.is_none(), "not west");
+        assert!(b.peers.read().await.unicast_target(a.node_id, Some("east")).await.is_some());
+        b.kv_delete(b"/z/2".to_vec()).await.unwrap();
+        assert!(until(|| async { a.kv_get(b"/z/2").await.is_none() }).await, "and so does its delete");
+    }
+
+    /// A txn is broadcast whole, so it propagates only when every key it
+    /// touches may - a nested txn's included. One that mixes local and
+    /// replicated keys stays here.
+    #[tokio::test]
+    async fn a_txn_propagates_only_when_all_its_keys_do() {
+        use crate::etcdpb::etcdserverpb::{request_op, RequestOp, TxnRequest};
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        let mut bc = cfg(B, "127.0.0.1:0", &a_url);
+        bc.local_prefix = "/mine/".to_string();
+        let b = init(bc).await;
+        let put = |k: &str| RequestOp { request: Some(request_op::Request::RequestPut(
+            PutRequest { key: k.as_bytes().to_vec(), value: b"v".to_vec(), ..Default::default() })) };
+        let txn = |ops: Vec<RequestOp>| TxnRequest { success: ops, ..Default::default() };
+
+        b.txn(tonic::Request::new(txn(vec![put("/mine/1"), put("/shared/1")]))).await.unwrap();
+        b.txn(tonic::Request::new(txn(vec![put("/shared/2"),
+            RequestOp { request: Some(request_op::Request::RequestTxn(txn(vec![put("/mine/2")]))) }]))).await.unwrap();
+        b.txn(tonic::Request::new(txn(vec![put("/mine/3")]))).await.unwrap();
+        b.txn(tonic::Request::new(txn(vec![put("/shared/4")]))).await.unwrap();
+
+        assert!(until(|| async { a.kv_get(b"/shared/4").await.is_some() }).await, "an all-replicated txn travels");
+        for k in ["/mine/1", "/shared/1", "/shared/2", "/mine/2", "/mine/3"] {
+            assert!(b.kv_get(k.as_bytes()).await.is_some(), "{} applied here", k);
+            assert!(a.kv_get(k.as_bytes()).await.is_none(), "{} must not reach the peer", k);
+        }
     }
 }

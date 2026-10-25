@@ -56,7 +56,7 @@ impl EtcdNode {
                     for (cid, wid) in v { // expected watcher per client
                         if let Some(client_watcher) = watchers.read().await.get(&cid) {
                             if let Some(client) = client_watcher.read().await.watchers.get(&wid) {
-                                info!(log, "{}watch notify: {}", LP, String::from_utf8_lossy(&kv.key));
+                                info!(log, "{}{}", LP, tr!("srv.watch_notify", key = String::from_utf8_lossy(&kv.key)));
                                 if let Err(_e) = client.client.send(Ok(
                                     WatchResponse {
                                         header: None,
@@ -121,11 +121,11 @@ impl Watch for EtcdNode {
                         cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
                     }
                     Err(e) => {
-                        warn!(etcd.log, "watcher [{}]: {}", cid, e.message());
+                        warn!(etcd.log, "{}{}", LP, tr!("srv.watch_error", client = cid, err = e.message()));
                     }
                 }
             }
-            info!(etcd.log, "{}end watching: {}", LP, cid);
+            info!(etcd.log, "{}{}", LP, tr!("srv.watch_end", client = cid));
         });
 
         let output_stream = ReceiverStream::new(receiver);
@@ -143,7 +143,7 @@ impl EtcdNode {
             while let Some(r) = stream.recv().await {
                 cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
             }
-            info!(etcd.log, "{}end watching: {}", LP, cid);
+            info!(etcd.log, "{}{}", LP, tr!("srv.watch_end", client = cid));
         });
     }
 
@@ -158,7 +158,7 @@ impl EtcdNode {
                 }
                 RequestUnion::ProgressRequest(_r) => {
                     let watchers = self.list_watchers(cid).await;
-                    debug!(self.log, "{}Progress watcher: {}", LP, cid);
+                    debug!(self.log, "{}{}", LP, tr!("srv.progress", client = cid));
                     if let Err(e) = sender.send(Ok(
                             WatchResponse {
                                 watch_id: *watchers.get(0).unwrap_or(&0),
@@ -166,7 +166,7 @@ impl EtcdNode {
                             }
                         )
                     ).await {
-                        warn!(self.log, "{}Progress watcher: {}", LP, e);
+                        warn!(self.log, "{}{}", LP, tr!("srv.progress_send_failed", err = e));
                     }
                 }
             }
@@ -179,5 +179,43 @@ impl EtcdNode {
             None => vec![],
             Some(w) => w.read().await.watchers.keys().map(|e| *e).collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::queue::node_tests::{node, Consumer};
+    use uuid::Uuid;
+
+    const A: &str = "22222222-2222-5222-8222-222222222222";
+
+    /// A put to a prefix watch's own start key is one event, not two: the
+    /// exact-key path and the range scan must not both fire.
+    #[tokio::test]
+    async fn a_put_to_a_range_start_key_fires_once() {
+        let n = node(A).await;
+        let mut c = Consumer::watch(&n, &Uuid::new_v4(), "/plain/", 1).await;
+        c.req.send(crate::etcdpb::etcdserverpb::WatchRequest { request_union: Some(
+            crate::etcdpb::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                crate::etcdpb::etcdserverpb::WatchCreateRequest {
+                    key: b"/range/".to_vec(), range_end: b"/range0".to_vec(), watch_id: 2, ..Default::default() })) })
+            .await.unwrap();
+        assert!(c.frame().await.unwrap().unwrap().created);
+        n.kv_put(b"/range/".to_vec(), b"v".to_vec()).await.unwrap();
+        assert_eq!(c.next().await.0, "/range/");
+        assert!(c.quiet().await, "exactly one event");
+    }
+
+    /// A watcher whose stream has gone does not stop the others being told.
+    #[tokio::test]
+    async fn a_closed_watcher_does_not_stop_the_others() {
+        let n = node(A).await;
+        let gone = Consumer::watch(&n, &Uuid::new_v4(), "/shared-key", 1).await;
+        let mut live = Consumer::watch(&n, &Uuid::new_v4(), "/shared-key", 1).await;
+        drop(gone);
+        n.kv_put(b"/shared-key".to_vec(), b"1".to_vec()).await.unwrap();
+        assert_eq!(live.next().await, ("/shared-key".to_string(), "1".to_string()));
+        n.kv_put(b"/shared-key".to_vec(), b"2".to_vec()).await.unwrap();
+        assert_eq!(live.next().await.1, "2");
     }
 }

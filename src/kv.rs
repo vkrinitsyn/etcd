@@ -253,7 +253,7 @@ impl EtcdNode {
     pub(crate) async fn delete_impl(&self, request: Request<DeleteRangeRequest>) -> Result<Response<DeleteRangeResponse>, Status> {
         let from_peer = peer(request.metadata());
         let r = request.into_inner();
-        trace!(self.log, "remove request {} ", String::from_utf8_lossy(&r.key));
+        trace!(self.log, "{}", tr!("kv.delete", key = String::from_utf8_lossy(&r.key)));
 
         // [range] A DeleteRange carrying a `range_end` deletes the RANGE. This
         // used to `remove(&r.key)` and nothing else, so a prefix delete removed
@@ -348,9 +348,7 @@ impl EtcdNode {
             let any_local = keys.iter().any(|k| !policy.propagates(k));
             let all_local = !keys.is_empty() && keys.iter().all(|k| !policy.propagates(k));
             if any_local && !all_local {
-                slog::warn!(self.log,
-                    "txn mixes local-only and replicated keys; not broadcasting. \
-                     Split it: one transaction cannot be both local and cluster-wide");
+                slog::warn!(self.log, "{}", tr!("kv.txn_mixed"));
             }
             drop(policy);
             if !any_local {
@@ -423,21 +421,23 @@ impl EtcdNode {
         let mut modified = Vec::new();
         let response = match req {
             request_op::Request::RequestRange(r) => {
-                let kvs: Vec<KeyValue> = if r.key.is_empty() && r.range_end == vec![0u8] {
-                    if r.count_only { vec![] } else { vault.values().map(|v| v.into()).collect() }
-                } else if let Some(v) = vault.get(&r.key) {
-                    vec![v.into()]
-                } else {
-                    vec![]
-                };
-                let count = if r.key.is_empty() && r.range_end == vec![0u8] {
-                    vault.len() as i64
-                } else {
-                    kvs.len() as i64
-                };
+                // [range] the same `range_end` semantics as `get_impl`: only the
+                // all-keys form used to be handled, so a txn get over a prefix
+                // missed and answered `count: 0`
+                let mut hits: Vec<&kv::Kv> = vault.iter()
+                    .filter(|(k, _)| Self::in_range(k, &r.key, &r.range_end))
+                    .map(|(_, v)| v)
+                    .collect();
+                hits.sort_by(|a, b| a.key.cmp(&b.key));
+                let count = hits.len() as i64;
+                if r.limit > 0 && hits.len() > r.limit as usize {
+                    hits.truncate(r.limit as usize);
+                }
+                let more = (hits.len() as i64) < count;
+                let kvs: Vec<KeyValue> = if r.count_only { vec![] } else { hits.into_iter().map(|v| v.into()).collect() };
                 ResponseOp {
                     response: Some(response_op::Response::ResponseRange(RangeResponse {
-                        header: None, count, kvs, more: false,
+                        header: None, count, kvs, more,
                     })),
                 }
             }
@@ -453,8 +453,13 @@ impl EtcdNode {
                 }
             }
             request_op::Request::RequestDeleteRange(r) => {
-                let removed = vault.remove(&r.key);
-                let deleted = if removed.is_some() { 1 } else { 0 };
+                // [range] and a txn delete over a range deletes the range
+                let doomed: Vec<Vec<u8>> = vault.keys()
+                    .filter(|k| Self::in_range(k, &r.key, &r.range_end))
+                    .cloned()
+                    .collect();
+                let removed: Vec<kv::Kv> = doomed.iter().filter_map(|k| vault.remove(k)).collect();
+                let deleted = removed.len() as i64;
                 let prev_kvs = if r.prev_kv {
                     removed.into_iter().map(|x| x.into()).collect()
                 } else {

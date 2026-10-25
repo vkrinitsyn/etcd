@@ -36,8 +36,7 @@ impl EtcdNode {
         // The message names the rule rather than the key: telling a remote
         // caller which key it may not have is a catalogue it did not have
         // before it asked.
-        Err(Status::permission_denied(
-            "this key prefix is served only on a local connection"))
+        Err(Status::permission_denied(tr!("srv.local_only")))
     }
 
     /// Refuse an API write under a `readonly` prefix: only the embedder writes
@@ -48,7 +47,7 @@ impl EtcdNode {
         if ok {
             return Ok(());
         }
-        Err(Status::permission_denied("this key prefix is written only by the node itself"))
+        Err(Status::permission_denied(tr!("srv.readonly")))
     }
 }
 
@@ -68,7 +67,7 @@ impl Kv for EtcdNode {
         };
         let span_ok = self.policy.read().await.range_may_serve(&key, &end, remote);
         if !span_ok && count_only {
-            return Err(Status::permission_denied("this key prefix is served only on a local connection"));
+            return Err(Status::permission_denied(tr!("srv.local_only")));
         }
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("get"));
@@ -141,5 +140,127 @@ impl Kv for EtcdNode {
 
     async fn compact(&self, _request: Request<CompactionRequest>) -> Result<Response<CompactionResponse>, Status> {
         Ok(Response::new(CompactionResponse { header: None }))
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    //! [E2] `local_only_prefix` is a property of the CONNECTION: a remote caller
+    //! is refused, a loopback or in-process one is served. These requests carry
+    //! the connection info tonic's TCP server would attach, so the handlers see
+    //! a caller on the network.
+    use super::*;
+    use crate::etcdpb::etcdserverpb::{request_op, RequestOp};
+    use tonic::transport::server::TcpConnectInfo;
+
+    async fn node() -> EtcdNode {
+        let mut cfg = crate::cli::EtcdConfig::with_defaults();
+        cfg.cluster = "11111111-1111-5111-8111-111111111111".to_string();
+        cfg.listen_client_urls = "127.0.0.1:0".to_string();
+        cfg.local_only_prefix = "/secret/".to_string();
+        cfg.local_only_prefix_except = "/secret/public/".to_string();
+        let n = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+            #[cfg(feature = "tracer")] None).await.unwrap();
+        for k in ["/secret/a", "/secret/public/b", "/open/c"] {
+            n.kv_put(k.as_bytes().to_vec(), b"v".to_vec()).await.unwrap();
+        }
+        n
+    }
+
+    fn from<T>(addr: &str, mut r: Request<T>) -> Request<T> {
+        r.extensions_mut().insert(TcpConnectInfo {
+            local_addr: "127.0.0.1:2379".parse().ok(),
+            remote_addr: addr.parse().ok(),
+        });
+        r
+    }
+
+    const FAR: &str = "10.0.0.7:5555";
+    const NEAR: &str = "127.0.0.1:5555";
+
+    fn get(key: &str, end: &str, count_only: bool) -> RangeRequest {
+        RangeRequest { key: key.into(), range_end: end.into(), count_only, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn a_remote_caller_cannot_read_a_local_only_key() {
+        let n = node().await;
+        let e = n.range(from(FAR, Request::new(get("/secret/a", "", false)))).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        assert!(!e.message().contains("/secret/a"), "the refusal does not name the key");
+        // the exception is served to anyone, and loopback gets everything
+        let r = n.range(from(FAR, Request::new(get("/secret/public/b", "", false)))).await.unwrap();
+        assert_eq!(r.get_ref().count, 1);
+        let r = n.range(from(NEAR, Request::new(get("/secret/a", "", false)))).await.unwrap();
+        assert_eq!(r.get_ref().count, 1);
+    }
+
+    /// A remote range over everything comes back without the local-only keys,
+    /// and its count says so; a count of such a range is refused outright.
+    #[tokio::test]
+    async fn a_remote_range_is_filtered_and_its_count_refused() {
+        let n = node().await;
+        let r = n.range(from(FAR, Request::new(get("/", "\0", false)))).await.unwrap().into_inner();
+        let keys: Vec<String> = r.kvs.iter().map(|kv| String::from_utf8_lossy(&kv.key).to_string()).collect();
+        assert_eq!(keys, vec!["/open/c", "/secret/public/b"]);
+        assert_eq!(r.count, 2, "the count matches what was served");
+
+        let e = n.range(from(FAR, Request::new(get("/", "\0", true)))).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "a count cannot be filtered");
+        let r = n.range(from(NEAR, Request::new(get("/", "\0", true)))).await.unwrap().into_inner();
+        assert_eq!(r.count, 3, "loopback counts everything");
+    }
+
+    #[tokio::test]
+    async fn a_remote_caller_cannot_write_or_delete_a_local_only_key() {
+        let n = node().await;
+        let put = PutRequest { key: b"/secret/x".to_vec(), value: b"v".to_vec(), ..Default::default() };
+        let e = n.put(from(FAR, Request::new(put.clone()))).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        assert!(n.kv_get(b"/secret/x").await.is_none());
+        n.put(from(NEAR, Request::new(put))).await.unwrap();
+        assert!(n.kv_get(b"/secret/x").await.is_some());
+
+        let del = DeleteRangeRequest { key: b"/secret/a".to_vec(), ..Default::default() };
+        let e = n.delete_range(from(FAR, Request::new(del))).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        assert!(n.kv_get(b"/secret/a").await.is_some());
+    }
+
+    /// Every key a txn touches is checked, the compares included: an
+    /// unrestricted request cannot carry a restricted key in.
+    #[tokio::test]
+    async fn a_txn_touching_a_local_only_key_is_refused_remotely() {
+        let n = node().await;
+        let txn = TxnRequest {
+            success: vec![
+                RequestOp { request: Some(request_op::Request::RequestRange(get("/open/c", "", false))) },
+                RequestOp { request: Some(request_op::Request::RequestRange(get("/secret/a", "", false))) },
+            ],
+            ..Default::default()
+        };
+        let e = n.txn(from(FAR, Request::new(txn.clone()))).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        let r = n.txn(from(NEAR, Request::new(txn))).await.unwrap().into_inner();
+        assert_eq!(r.responses.len(), 2);
+    }
+
+    /// `readonly_prefix` refuses a txn write as it refuses a put.
+    #[tokio::test]
+    async fn a_txn_write_under_a_readonly_prefix_is_refused() {
+        let mut cfg = crate::cli::EtcdConfig::with_defaults();
+        cfg.listen_client_urls = "127.0.0.1:0".to_string();
+        cfg.cluster = "11111111-1111-5111-8111-111111111111".to_string();
+        cfg.readonly_prefix = "/ro/".to_string();
+        let n = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+            #[cfg(feature = "tracer")] None).await.unwrap();
+        let txn = TxnRequest {
+            success: vec![RequestOp { request: Some(request_op::Request::RequestPut(
+                PutRequest { key: b"/ro/k".to_vec(), value: b"v".to_vec(), ..Default::default() })) }],
+            ..Default::default()
+        };
+        let e = n.txn(Request::new(txn)).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        assert!(n.kv_get(b"/ro/k").await.is_none());
     }
 }

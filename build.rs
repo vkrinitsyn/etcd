@@ -1,6 +1,8 @@
 fn main() {
     let proto_root = "proto";
     println!("cargo:rerun-if-changed={}", proto_root);
+    // [i18n] rust-i18n reads locales/ as the crate compiles: a message edited there rebuilds it
+    println!("cargo:rerun-if-changed=locales");
 
     tonic_prost_build::configure()
         // .out_dir("src/etcdpb")

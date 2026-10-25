@@ -276,7 +276,7 @@ impl Queue {
             (cfg.clickhouse_url.clone(), cfg.clickhouse_db.clone())
         };
         let Some(sink) = crate::clickhouse::ChSink::new(&url, &db) else {
-            warn!(log, "{}queue {} targets ClickHouse but clickhouse_url is not set", LP, self.fq_name);
+            warn!(log, "{}{}", LP, tr!("queue.ch_no_url", queue = self.fq_name));
             return;
         };
 
@@ -301,13 +301,11 @@ impl Queue {
                     q.retain(|m| !sent.contains(&m.idx));
                     q.len()
                 };
-                debug!(log, "{}clickhouse {} <- {} row(s) from {} [{} left]",
-                    LP, table, rows.len(), self.fq_name, left);
+                debug!(log, "{}{}", LP, tr!("queue.ch_sent", table = table, rows = rows.len(), queue = self.fq_name, left = left));
             }
             Err(e) => {
                 // left queued on purpose: the next put or retry delivers them
-                warn!(log, "{}clickhouse insert into {} failed, {} row(s) stay queued: {}",
-                    LP, table, rows.len(), e);
+                warn!(log, "{}{}", LP, tr!("queue.ch_failed", table = table, rows = rows.len(), err = e));
             }
         }
     }
@@ -381,8 +379,7 @@ impl Queue {
                     // The registry said we host this consumer and we do not.
                     // Refusing is what lets the dispatcher try another one
                     // rather than count it delivered.
-                    return Err(Status::not_found(format!(
-                        "no live consumer {} on this node for {}", cid, self.fq_name)));
+                    return Err(Status::not_found(tr!("queue.no_consumer_here", consumer = cid, queue = self.fq_name)));
                 }
                 return Ok(Response::new(PutResponse::default()));
             }
@@ -410,13 +407,12 @@ impl Queue {
         // consumer would get the message TWICE. It would also have leaked, since
         // the ack deletes by idx on the dispatcher only.
         if matches!(dispatch, crate::route::Dispatch::Remote(_)) && from_peer.is_none() {
-            trace!(_log, "{}[q-route] forwarding #{} for {} without a local copy",
-                LP, idx, self.fq_name);
+            trace!(_log, "{}[q-route] {}", LP, tr!("queue.forwarding", idx = idx, queue = self.fq_name));
         } else {
             let depth = { let mut q = self.queue.write().await; q.push_front(msg); q.len() };
             let notified = self.sender.try_send(idx);
-            debug!(_log, "{}queued #{} [{}] notify={:?} cap={}", LP, idx, depth,
-                notified.as_ref().map(|_| "ok").map_err(|e| e.to_string()), self.sender.capacity());
+            debug!(_log, "{}{}", LP, tr!("queue.queued", idx = idx, depth = depth,
+                notify = format!("{:?}", notified.as_ref().map(|_| "ok").map_err(|e| e.to_string())), cap = self.sender.capacity()));
         }
 
         // [q-route] Replicate the message only as far as it has to go.
@@ -460,8 +456,7 @@ impl Queue {
                         // test. Broadcasting rather than dropping is the safe
                         // direction, and re-electing on the next touch is what
                         // stops it being permanent.
-                        warn!(_log, "{}[q-route] dispatcher {} unreachable for {}; broadcasting \
-                            and re-electing", LP, node, self.fq_name);
+                        warn!(_log, "{}[q-route] {}", LP, tr!("queue.dispatcher_unreachable", node = node, queue = self.fq_name));
                         *self.dispatch.write().await = crate::route::Dispatch::Unknown;
                         let _ = etcd
                             .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
@@ -469,8 +464,7 @@ impl Queue {
                     }
                 }
                 crate::route::Dispatch::Unknown => {
-                    debug!(_log, "{}[q-route] no dispatcher for {} yet; broadcasting",
-                        LP, self.fq_name);
+                    debug!(_log, "{}[q-route] {}", LP, tr!("queue.no_dispatcher", queue = self.fq_name));
                     let _ = etcd
                         .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
                             zone.as_deref()).await?;
@@ -552,7 +546,7 @@ impl Queue {
                     };
 
                     if candidates.is_empty() && remote.is_empty() {
-                        debug!(log, "{}no consumer yet for {} [{}]", LP, key, depth);
+                        debug!(log, "{}{}", LP, tr!("queue.no_consumer_yet", key = key, depth = depth));
                         break; // the next put, ack or watcher registration wakes us
                     }
 
@@ -581,17 +575,17 @@ impl Queue {
                         };
                         match tokio::time::timeout(DISPATCH_TIMEOUT, client.send(Ok(resp))).await {
                             Ok(Ok(())) => {
-                                debug!(log, "{}dispatch {} [{}]", LP, key, depth);
+                                debug!(log, "{}{}", LP, tr!("queue.dispatched", key = key, depth = depth));
                                 delivered = Some(cid);
                                 break;
                             }
                             Ok(Err(_)) => {
-                                warn!(log, "{}consumer {} watcher {} is gone, dropping it", LP, cid, wid);
+                                warn!(log, "{}{}", LP, tr!("queue.watcher_gone", consumer = cid, watch = wid));
                                 queue.drop_watcher(&cid, wid).await;
                             }
                             Err(_) => {
-                                warn!(log, "{}consumer {} watcher {} did not accept {} within {:?}, dropping it",
-                                    LP, cid, wid, key, DISPATCH_TIMEOUT);
+                                warn!(log, "{}{}", LP, tr!("queue.watcher_slow", consumer = cid, watch = wid, key = key,
+                                    timeout = format!("{:?}", DISPATCH_TIMEOUT)));
                                 queue.drop_watcher(&cid, wid).await;
                             }
                         }
@@ -621,13 +615,11 @@ impl Queue {
                                 .unicast(BroadcastRequest::Kv(KvEvent::Put(req)), node,
                                     zone.as_deref()).await;
                             if sent {
-                                debug!(log, "{}[q-route] dispatch {} -> consumer {} on node {}",
-                                    LP, key, cid, node);
+                                debug!(log, "{}[q-route] {}", LP, tr!("queue.dispatched_remote", key = key, consumer = cid, node = node));
                                 delivered = Some(cid);
                                 break;
                             }
-                            warn!(log, "{}[q-route] node {} would not take {} for consumer {}",
-                                LP, node, key, cid);
+                            warn!(log, "{}[q-route] {}", LP, tr!("queue.remote_refused", node = node, key = key, consumer = cid));
                         }
                     }
 
@@ -670,7 +662,7 @@ impl Queue {
             q.retain(|v| v.idx != idx); // TODO optimize for big queue size
             q.len() as i64
         } else {-1};
-        debug!(log, "{}ack [{}] # {:?} queue size: [{}] cap={}", LP, request.input, request.idx, q, self.sender.capacity());
+        debug!(log, "{}{}", LP, tr!("queue.ack", key = request.input, idx = format!("{:?}", request.idx), size = q, cap = self.sender.capacity()));
         let _ = self.sender.try_send(0);
     }
 
@@ -682,7 +674,7 @@ impl Queue {
         let me = etcd.peers.read().await.me();
         let key = crate::route::consumer_key(&self.fq_name, client);
         if let Err(e) = put_control(&etcd, &key, &me.to_string()).await {
-            warn!(etcd.log, "{}[q-route] cannot publish consumer {}: {}", LP, key, e);
+            warn!(etcd.log, "{}[q-route] {}", LP, tr!("queue.publish_failed", key = key, err = e));
         }
     }
 
@@ -691,7 +683,7 @@ impl Queue {
         let etcd = self.etcd.read().await.clone();
         let key = crate::route::consumer_key(&self.fq_name, client);
         if let Err(e) = etcd.kv_delete(key.clone().into_bytes()).await {
-            warn!(etcd.log, "{}[q-route] cannot withdraw consumer {}: {}", LP, key, e);
+            warn!(etcd.log, "{}[q-route] {}", LP, tr!("queue.withdraw_failed", key = key, err = e));
         }
     }
 
@@ -777,8 +769,7 @@ impl Queue {
             match tokio::time::timeout(DISPATCH_TIMEOUT, ch.send(Ok(resp))).await {
                 Ok(Ok(())) => return true,
                 Ok(Err(_)) | Err(_) => {
-                    warn!(log, "{}[q-route] local consumer {} watcher {} would not take a \
-                        dispatched message, dropping it", LP, client, wid);
+                    warn!(log, "{}[q-route] {}", LP, tr!("queue.local_refused", consumer = client, watch = wid));
                     self.drop_watcher(client, wid).await;
                 }
             }
@@ -849,8 +840,7 @@ impl Queue {
         }
         if take_over {
             if let Some(r) = &found {
-                info!(log, "{}[q-route] {} dispatcher moves {} -> {}: this node hosts a \
-                    consumer and that one does not", LP, key, r.node, me);
+                info!(log, "{}[q-route] {}", LP, tr!("queue.take_over", key = key, from = r.node, to = me));
             }
         }
 
@@ -858,7 +848,7 @@ impl Queue {
         // kept: `queue-p2p-route.md` is explicit that a pinned dispatcher on a
         // demoted peer must be re-elected rather than silently used.
         if let (Some(r), false) = (&found, take_over) {
-            warn!(log, "{}[q-route] {} dispatcher {} is not Online; re-electing", LP, key, r.node);
+            warn!(log, "{}[q-route] {}", LP, tr!("queue.reelect", key = key, node = r.node));
         }
         let claim = DispatchRecord {
             node: me,
@@ -868,7 +858,7 @@ impl Queue {
             pinned: false,
         };
         if let Err(e) = put_control(&etcd, &key, &claim.render()).await {
-            warn!(log, "{}[q-route] cannot claim {}: {} - falling back to broadcast", LP, key, e);
+            warn!(log, "{}[q-route] {}", LP, tr!("queue.claim_failed", key = key, err = e));
             *self.dispatch.write().await = Dispatch::Unknown;
             return Dispatch::Unknown;
         }
@@ -879,7 +869,7 @@ impl Queue {
             .and_then(|v| DispatchRecord::parse(&String::from_utf8_lossy(&v)))
             .unwrap_or(claim);
         let d = Dispatch::of(Some(&confirmed), me);
-        debug!(log, "{}[q-route] {} dispatcher = {:?}", LP, key, d);
+        debug!(log, "{}[q-route] {}", LP, tr!("queue.dispatcher", key = key, dispatch = format!("{:?}", d)));
         *self.record.write().await = Some(confirmed);
         *self.dispatch.write().await = d;
         d
@@ -927,7 +917,7 @@ impl Queue {
         let etcd = self.etcd.read().await.clone();
         let key = crate::route::dispatcher_key(&self.fq_name);
         if let Err(e) = etcd.kv_delete(key.clone().into_bytes()).await {
-            warn!(log, "{}[q-route] cannot clear {}: {}", LP, key, e);
+            warn!(log, "{}[q-route] {}", LP, tr!("queue.clear_failed", key = key, err = e));
         }
     }
 
@@ -1008,11 +998,10 @@ impl Queue {
         r.pinned = true;
         let key = dispatcher_key(&self.fq_name);
         if let Err(e) = put_control(&etcd, &key, &r.render()).await {
-            warn!(log, "{}[q-route] cannot pin {} to node {}: {}", LP, key, target, e);
+            warn!(log, "{}[q-route] {}", LP, tr!("queue.pin_failed", key = key, node = target, err = e));
             return;
         }
-        info!(log, "{}[q-route] {} dispatcher pinned to node {} (its only consumer's host)",
-            LP, key, target);
+        info!(log, "{}[q-route] {}", LP, tr!("queue.pinned", key = key, node = target));
         *self.record.write().await = Some(r);
         *self.dispatch.write().await = Dispatch::Remote(target);
         *self.pin_seen.write().await = None;
@@ -1034,10 +1023,10 @@ impl Queue {
         r.reply_to = Some(other.to_string());
         let key = dispatcher_key(&self.fq_name);
         if let Err(e) = put_control(&etcd, &key, &r.render()).await {
-            warn!(log, "{}[q-route] cannot link {} -> {}: {}", LP, key, other, e);
+            warn!(log, "{}[q-route] {}", LP, tr!("queue.link_failed", key = key, other = other, err = e));
             return;
         }
-        debug!(log, "{}[q-route] {} replies to {}", LP, key, other);
+        debug!(log, "{}[q-route] {}", LP, tr!("queue.linked", key = key, other = other));
         *self.record.write().await = Some(r);
     }
 
@@ -1086,7 +1075,7 @@ impl EtcdNode {
         }
         for (name, q) in &dropped {
             q.forget_registry(&self.log).await;
-            info!(self.log, "{}[q-route] reaped idle queue {}", LP, name);
+            info!(self.log, "{}[q-route] {}", LP, tr!("queue.reaped", queue = name));
         }
         dropped.len()
     }
@@ -1156,7 +1145,14 @@ impl EtcdNode {
     pub(crate) async fn create_watcher(&self, r: WatchCreateRequest, cid: Uuid, sender: Sender<Result<WatchResponse, Status>>) -> ClientId {
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         let cid = qn.client_id.unwrap_or(cid);
-        info!(self.log, "{}Create watcher for client: {}, WatchID: {}, {}", LP, cid, r.watch_id, &qn.input);
+        info!(self.log, "{}{}", LP, tr!("queue.watch_created", client = cid, watch = r.watch_id, key = &qn.input));
+        // An exact consumer watch receives what the queue dispatches to it, and
+        // nothing else. As an ordinary key observer too, it also received the
+        // server's own registry write under that key - `/q/{name}/c/{uuid}` IS
+        // the consumer registration key for the `/q/.../c/` spelling - so the
+        // consumer got its host node id as a "message", and a client that
+        // acknowledged it deleted its own registration.
+        let key_observer = !(qn.consumer && r.range_end.is_empty());
         if qn.consumer {
             let mut queue_map = self.queues.write().await;
             match queue_map.get_mut(&qn.queue_name) {
@@ -1170,7 +1166,7 @@ impl EtcdNode {
                 Some(queue) => queue.make_consumer(qn, cid, r.watch_id, &sender).await
             }
         }
-        {
+        if key_observer {
             let mut o = self.observers.write().await;
             match o.get_mut(&r.key) {
                 None => {
@@ -1205,10 +1201,10 @@ impl EtcdNode {
                         // as I understand the contract - the watcher must be uniq on the clients,
                         // therefore only one watcher ID per watching key
                         Some(w) => {
-                            let msg = format!("Watcher#{} already on {}", r.watch_id, String::from_utf8_lossy(&w.key));
+                            let msg = tr!("queue.watch_exists", watch = r.watch_id, key = String::from_utf8_lossy(&w.key));
                             if let Err(e) = sender.send(Err(Status::already_exists(msg))).await
                             {
-                                warn!(self.log, "{}Create watcher: {}", LP, e);
+                                warn!(self.log, "{}{}", LP, tr!("queue.watch_send_failed", err = e));
                             }
                         }
                     }
@@ -1222,14 +1218,14 @@ impl EtcdNode {
                 created: true, .. Default::default()
             }
         )).await {
-            warn!(self.log, "{}Create watcher: {}", LP, e);
+            warn!(self.log, "{}{}", LP, tr!("queue.watch_send_failed", err = e));
         }
         cid
     }
 
     pub(crate) async fn remove_watcher(&self, r: WatchCancelRequest, cid: ClientId) {
         if let Some(c) =  self.watchers.write().await.get_mut(&cid) {
-            trace!(self.log, "CancelRequest watching by client: {} of [{}] watchers", cid, c.read().await.watchers.len());
+            trace!(self.log, "{}{}", LP, tr!("queue.cancel_request", client = cid, count = c.read().await.watchers.len()));
             if let Some(w) = c.write().await.watchers.remove(&r.watch_id) {
                 let empty = {
                     let mut obs = self.observers.write().await;
@@ -1244,12 +1240,23 @@ impl EtcdNode {
                     self.observers.write().await.remove(&w.key);
                     self.observer_ranges.write().await.remove(&w.key);
                 }
-                debug!(self.log, "{}CancelRequest watching: {} {}", LP, cid, r.watch_id);
+                debug!(self.log, "{}{}", LP, tr!("queue.cancelled", client = cid, watch = r.watch_id));
+
+                // A cancelled consumer watch is no longer a consumer. Its stream
+                // stays open, so without this the dispatcher kept handing it
+                // messages - marked delivered, so no other consumer got them.
+                let qn = QueueNameKey::new(String::from_utf8_lossy(&w.key).to_string());
+                if qn.consumer {
+                    let q = self.queues.read().await.get(&qn.queue_name).cloned();
+                    if let Some(q) = q {
+                        q.drop_watcher(&cid, r.watch_id).await;
+                    }
+                }
 
                 if let Err(e) = w.client.send(Ok(
                     WatchResponse { watch_id: r.watch_id, canceled: true, .. Default::default() }
                 )).await {
-                    warn!(self.log, "{}Cancel watcher: {}", LP, e);
+                    warn!(self.log, "{}{}", LP, tr!("queue.cancel_send_failed", err = e));
                 }
             }
         }
@@ -1340,5 +1347,613 @@ pub mod test {
         q.retain(|v| v.idx != 1);
         assert_eq!(q.len(), 2);
         assert_eq!(next_undelivered(&q), Some(3));
+    }
+}
+#[cfg(test)]
+pub(crate) mod node_tests {
+    //! One node, a queue used the way queue.md describes it: watch a consumer
+    //! key, put on the producer key, receive a put event, delete to acknowledge.
+    //! In-process, through `new_watcher` - the same protocol as the gRPC Watch.
+    use super::*;
+    use crate::etcdpb::etcdserverpb::{watch_request, DeleteRangeRequest, RangeRequest, WatchRequest};
+    use crate::etcdpb::etcdserverpb::kv_server::Kv as _;
+    use std::time::Duration;
+
+    pub(crate) async fn node(node_uuid: &str) -> EtcdNode {
+        let mut cfg = crate::cli::EtcdConfig::with_defaults();
+        cfg.cluster = "11111111-1111-5111-8111-111111111111".to_string();
+        cfg.node = node_uuid.to_string();
+        cfg.listen_client_urls = "127.0.0.1:0".to_string();
+        EtcdNode::init(cfg, Logger::root(slog::Discard, slog::o!()),
+            #[cfg(feature = "tracer")] None).await.unwrap()
+    }
+
+    /// An in-process watch stream: the request side, and the responses.
+    pub(crate) struct Consumer {
+        pub(crate) req: Sender<WatchRequest>,
+        pub(crate) rx: Receiver<Result<WatchResponse, Status>>,
+    }
+
+    impl Consumer {
+        /// Watch `key` as client `cid`, and read past the `created` frame.
+        pub(crate) async fn watch(n: &EtcdNode, cid: &Uuid, key: &str, watch_id: i64) -> Consumer {
+            let (req, req_rx) = mpsc::channel(10);
+            let (tx, rx) = mpsc::channel(10);
+            n.new_watcher(req_rx, tx, cid).await;
+            let mut c = Consumer { req, rx };
+            c.create(key, watch_id).await;
+            c
+        }
+
+        pub(crate) async fn create(&mut self, key: &str, watch_id: i64) {
+            self.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest { key: key.as_bytes().to_vec(), watch_id, ..Default::default() })) })
+                .await.unwrap();
+            let r = self.frame().await.expect("a created frame").unwrap();
+            assert!(r.created, "{:?}", r);
+        }
+
+        pub(crate) async fn frame(&mut self) -> Option<Result<WatchResponse, Status>> {
+            tokio::time::timeout(Duration::from_secs(5), self.rx.recv()).await.ok().flatten()
+        }
+
+        /// The next delivery: (key, value).
+        pub(crate) async fn next(&mut self) -> (String, String) {
+            let r = self.frame().await.expect("a delivery within 5 s").expect("not an error");
+            let kv = r.events[0].kv.clone().unwrap();
+            (String::from_utf8_lossy(&kv.key).to_string(), String::from_utf8_lossy(&kv.value).to_string())
+        }
+
+        /// Nothing more arrives for a while.
+        pub(crate) async fn quiet(&mut self) -> bool {
+            tokio::time::timeout(Duration::from_millis(300), self.rx.recv()).await.is_err()
+        }
+    }
+
+    pub(crate) async fn produce(n: &EtcdNode, key: &str, value: &str) {
+        n.kv_put(key.as_bytes().to_vec(), value.as_bytes().to_vec()).await.unwrap();
+    }
+
+    /// Acknowledge, as a client does: delete the key the event carried.
+    pub(crate) async fn ack(n: &EtcdNode, key: &str) {
+        n.delete_range(tonic::Request::new(DeleteRangeRequest { key: key.as_bytes().to_vec(), ..Default::default() }))
+            .await.unwrap();
+    }
+
+    pub(crate) async fn queue(n: &EtcdNode, name: &str) -> Queue {
+        n.queues.read().await.get(name).cloned().expect("the queue exists")
+    }
+
+    /// The indexes the dispatcher still holds, oldest first.
+    pub(crate) async fn held(q: &Queue) -> Vec<u64> {
+        q.queue.read().await.iter().rev().map(|m| m.idx).collect()
+    }
+
+    pub(crate) async fn until<F, Fut>(f: F) -> bool where F: Fn() -> Fut, Fut: std::future::Future<Output = bool> {
+        for _ in 0..150 {
+            if f().await { return true; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    const A: &str = "22222222-2222-5222-8222-222222222222";
+
+    /// A message put before any consumer exists waits, and goes to the first
+    /// one that registers; the rest follow oldest first.
+    #[tokio::test]
+    async fn messages_wait_for_a_consumer_and_arrive_oldest_first() {
+        let n = node(A).await;
+        produce(&n, "/q/jobs/p/one", "1").await;
+        produce(&n, "/q/jobs/p/two", "2").await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, &format!("/q/jobs/c/{}", cid), 1).await;
+        assert_eq!(c.next().await, ("/q/jobs/1/one".to_string(), "1".to_string()));
+        assert_eq!(c.next().await, ("/q/jobs/2/two".to_string(), "2".to_string()));
+        assert!(c.quiet().await, "each message once");
+
+        // nothing is stored as a key: the producer key is queue traffic
+        assert!(n.kv_get(b"/q/jobs/p/one").await.is_none());
+        // the delivery key reads back the held message until it is acknowledged
+        let got = n.range(tonic::Request::new(RangeRequest { key: b"/q/jobs/2/two".to_vec(), ..Default::default() }))
+            .await.unwrap().into_inner();
+        assert_eq!(got.kvs[0].value, b"2");
+    }
+
+    /// An acknowledge removes the one message whose index it carries - in any
+    /// order - and a delivered, unacknowledged message is not handed out again.
+    #[tokio::test]
+    async fn an_ack_removes_exactly_its_message() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, &format!("/queue/work/consumer/{}", cid), 3).await;
+        for i in 1..=3 {
+            produce(&n, &format!("/queue/work/producer/m{}", i), &i.to_string()).await;
+        }
+        let keys: Vec<String> = vec![c.next().await.0, c.next().await.0, c.next().await.0];
+        assert_eq!(keys, vec!["/queue/work/1/m1", "/queue/work/2/m2", "/queue/work/3/m3"]);
+        let q = queue(&n, "work").await;
+        assert_eq!(held(&q).await, vec![1, 2, 3], "delivered, held until acknowledged");
+
+        ack(&n, &keys[1]).await;
+        assert_eq!(held(&q).await, vec![1, 3], "only #2 goes");
+        ack(&n, "/queue/work/nothing-here").await; // no index: removes nothing
+        assert_eq!(held(&q).await, vec![1, 3]);
+        assert!(c.quiet().await, "the ack's wake-up re-sends nothing");
+        ack(&n, &keys[0]).await;
+        ack(&n, &keys[2]).await;
+        assert!(held(&q).await.is_empty());
+    }
+
+    /// The node hosting a consumer claims the queue: the dispatcher record and
+    /// the consumer's registration both name it (route.rs).
+    #[tokio::test]
+    async fn a_consumer_registers_itself_and_claims_the_dispatcher() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let _c = Consumer::watch(&n, &cid, &format!("/q/reg/c/{}", cid), 1).await;
+        assert_eq!(n.queue_dispatcher("/q/reg").await, Some(n.node_id));
+        assert_eq!(n.queue_dispatcher("/q/reg/p/anything").await, Some(n.node_id), "any key of the queue");
+        assert_eq!(n.kv_get(format!("/q/reg/c/{}", cid).as_bytes()).await,
+            Some(n.node_id.to_string().into_bytes()), "the consumer's host");
+        assert!(queue(&n, "reg").await.dispatch().await.is_local());
+    }
+
+    /// A watch key without a valid UUID takes the connection's id instead.
+    #[tokio::test]
+    async fn a_consumer_key_without_a_uuid_uses_the_connection_id() {
+        let n = node(A).await;
+        let conn = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &conn, "/q/anon/c/not-a-uuid", 1).await;
+        let q = queue(&n, "anon").await;
+        assert!(q.clients.read().await.contains_key(&conn));
+        produce(&n, "/q/anon/p/k", "v").await;
+        assert_eq!(c.next().await.1, "v");
+    }
+
+    /// A consumer whose stream has closed is dropped, its registration is
+    /// withdrawn, and the message waits for the next consumer.
+    #[tokio::test]
+    async fn a_consumer_that_is_gone_is_dropped_and_the_message_waits() {
+        let n = node(A).await;
+        let dead = Uuid::new_v4();
+        let gone = Consumer::watch(&n, &dead, &format!("/q/two/c/{}", dead), 1).await;
+        drop(gone); // its receiving end closes
+
+        produce(&n, "/q/two/p/m0", "v").await;
+        let q = queue(&n, "two").await;
+        assert!(until(|| async { !q.clients.read().await.contains_key(&dead) }).await);
+        assert!(until(|| async { n.kv_get(format!("/q/two/c/{}", dead).as_bytes()).await.is_none() }).await,
+            "the dead consumer's registration is withdrawn");
+        assert!(q.queue.read().await[0].handled_by.is_none(), "not counted delivered");
+
+        let live = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &live, &format!("/q/two/c/{}", live), 1).await;
+        assert_eq!(c.next().await.0, "/q/two/1/m0", "the next consumer gets it");
+        assert!(n.kv_get(format!("/q/two/c/{}", live).as_bytes()).await.is_some());
+    }
+
+    /// A consumer that does not take a message within DISPATCH_TIMEOUT is
+    /// dropped too: a stalled watcher must not wedge the queue.
+    #[tokio::test]
+    async fn a_stalled_consumer_is_dropped_after_the_dispatch_timeout() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let (req, req_rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(1); // room for the created frame only
+        n.new_watcher(req_rx, tx, &cid).await;
+        req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+            WatchCreateRequest { key: format!("/q/slow/c/{}", cid).into_bytes(), watch_id: 1, ..Default::default() })) })
+            .await.unwrap();
+        produce(&n, "/q/slow/p/k", "v").await;
+        let q = queue(&n, "slow").await;
+        tokio::time::sleep(DISPATCH_TIMEOUT + Duration::from_millis(500)).await;
+        assert!(q.clients.read().await.is_empty(), "the stalled consumer was dropped");
+        assert_eq!(held(&q).await, vec![1], "and the message waits for the next one");
+        assert!(q.queue.read().await[0].handled_by.is_none(), "undelivered");
+        drop(rx);
+    }
+
+    /// A second create on the same watch id of one client is refused.
+    #[tokio::test]
+    async fn the_same_watch_id_twice_is_refused() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, "/plain/key", 7).await;
+        c.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+            WatchCreateRequest { key: b"/plain/other".to_vec(), watch_id: 7, ..Default::default() })) })
+            .await.unwrap();
+        let e = c.frame().await.unwrap().unwrap_err();
+        assert_eq!(e.code(), tonic::Code::AlreadyExists);
+        assert!(e.message().contains("/plain/key"), "names the key the id is on: {}", e.message());
+    }
+
+    /// Registry keys are not messages: a put to `/q/{name}` or
+    /// `/q/{name}/c/{uuid}` is an ordinary stored key.
+    #[tokio::test]
+    async fn a_registry_key_is_stored_not_enqueued() {
+        let n = node(A).await;
+        produce(&n, "/q/reg2", "12345").await;
+        produce(&n, &format!("/q/reg2/c/{}", Uuid::new_v4()), "12345").await;
+        assert_eq!(n.kv_get(b"/q/reg2").await.as_deref(), Some(&b"12345"[..]));
+        assert!(n.queues.read().await.get("reg2").is_none(), "no queue was created for them");
+    }
+
+    /// A record naming a node that is not an Online peer is replaced, not kept.
+    #[tokio::test]
+    async fn a_dispatcher_that_is_not_online_is_re_elected() {
+        let n = node(A).await;
+        produce(&n, "/q/stale", "987654321;reply_to=/q/stale-reply").await;
+        produce(&n, "/q/stale/p/k", "v").await;
+        assert_eq!(n.queue_dispatcher("/q/stale").await, Some(n.node_id));
+        let rec = crate::route::DispatchRecord::parse(
+            &String::from_utf8_lossy(&n.kv_get(b"/q/stale").await.unwrap())).unwrap();
+        assert_eq!(rec.reply_to.as_deref(), Some("/q/stale-reply"), "the link survives a re-election");
+        assert!(queue(&n, "stale").await.dispatch().await.is_local());
+    }
+
+    /// `queue_link` records `reply_to` on the request queue's record, once.
+    #[tokio::test]
+    async fn queue_link_records_the_reply_queue() {
+        let n = node(A).await;
+        n.queue_link("/q/rpc", "/q/rpc-reply").await; // no queue yet: nothing to link
+        assert!(n.kv_get(b"/q/rpc").await.is_none());
+
+        produce(&n, "/q/rpc/p/req", "v").await;
+        n.queue_link("/q/rpc/p/req", "/q/rpc-reply").await;
+        let rec = || async {
+            crate::route::DispatchRecord::parse(&String::from_utf8_lossy(&n.kv_get(b"/q/rpc").await.unwrap())).unwrap()
+        };
+        assert_eq!(rec().await.reply_to.as_deref(), Some("/q/rpc-reply"));
+        assert_eq!(rec().await.node, n.node_id, "the dispatcher stays where it is");
+        n.queue_link("/q/rpc", "/q/rpc-reply").await; // idempotent
+        assert_eq!(rec().await.reply_to.as_deref(), Some("/q/rpc-reply"));
+    }
+
+    /// The reaper: only a queue that is empty, unwatched, consumerless anywhere
+    /// and idle for QUEUE_IDLE goes - and its dispatcher record with it.
+    #[tokio::test]
+    async fn only_an_idle_empty_unwatched_queue_is_reaped() {
+        let n = node(A).await;
+        produce(&n, "/q/idle/p/k", "v").await;
+        let q = queue(&n, "idle").await;
+        let long_ago = || Some(Instant::now().checked_sub(QUEUE_IDLE + Duration::from_secs(1)).unwrap());
+
+        *q.idle_since.write().await = long_ago();
+        assert_eq!(n.reap_idle_queues().await, 0, "it still holds a message");
+        q.queue.write().await.clear();
+        *q.idle_since.write().await = Some(Instant::now());
+        assert_eq!(n.reap_idle_queues().await, 0, "empty, but used just now");
+
+        // a consumer on another node keeps it, though nothing is attached here
+        let elsewhere = format!("/q/idle/c/{}", Uuid::new_v4());
+        produce(&n, &elsewhere, "987654321").await;
+        *q.idle_since.write().await = long_ago();
+        assert_eq!(n.reap_idle_queues().await, 0, "a remote consumer is a user");
+        n.kv_delete(elsewhere.into_bytes()).await.unwrap();
+
+        // a local consumer keeps it
+        let cid = Uuid::new_v4();
+        let c = Consumer::watch(&n, &cid, &format!("/q/idle/c/{}", cid), 1).await;
+        *q.idle_since.write().await = long_ago();
+        assert_eq!(n.reap_idle_queues().await, 0, "a local consumer is a user");
+        q.drop_watcher(&cid, 1).await;
+        drop(c);
+
+        *q.idle_since.write().await = long_ago();
+        assert!(n.kv_get(b"/q/idle").await.is_some());
+        assert_eq!(n.reap_idle_queues().await, 1);
+        assert!(n.queues.read().await.get("idle").is_none(), "the queue is gone");
+        assert!(n.kv_get(b"/q/idle").await.is_none(), "and its dispatcher record");
+    }
+
+    /// A delivery from a peer for a consumer this node does not host is refused,
+    /// so the dispatcher can try another rather than count it delivered.
+    #[tokio::test]
+    async fn a_delivery_for_a_consumer_not_hosted_here_is_refused() {
+        let n = node(A).await;
+        let mut r = tonic::Request::new(PutRequest {
+            key: format!("/q/del/c/{}/5/k", Uuid::new_v4()).into_bytes(), value: b"v".to_vec(), ..Default::default() });
+        r.metadata_mut().insert(crate::etcdpb::XPEER, "987654321".parse().unwrap());
+        let e = n.put(r).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::NotFound);
+        assert!(held(&queue(&n, "del").await).await.is_empty(), "and nothing was enqueued");
+    }
+
+    /// ...and one for a consumer it does host goes straight to its watcher,
+    /// under the delivery key, without a second copy in a queue here.
+    #[tokio::test]
+    async fn a_delivery_from_a_peer_reaches_the_local_consumer() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, &format!("/q/del2/c/{}", cid), 1).await;
+        let key = format!("/q/del2/c/{}/9/k", cid);
+        let mut r = tonic::Request::new(PutRequest { key: key.clone().into_bytes(), value: b"v".to_vec(), ..Default::default() });
+        r.metadata_mut().insert(crate::etcdpb::XPEER, "987654321".parse().unwrap());
+        n.put(r).await.unwrap();
+        assert_eq!(c.next().await, (key, "v".to_string()));
+        assert!(held(&queue(&n, "del2").await).await.is_empty());
+
+        // a watcher whose stream closed is dropped, and the delivery refused
+        drop(c);
+        let mut r = tonic::Request::new(PutRequest {
+            key: format!("/q/del2/c/{}/10/k", cid).into_bytes(), value: b"v".to_vec(), ..Default::default() });
+        r.metadata_mut().insert(crate::etcdpb::XPEER, "987654321".parse().unwrap());
+        assert_eq!(n.put(r).await.unwrap_err().code(), tonic::Code::NotFound);
+        assert!(queue(&n, "del2").await.clients.read().await.is_empty());
+    }
+
+    /// Cancelling a watch answers `canceled` and stops its events.
+    #[tokio::test]
+    async fn a_cancelled_watch_gets_no_more_events() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, "/w/prefix/", 4).await;
+        // a second, ranged watch on the same client
+        c.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+            WatchCreateRequest { key: b"/w/r/".to_vec(), range_end: b"/w/r0".to_vec(), watch_id: 5, ..Default::default() })) })
+            .await.unwrap();
+        assert!(c.frame().await.unwrap().unwrap().created);
+        n.kv_put(b"/w/r/x".to_vec(), b"1".to_vec()).await.unwrap();
+        assert_eq!(c.next().await.0, "/w/r/x");
+
+        c.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CancelRequest(
+            WatchCancelRequest { watch_id: 5 })) }).await.unwrap();
+        let r = c.frame().await.unwrap().unwrap();
+        assert!(r.canceled && r.watch_id == 5);
+        assert!(n.observer_ranges.read().await.is_empty(), "the range goes with its last watcher");
+        n.kv_put(b"/w/r/y".to_vec(), b"2".to_vec()).await.unwrap();
+        assert!(c.quiet().await);
+        // cancelling an id that is not there is ignored
+        c.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CancelRequest(
+            WatchCancelRequest { watch_id: 99 })) }).await.unwrap();
+        assert!(c.quiet().await);
+    }
+
+    /// A progress request answers with the client's watch id.
+    #[tokio::test]
+    async fn a_progress_request_names_the_watch() {
+        use crate::etcdpb::etcdserverpb::WatchProgressRequest;
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, "/p/k", 11).await;
+        c.req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::ProgressRequest(
+            WatchProgressRequest {})) }).await.unwrap();
+        let r = c.frame().await.unwrap().unwrap();
+        assert_eq!(r.watch_id, 11);
+        assert!(!r.fragment, "one watch, no fragment");
+
+        // a client with no watch at all is answered with id 0
+        let other = Uuid::new_v4();
+        let (req, req_rx) = mpsc::channel(10);
+        let (tx, mut rx) = mpsc::channel(10);
+        n.new_watcher(req_rx, tx, &other).await;
+        req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::ProgressRequest(
+            WatchProgressRequest {})) }).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap().watch_id, 0);
+        // an empty request is ignored
+        req.send(WatchRequest { request_union: None }).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err());
+    }
+
+    #[test]
+    fn queue_keys_are_classified_by_shape() {
+        let k = QueueNameKey::new("/queue/jobs/consumer/7e1d0f57-1d3c-4a7b-9b5c-2a1d1e9f0a11/12/tail".into());
+        assert!(k.consumer && !k.producer && k.is_queue());
+        assert_eq!((k.idx, k.tail.as_str()), (Some(12), "tail"));
+        assert!(k.client_id.is_some());
+        let k = QueueNameKey::new("/q/jobs/i/key".into());
+        assert!(k.producer && k.idx.is_none());
+        assert_eq!(k.name(), "/q/jobs");
+        let k = QueueNameKey::new("/q/jobs/4/key".into());
+        assert_eq!(k.idx, Some(4), "a delivery key carries its index");
+        assert!(!QueueNameKey::new("/other/jobs/p/k".into()).is_queue());
+        assert!(!QueueNameKey::new("/q".into()).is_queue());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! [q-route] Two nodes of one cluster, peered and Online, and the routes a
+    //! message takes between them (queue-p2p-route.md).
+    use super::node_tests::{ack, held, node, produce, queue, until, Consumer};
+    use super::*;
+    use crate::{EtcdEvents, EtcdMgmtEvent};
+    use std::time::Duration;
+
+    const A: &str = "77777777-7777-5777-8777-777777777771";
+    const B: &str = "77777777-7777-5777-8777-777777777772";
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// Two served nodes that know each other, each holding the other Online.
+    async fn online_pair() -> (EtcdNode, EtcdNode) {
+        let ports = [free_port(), free_port()];
+        let urls: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{}", p)).collect();
+        let mut nodes = Vec::new();
+        for (id, p) in [A, B].iter().zip(ports) {
+            let n = node(id).await;
+            n.cfg.write().await.listen_client_urls = format!("127.0.0.1:{}", p);
+            n.serve().await.unwrap();
+            nodes.push(n);
+        }
+        for p in ports {
+            assert!(until(|| async { tokio::net::TcpStream::connect(("127.0.0.1", p)).await.is_ok() }).await);
+        }
+        // what an embedder sends once it knows the roster
+        for (i, n) in nodes.iter().enumerate() {
+            let mut c = crate::cli::EtcdConfig::default();
+            c.listen_client_urls = urls[i].clone();
+            c.initial_advertise_peer_urls = urls.join(",");
+            n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
+        }
+        for n in &nodes {
+            assert!(until(|| async { n.peers.read().await.connected() == 1 }).await, "peered");
+        }
+        // one replicated write each way proves the peer, which is what Online means
+        let (a, b) = (nodes[0].clone(), nodes[1].clone());
+        a.kv_put(b"/warm/a".to_vec(), b"1".to_vec()).await.unwrap();
+        b.kv_put(b"/warm/b".to_vec(), b"1".to_vec()).await.unwrap();
+        assert!(until(|| async { a.peers.read().await.is_online(b.node_id).await }).await);
+        assert!(until(|| async { b.peers.read().await.is_online(a.node_id).await }).await);
+        (a, b)
+    }
+
+    /// A producer on another node sends the dispatcher one unicast, and keeps
+    /// no copy. The consumer on the dispatcher's node receives it under the
+    /// producer's own key - the documented gap (agent.md, "Known gaps"): that
+    /// key has no index, so the ack removes nothing and the message stays held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_remote_producer_forwards_to_the_dispatcher_and_keeps_nothing() {
+        let (a, b) = online_pair().await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&a, &cid, &format!("/q/fwd/consumer/{}", cid), 1).await;
+        assert!(until(|| async { b.queue_dispatcher("/q/fwd").await == Some(a.node_id) }).await,
+            "the consumer's node claimed the queue, and B knows it");
+
+        produce(&b, "/q/fwd/p/m1", "hello").await;
+        assert_eq!(c.next().await, ("/q/fwd/p/m1".to_string(), "hello".to_string()));
+        let on_b = queue(&b, "fwd").await;
+        assert_eq!(on_b.dispatch().await, crate::route::Dispatch::Remote(a.node_id));
+        assert!(held(&on_b).await.is_empty(), "the producer's node forwards and forgets");
+
+        let on_a = queue(&a, "fwd").await;
+        assert_eq!(held(&on_a).await.len(), 1);
+        ack(&a, "/q/fwd/p/m1").await;
+        assert_eq!(held(&on_a).await.len(), 1, "the known gap: an ack without an index removes nothing");
+        assert!(c.quiet().await, "...but it is not delivered twice");
+    }
+
+    /// A consumer on B takes the queue from a dispatcher that hosts none.
+    /// Messages A already holds go to B by one unicast each, under the delivery
+    /// key with the consumer and index; B's ack reaches A and removes exactly
+    /// that one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dispatcher_hands_messages_to_a_consumer_on_another_node() {
+        let (a, b) = online_pair().await;
+        produce(&a, "/q/far/p/m1", "1").await;
+        assert_eq!(a.queue_dispatcher("/q/far").await, Some(a.node_id), "the producer's node claimed it");
+
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&b, &cid, &format!("/q/far/c/{}", cid), 1).await;
+        assert!(until(|| async { a.queue_dispatcher("/q/far").await == Some(b.node_id) }).await,
+            "the consumer's node took it over, and A knows it");
+        assert!(until(|| async { a.kv_get(format!("/q/far/c/{}", cid).as_bytes()).await.is_some() }).await);
+
+        // A still holds m1 and still dispatches what it holds: the next put
+        // there wakes it, and both go to B, oldest first
+        produce(&a, "/q/far/p/m2", "2").await;
+        let first = c.next().await;
+        let second = c.next().await;
+        assert_eq!(first, (format!("/q/far/c/{}/1/m1", cid), "1".to_string()));
+        assert_eq!(second, (format!("/q/far/c/{}/2/m2", cid), "2".to_string()));
+
+        let on_a = queue(&a, "far").await;
+        assert_eq!(held(&on_a).await, vec![1, 2]);
+        ack(&b, &first.0).await;
+        assert!(until(|| async { held(&on_a).await == vec![2] }).await, "B's ack removed #1 on A");
+        ack(&b, &second.0).await;
+        assert!(until(|| async { held(&on_a).await.is_empty() }).await);
+    }
+
+    /// With exactly one consumer, on another node, stable and with nothing
+    /// outstanding, the dispatcher moves to that node and the record says
+    /// `pinned`. Several consumers, or one not yet stable, and it stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_dispatcher_follows_a_lone_stable_consumer() {
+        let (a, b) = online_pair().await;
+        // the queue and its election, without a put: nothing wakes its dispatch
+        // loop, so only this test moves the dispatcher
+        let (on_a, _) = a.get_or_create_queue(&PutRequest { key: b"/q/pin/p/m1".to_vec(), ..Default::default() })
+            .await.unwrap();
+        assert!(on_a.elect(crate::route::Claim::Producer, &a.log).await.is_local());
+        on_a.queue.write().await.push_front(QueueMsg { idx: 1, key: "/q/pin/1/m1".into(), value: vec![],
+            created: Instant::now(), handled_by: None });
+        // a consumer registered on B without taking the dispatcher: as if B's
+        // consumer had moved there after A was elected
+        let cid = Uuid::new_v4();
+        produce(&a, &format!("/q/pin/c/{}", cid), &b.node_id.to_string()).await;
+        let log = a.log.clone();
+
+        on_a.pin_to_consumer(&log).await;
+        assert!(on_a.dispatch().await.is_local(), "seen once is not stable yet");
+        assert_eq!(on_a.pin_seen.read().await.map(|(n, _)| n), Some(b.node_id));
+
+        *on_a.pin_seen.write().await = Some((b.node_id,
+            Instant::now().checked_sub(PIN_STABLE + Duration::from_secs(1)).unwrap()));
+        on_a.queue.write().await[0].handled_by = Some(cid);
+        on_a.pin_to_consumer(&log).await;
+        assert!(on_a.dispatch().await.is_local(), "an unacknowledged message holds it here");
+
+        on_a.queue.write().await.clear();
+        on_a.pin_to_consumer(&log).await;
+        assert_eq!(on_a.dispatch().await, crate::route::Dispatch::Remote(b.node_id));
+        let rec = crate::route::DispatchRecord::parse(
+            &String::from_utf8_lossy(&a.kv_get(b"/q/pin").await.unwrap())).unwrap();
+        assert_eq!((rec.node, rec.pinned), (b.node_id, true));
+        assert!(until(|| async { b.queue_dispatcher("/q/pin").await == Some(b.node_id) }).await,
+            "replicated to B");
+
+        // a second consumer: no single right place, and the clock resets
+        *on_a.dispatch.write().await = crate::route::Dispatch::Local;
+        produce(&a, &format!("/q/pin/c/{}", Uuid::new_v4()), &b.node_id.to_string()).await;
+        on_a.pin_to_consumer(&log).await;
+        assert!(on_a.pin_seen.read().await.is_none());
+        assert!(on_a.dispatch().await.is_local());
+    }
+
+    /// A lone consumer on the dispatcher's own node: nothing to move.
+    #[tokio::test]
+    async fn a_local_lone_consumer_pins_nothing() {
+        let a = node(A).await;
+        let cid = Uuid::new_v4();
+        let _c = Consumer::watch(&a, &cid, &format!("/q/home/c/{}", cid), 1).await;
+        let q = queue(&a, "home").await;
+        *q.pin_seen.write().await = Some((12345, Instant::now()));
+        q.pin_to_consumer(&a.log).await;
+        assert!(q.pin_seen.read().await.is_none());
+        assert!(q.dispatch().await.is_local());
+    }
+
+    /// A dispatcher that cannot be reached: the put is broadcast instead of
+    /// dropped, the queue forgets its dispatcher, and the next put re-elects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unreachable_dispatcher_is_replaced() {
+        let (a, b) = online_pair().await;
+        let cid = Uuid::new_v4();
+        let _c = Consumer::watch(&a, &cid, &format!("/q/lost/c/{}", cid), 1).await;
+        assert!(until(|| async { b.queue_dispatcher("/q/lost").await == Some(a.node_id) }).await);
+        produce(&b, "/q/lost/p/m1", "1").await;
+        let on_b = queue(&b, "lost").await;
+        assert_eq!(on_b.dispatch().await, crate::route::Dispatch::Remote(a.node_id));
+
+        // A drops out of B's Online set: unicast has no target
+        assert!(b.peers.read().await.demote_to_spare(a.node_id, &b.log).await);
+        produce(&b, "/q/lost/p/m2", "2").await;
+        assert!(on_b.dispatch().await.is_unknown(), "the dispatcher is forgotten, not kept");
+
+        produce(&b, "/q/lost/p/m3", "3").await;
+        assert_eq!(b.queue_dispatcher("/q/lost").await, Some(b.node_id), "re-elected here");
+        assert!(on_b.dispatch().await.is_local());
+    }
+
+    /// A registry entry naming a node that will not take the delivery: the
+    /// message stays queued and undelivered rather than counted delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_that_refuses_a_delivery_leaves_the_message_queued() {
+        let (a, b) = online_pair().await;
+        let ghost = Uuid::new_v4();
+        // A believes B hosts `ghost`; B has no such consumer
+        produce(&a, &format!("/q/ghost/c/{}", ghost), &b.node_id.to_string()).await;
+        produce(&a, "/q/ghost/p/m1", "1").await;
+        let on_a = queue(&a, "ghost").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(held(&on_a).await, vec![1]);
+        assert!(on_a.queue.read().await[0].handled_by.is_none(), "not counted delivered");
+        assert!(!on_a.is_reapable().await, "a registered consumer anywhere keeps the queue");
+        assert!(on_a.node_hosts_consumer(b.node_id).await);
+        assert!(!on_a.node_hosts_consumer(12345).await);
     }
 }

@@ -23,7 +23,8 @@ async fn main() -> ExitCode {
         match args.parse_from(BufReader::new(f)) {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("Error parsing config file {}: {}", args.config_path.display(), e);
+                // the error names the file, with its code (cli.config_file)
+                eprintln!("{}", e);
                 return ExitCode::from(11);
             }
         }
@@ -38,12 +39,12 @@ async fn main() -> ExitCode {
     ).await {
         Ok(c) => {
             if let Err(e) = c.serve().await {
-                crit!(log, "Error: {}", e);
+                crit!(log, "{}", message("main.serve", &[("err", &e)]));
                 return ExitCode::from(12);
             }
         }
         Err(e) => {
-            crit!(log, "Error: {}", e);
+            crit!(log, "{}", message("main.init", &[("err", &e)]));
             return ExitCode::from(13);
         }
     }
@@ -62,12 +63,13 @@ async fn main() -> ExitCode {
 use tokio::signal::unix::*;
 use etcds::cli::{EtcdCliArgs, EtcdConfig};
 use etcds::cluster::EtcdNode;
+use etcds::message;
 
 #[cfg(unix)]
 async fn wait_for_signal() -> Result<String, String> {
-    let mut int_stream = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
-    let mut term_stream = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
-    let mut hangup_stream = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
+    let mut int_stream = signal(SignalKind::interrupt()).map_err(|e| message("main.signal", &[("err", &e.to_string())]))?;
+    let mut term_stream = signal(SignalKind::terminate()).map_err(|e| message("main.signal", &[("err", &e.to_string())]))?;
+    let mut hangup_stream = signal(SignalKind::hangup()).map_err(|e| message("main.signal", &[("err", &e.to_string())]))?;
     let sig = tokio::select! {
 		_ = int_stream.recv() => {"interrupt"},
 		_ = term_stream.recv() => {"terminate"},
@@ -79,8 +81,8 @@ async fn wait_for_signal() -> Result<String, String> {
 #[cfg(windows)]
 async fn wait_for_signal() -> Result<String, String> {
     tokio::signal::ctrl_c().await
-        .map(|_| format!("got CTRL-C."))
-        .map_err(|err| format!("Unable to listen for shutdown signal: {}", err))
+        .map(|_| message("main.ctrl_c", &[]))
+        .map_err(|err| message("main.signal", &[("err", &err.to_string())]))
 }
 
 pub fn exit_with_msg(log: Logger, msg: String, code: u8) -> ExitCode {

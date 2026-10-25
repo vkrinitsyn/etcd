@@ -82,7 +82,7 @@ The settings that do something:
 | `node` | random | this node's id, a UUID. Set it: an id that changes at each start leaves dispatcher records naming a node that no longer exists |
 | `cluster` | random | the cluster's UUID, the same on every node, or nothing peers |
 | `term` | 1 | the node's epoch |
-| `listen_client_urls` | `localhost:2379` | where the gRPC server binds (the first URL). Write it as `http://host:port`: only in that form is this node left out of its own peer list (`EtcdConfig::peers`) |
+| `listen_client_urls` | `localhost:2379` | where the gRPC server binds (the first URL), `host:port` or `http://host:port`; either way this node is left out of its own peer list (`EtcdConfig::peers`) |
 | `initial_advertise_peer_urls` | | every node's URL, this one included, comma separated: the peers to connect to. Peer traffic uses the same gRPC port as clients |
 | `local_prefix`, `local_prefix_except` | | key prefixes that never leave the node, and branches of them that do (`prefix.rs`) |
 | `local_only_prefix`, `local_only_prefix_except` | | prefixes served only to a loopback caller, and branches served to anyone |
@@ -107,6 +107,17 @@ Every other field is etcd's, accepted for compatibility and unused.
 | `queue_dispatcher(q)` | the node dispatching `q`, from the registry |
 | `reap_idle_queues()` | drops queues that are empty, consumerless and idle for 10 minutes. **Nothing in the crate calls it:** an embedder that creates queues calls it on a timer |
 | `node.event` | a `Sender<EtcdEvents>`: `Data` applies a put, delete or txn; `Mgmt` reconfigures (`Config`), sets the tracer or meter, `Restart`s (term + 1 and a fresh sync), `Pause(secs)`, `Stop` |
+
+### Language
+
+Messages - errors, log lines, gRPC status texts, `--help` - are in en, ru, fr,
+de, zh and ja (`locales/<language>.yml`, one file each; fr, de, zh and ja not
+reviewed). The language is
+the first of `etcds::set_lang("ru")`, the `lang` value of the logger given to
+`init` (`o!("lang" => "ru")`), `LANG`, English. It is the process's, not a call's.
+An error starts with its code, `ETCD-Ennn`, the same in every language: match
+on the code, never on the text - a client of the gRPC API gets the server's
+language.
 
 A `Config` reconfigure replaces the peer URLs, the prefix policy, the zones, the
 name, the term and the log level from the config it carries - send a whole
@@ -251,3 +262,9 @@ Read from the source; each is a place where the obvious assumption is wrong.
   bump here goes with a matching change of those requirements - otherwise cargo
   warns that the patch was not used and builds the crates.io release instead.
 - Log lines start with `[etcd] ` (`LP`); queue routing ones add `[q-route]`.
+- **Messages go through `tr!("module.key", name = value)`** (`src/i18n.rs`), the
+  binary's through `etcds::message`; each key in all six `locales/<language>.yml`,
+  on the same line in each, grouped by module. An error's message starts with a
+  new `ETCD-Ennn` code (E001-E009 cli, E010 cluster, E030 peer, E050 queue, E070 clickhouse, E080 srv, E100
+  main). The i18n tests fail on a key missing in a language, a placeholder that
+  differs, a reused code, or a message nothing uses.

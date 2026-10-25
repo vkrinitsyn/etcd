@@ -211,14 +211,12 @@ pub struct EtcdConfig {
     pub initial_cluster_state: String,
 
     /// Initial cluster token for the etcd cluster during bootstrap.
-
     /// Specifying this can protect you from unintended cross_cluster interaction when running multiple clusters.
     #[arg(long, required = false, default_value = "etcd-cluster")]
     pub initial_cluster_token: String,
 
 
     /// List of this member's client URLs to advertise to the public.
-
     /// The client URLs advertised should be accessible to machines that talk to etcd cluster. etcd client libraries parse these URLs to connect to the cluster.
     /// The URLs needed to be a comma-separated list.
     #[arg(long, required = false, default_value = "http://localhost:2379")]
@@ -230,7 +228,6 @@ pub struct EtcdConfig {
 
 
     /// Expected behavior ('exit' or 'proxy') when discovery services fails.
-
     /// "proxy" supports v2 API only.
     #[arg(long, required = false, default_value = "proxy")]
     pub discovery_fallback: String,
@@ -268,6 +265,8 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "false")]
     pub enable_v2 : bool, // ''
 
+    /// Phase of v2store deprecation: 'not_yet', 'write_only',
+    /// 'write_only_drop_data' or 'gone'.
     #[arg(long, required = false, default_value = "not_yet")]
     pub v2_deprecation: String,
 
@@ -304,7 +303,6 @@ pub struct EtcdConfig {
     pub key_file : String, // ''
 
     /// Enable client cert authentication.
-
     /// It's recommended to enable client cert authentication to prevent attacks from unauthenticated clients (e.g. CVE_2023_44487), especially when running etcd as a public service.
     #[arg(long, required = false, default_value = "false")]
     pub client_cert_auth : bool, // ''
@@ -317,12 +315,9 @@ pub struct EtcdConfig {
     pub client_cert_allowed_hostname : String, // ''
 
     /// Path to the client server TLS trusted CA cert file.
-
-    /// //Note setting this parameter will also automatically enable client cert authentication no matter what value is set for `
-    ///
+    /// Setting it also enables client cert authentication, whatever `client_cert_auth` says.
     #[arg(long, required = false, default_value = "")]
-    pub trusted_ca_file : String, // ''#[arg(long, required = false, default_value = "")]
-    // client_cert_auth`.
+    pub trusted_ca_file : String, // ''
 
     /// Client TLS using generated certificates.
     #[arg(long, required = false, default_value = "false")]
@@ -339,12 +334,10 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "")]
     pub peer_key_file : String, // ''
 
+    /// Enable peer client cert authentication.
+    /// It's recommended to enable peer client cert authentication to prevent attacks from unauthenticated forged peers (e.g. CVE_2023_44487).
     #[arg(long, required = false, default_value = "false")]
     pub peer_client_cert_auth : bool, // ''
-
-    /// Enable peer client cert authentication.
-
-    /// It's recommended to enable peer client cert authentication to prevent attacks from unauthenticated forged peers (e.g. CVE_2023_44487).
 
     /// Path to the peer server TLS trusted CA file.
     #[arg(long, required = false, default_value = "")]
@@ -497,11 +490,13 @@ pub struct ClientConfig {
 
 }
 
+/// [i18n] The command line. Its texts - about, after_help, each argument's help -
+/// are not these doc comments but the help.<id> messages (locales/<language>.yml), in the language of
+/// `crate::i18n::lang()`: see [EtcdCliArgs::command_in].
 #[derive(Parser)]
-// author, version, about,
 #[command(after_help = "https://etcd.io/docs/v3.5/op-guide/configuration/")]
 pub struct EtcdCliArgs {
-    /// Input files
+    /// Input files (not used)
     input: Vec<std::path::PathBuf>,
 
     /// Config file
@@ -527,7 +522,7 @@ impl EtcdCliArgs {
     /// `parse_args` over the given arguments, the program name first.
     pub fn parse_args_from<I, T>(args: I) -> Self
     where I: IntoIterator<Item = T>, T: Into<std::ffi::OsString> + Clone {
-        let m = <Self as clap::CommandFactory>::command().get_matches_from(args);
+        let m = Self::command_in(&crate::i18n::lang()).get_matches_from(args);
         let mut a = <Self as clap::FromArgMatches>::from_arg_matches(&m).unwrap_or_else(|e| e.exit());
         a.given = m.ids()
             .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
@@ -536,11 +531,48 @@ impl EtcdCliArgs {
         a
     }
 
+    /// [i18n] The command line, its texts in `lang` (`en`, `ru`, ...; any other is
+    /// English): the about, the after_help, the headings, and each argument's help
+    /// from `help.<arg id>` - the id is the field name - in locales/<language>.yml. The
+    /// doc comments stay the source's documentation; `--help` shows these.
+    pub fn command_in(lang: &str) -> clap::Command {
+        let t = |key: &str| rust_i18n::t!(key, locale = lang).into_owned();
+        let header = clap::builder::styling::Styles::default().get_usage().clone();
+        let options = t("help.options");
+        let arguments = t("help.arguments");
+        <Self as clap::CommandFactory>::command()
+            // clap's own -h/--help, made here to carry a translated help
+            .disable_help_flag(true)
+            // help under its option: the longest option names are some 90 columns
+            .next_line_help(true)
+            .arg(clap::Arg::new("help").short('h').long("help").action(clap::ArgAction::Help))
+            .about(t("help.about"))
+            .long_about(None)
+            .after_help(t("help.after_help"))
+            .help_template(format!("{{before-help}}{{about-with-newline}}\n{}{}{} {{usage}}\n\n{{all-args}}{{after-help}}",
+                header.render(), t("help.usage"), header.render_reset()))
+            .mut_args(|a| {
+                let help = t(&format!("help.{}", a.get_id()));
+                let heading = if a.is_positional() { arguments.clone() } else { options.clone() };
+                let a = a.long_help(None).help_heading(heading);
+                if !a.get_action().takes_values() {
+                    return a.help(help);
+                }
+                // clap's "[default: ...]" is English: said here, and not at all when empty
+                let default = a.get_default_values().iter().map(|v| v.to_string_lossy()).collect::<Vec<_>>().join(",");
+                if default.is_empty() {
+                    a.help(help).hide_default_value(true)
+                } else {
+                    a.help(format!("{} {}", help, rust_i18n::t!("help.default", locale = lang, value = default))).hide_default_value(true)
+                }
+            })
+    }
+
     /// The config file's settings, under the ones the command line named; the
     /// rest as clap defaults them. (Before, every default overrode the file too:
     /// the merged twin held a value for each field that had a `default_value`.)
     pub fn parse_from<R: Read>(&mut self, input: BufReader<R>) -> Result<EtcdConfig, String> {
-        let err = |e: &dyn std::fmt::Display| format!("Error in configuration file [{}]:\n{}", self.config_path.display(), e);
+        let err = |e: &dyn std::fmt::Display| tr!("cli.config_file", file = self.config_path.display(), err = e);
         // serde-saphyr (no unsafe code, unlike serde_yaml's libyaml port) has no YAML
         // value type of its own: the file and the settings meet as JSON values
         let file: serde_json::Value = serde_saphyr::from_reader(input).map_err(|e| err(&e))?;
@@ -570,7 +602,7 @@ impl EtcdConfig {
             if h.contains("//") {
                 clients.remove(h);
             } else {
-                clients.remove(format!("http:://{}",h).as_str());
+                clients.remove(format!("http://{}",h).as_str());
             }
         }
         clients
@@ -579,6 +611,18 @@ impl EtcdConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// this node is left out of its own peers, its listen url written with the scheme
+    /// or without it
+    #[test]
+    fn a_node_is_not_its_own_peer() {
+        let mut c = EtcdConfig::with_defaults();
+        c.initial_advertise_peer_urls = "http://localhost:2379,http://other:2379".to_string();
+        for listen in ["localhost:2379", "http://localhost:2379"] {
+            c.listen_client_urls = listen.to_string();
+            assert_eq!(c.peers(), HashSet::from(["http://other:2379"]), "{}", listen);
+        }
+    }
 
     #[test]
     fn the_two_defaults_stay_what_they_were() {
@@ -621,7 +665,96 @@ mod tests {
         let mut a = EtcdCliArgs::parse_args_from(["etcd", "--config", "/etc/etcd/etcd.yml"]);
         for file in ["name: [unclosed\n", "term: seven\n"] {
             let e = a.parse_from(BufReader::new(file.as_bytes())).err().unwrap_or_else(|| panic!("{:?} accepted", file));
-            assert!(e.starts_with("Error in configuration file [/etc/etcd/etcd.yml]:"), "{:?}: {}", file, e);
+            assert!(e.starts_with("ETCD-E001 ") && e.contains("[/etc/etcd/etcd.yml]"), "{:?}: {}", file, e);
+        }
+    }
+
+    /// the help. keys (locales/en.yml - every language has the same, i18n.rs tests it),
+    /// without `help.`
+    fn help_keys() -> std::collections::BTreeSet<String> {
+        let f = format!("{}/locales/en.yml", env!("CARGO_MANIFEST_DIR"));
+        let y: serde_json::Value = serde_saphyr::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+        y.as_object().unwrap().keys().filter_map(|k| k.strip_prefix("help.")).map(str::to_string).collect()
+    }
+
+    /// the help. keys that are the command's own texts, not an argument's
+    const COMMAND_TEXTS: [&str; 6] = ["about", "after_help", "usage", "options", "arguments", "default"];
+
+    /// [i18n] every argument has its help.<id>, and every help. key is an argument's or
+    /// the command's - so i18n.rs, which takes help. keys as used, takes no stale one
+    #[test]
+    fn every_argument_has_its_help_and_every_help_an_argument() {
+        let ids: std::collections::BTreeSet<String> = EtcdCliArgs::command_in("en").get_arguments()
+            .map(|a| a.get_id().to_string()).collect();
+        assert!(ids.len() > 90 && ids.contains("help") && ids.contains("config_path"), "{}", ids.len());
+        let keys = help_keys();
+        let missing: Vec<&String> = ids.iter().filter(|i| !keys.contains(*i)).collect();
+        assert!(missing.is_empty(), "no help.<id> for {:?}", missing);
+        let stale: Vec<&String> = keys.iter().filter(|k| !ids.contains(*k) && !COMMAND_TEXTS.contains(&k.as_str())).collect();
+        assert!(stale.is_empty(), "help. keys naming no argument: {:?}", stale);
+    }
+
+    /// [i18n] every language's command line is the English one translated: the same
+    /// arguments - names, defaults, actions - each help and the about translated
+    /// (Russian, Chinese and Japanese told by their script, French and German by
+    /// differing from English); the unreviewed ones say so, and how to get English
+    #[test]
+    fn every_command_line_is_the_english_one_translated() {
+        let args = |c: &clap::Command| c.get_arguments()
+            .map(|a| (a.get_id().to_string(), a.get_long().map(str::to_string), a.get_short(),
+                a.get_default_values().to_vec(), format!("{:?}", a.get_action())))
+            .collect::<Vec<_>>();
+        let texts = |c: &clap::Command| {
+            let mut t = vec![("about".to_string(), c.get_about().unwrap().to_string()),
+                ("after_help".to_string(), c.get_after_help().unwrap().to_string())];
+            t.extend(c.get_arguments().map(|a| (a.get_id().to_string(), a.get_help().unwrap().to_string())));
+            t
+        };
+        let en = EtcdCliArgs::command_in("en");
+        for l in ["ru", "fr", "de", "zh", "ja"] {
+            let c = EtcdCliArgs::command_in(l);
+            assert_eq!(args(&en), args(&c), "{}", l);
+            for ((what, e), (_, t)) in texts(&en).iter().zip(texts(&c).iter()) {
+                let has = |from: char, to: char| t.chars().any(|c| (from..=to).contains(&c));
+                let translated = match l {
+                    "ru" => has('\u{0400}', '\u{04FF}'),
+                    "zh" => has('\u{4E00}', '\u{9FFF}'),
+                    "ja" => has('\u{3040}', '\u{30FF}'),
+                    _ => t != e,
+                };
+                assert!(translated, "{} {} is not translated: {}", l, what, t);
+            }
+            let about = c.get_about().unwrap().to_string();
+            assert_eq!(l == "ru", !about.contains("LANG=en"), "{}: the notice that it is not reviewed: {}", l, about);
+        }
+        // a language without messages is English
+        assert_eq!(texts(&EtcdCliArgs::command_in("xx")), texts(&en));
+    }
+
+    /// [i18n] --help in Russian: Russian text, and every option's name as it is
+    #[test]
+    fn the_help_in_russian_keeps_the_option_names() {
+        let mut c = EtcdCliArgs::command_in("ru");
+        let help = c.render_help().to_string();
+        for text in ["Использование:", "Параметры", "Префиксы ключей, которые никогда не передаются", "[по умолчанию: localhost:2379]",
+            "https://etcd.io/docs/v3.5/op-guide/configuration/"] {
+            assert!(help.contains(text), "no {:?} in\n{}", text, help);
+        }
+        for a in c.get_arguments().filter_map(|a| a.get_long()) {
+            assert!(help.contains(&format!("--{}", a)), "no --{} in\n{}", a, help);
+        }
+        assert!(!help.contains("Options") && !help.contains("[default:"), "English left in\n{}", help);
+    }
+
+    /// the command line parses as before the translation: the help is all it changed
+    #[test]
+    fn the_translated_command_line_parses_the_same() {
+        for l in ["en", "ru", "ja"] {
+            let m = EtcdCliArgs::command_in(l).try_get_matches_from(["etcd", "--name", "n1", "--pre-vote", "--config", "x.yml"]).unwrap();
+            let a = <EtcdCliArgs as clap::FromArgMatches>::from_arg_matches(&m).unwrap();
+            assert_eq!((a.config.name.as_str(), a.config.pre_vote, a.config_path.to_str()), ("n1", true, Some("x.yml")), "{}", l);
+            let e = EtcdCliArgs::command_in(l).try_get_matches_from(["etcd", "--help"]).unwrap_err();
+            assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp, "{}", l);
         }
     }
 }

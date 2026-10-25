@@ -3,7 +3,6 @@ use crate::etcdpb::etcdserverpb::kv_server::{Kv, KvServer};
 use crate::etcdpb::etcdserverpb::ResponseHeader;
 use crate::queue::{Queue};
 use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
-use rust_i18n::t;
 use slog::{warn, error, info, Logger};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
@@ -45,6 +44,8 @@ impl EtcdNode {
     pub async fn init(cfg: EtcdConfig, log: Logger,
       #[cfg(feature = "tracer")] tracer: Option<opentelemetry_sdk::trace::SdkTracer>,
     ) -> Result<Self, String> {
+        // [i18n] the logger's `lang`, o!("lang" => "ru"), is the messages' language
+        crate::i18n::set_logger_lang(crate::i18n::lang_of(&log));
         let node_id = parse_uuid(&cfg.node)?;
         // [peering] An EMPTY cluster uuid is not "unconfigured", it is "a
         // cluster of one that nobody else can join".
@@ -57,11 +58,7 @@ impl EtcdNode {
         // instead, once, at startup.
         let cluster_id = if cfg.cluster.trim().is_empty() {
             let id = parse_uuid(&cfg.cluster)?;
-            error!(log, "{}no cluster uuid configured: this node invented {} for itself, \
-                and every other node invents its own - so NO peer will ever be accepted \
-                (peering compares cluster ids) and this kv is local to this node. Set the \
-                cluster uuid in the configuration to make the etcd surface cluster-wide.",
-                LP, id);
+            error!(log, "{}{}", LP, tr!("cluster.no_uuid", id = id));
             id
         } else {
             parse_uuid(&cfg.cluster)?
@@ -111,9 +108,9 @@ impl EtcdNode {
             let pol = c.policy.read().await.clone();
             match c.peers.read().await.announce_and_sync(my_urls, &c.vault, &pol, &log).await {
                 Ok(n) => if n > 0 {
-                    info!(log, "{}startup sync: loaded {} keys", LP, n);
+                    info!(log, "{}{}", LP, tr!("cluster.start_sync", count = n));
                 },
-                Err(e) => info!(log, "{}startup sync skipped: {}", LP, e),
+                Err(e) => info!(log, "{}{}", LP, tr!("cluster.start_sync_skipped", err = e)),
             }
         }
 
@@ -152,12 +149,12 @@ impl EtcdNode {
                             *grpc_client.meter.write().await = m.map(crate::metrics::Instruments::new);
                         }
                         EtcdMgmtEvent::Stop => {
-                            info!(grpc_client.log, "{}received Stop event, shutting down event loop", LP);
+                            info!(grpc_client.log, "{}{}", LP, tr!("cluster.stop"));
                             break;
                         }
                         EtcdMgmtEvent::Restart => {
                             let new_term = grpc_client.term.fetch_add(1, Ordering::Relaxed) + 1;
-                            info!(grpc_client.log, "{}restart: term incremented to {}", LP, new_term);
+                            info!(grpc_client.log, "{}{}", LP, tr!("cluster.restart", term = new_term));
                             let cfg = grpc_client.cfg.read().await;
                             let my_urls: Vec<String> = cfg.listen_client_urls
                                 .split(',')
@@ -174,15 +171,15 @@ impl EtcdNode {
                             match grpc_client.peers.read().await
                                 .announce_and_sync(my_urls, &grpc_client.vault, &pol, &grpc_client.log).await {
                                 Ok(n) => if n > 0 {
-                                    info!(grpc_client.log, "{}restart sync: loaded {} keys", LP, n);
+                                    info!(grpc_client.log, "{}{}", LP, tr!("cluster.restart_sync", count = n));
                                 },
-                                Err(e) => info!(grpc_client.log, "{}restart sync skipped: {}", LP, e),
+                                Err(e) => info!(grpc_client.log, "{}{}", LP, tr!("cluster.restart_sync_skipped", err = e)),
                             }
                         }
                         EtcdMgmtEvent::Pause(secs) => {
-                            info!(grpc_client.log, "{}pausing for {} seconds", LP, secs);
+                            info!(grpc_client.log, "{}{}", LP, tr!("cluster.pause", secs = secs));
                             tokio::time::sleep(tokio::time::Duration::from_secs(secs as u64)).await;
-                            info!(grpc_client.log, "{}resumed after pause", LP);
+                            info!(grpc_client.log, "{}{}", LP, tr!("cluster.resume"));
                         }
                     }
                 }
@@ -234,10 +231,8 @@ impl EtcdNode {
                     quiet = quiet.saturating_add(1);
                     if quiet == 1 || quiet % EMPTY_PEERS_EVERY == 0 {
                         let cfg = node.cfg.read().await;
-                        warn!(node.log, "{}no etcd peers to connect to, so every key written \
-                            here stays here. peers() takes initial_advertise_peer_urls \
-                            [{}] minus listen_client_urls [{}] and keeps only http:// \
-                            entries.", LP, cfg.initial_advertise_peer_urls, cfg.listen_client_urls);
+                        warn!(node.log, "{}{}", LP, tr!("cluster.no_peers",
+                            advertised = cfg.initial_advertise_peer_urls, listen = cfg.listen_client_urls));
                     }
                     continue;
                 }
@@ -248,13 +243,13 @@ impl EtcdNode {
                 let set: HashSet<&str> = urls.iter().map(|s| s.as_str()).collect();
                 // [lockup] dialled with the peer lock released - see `add_peers`
                 match node.add_peers(set).await {
-                    n if n > 0 => info!(node.log, "{}peer retry: connected {} more peer(s), \
-                        {} of {} total", LP, n, node.peers.read().await.connected(), urls.len()),
+                    n if n > 0 => info!(node.log, "{}{}", LP, tr!("cluster.retry_connected",
+                        count = n, connected = node.peers.read().await.connected(), total = urls.len())),
                     // At WARN, not debug: this is a cluster that cannot share a
                     // key, and the fixture (and the guide) run at log_level
                     // "warning" - a diagnosis nobody can see is not one.
-                    _ => warn!(node.log, "{}peer retry: still {} of {} peer(s) connected, \
-                        none of {:?} answered", LP, have, urls.len(), urls),
+                    _ => warn!(node.log, "{}{}", LP, tr!("cluster.retry_none",
+                        connected = have, total = urls.len(), urls = format!("{:?}", urls))),
                 }
             }
         });
@@ -267,27 +262,35 @@ impl EtcdNode {
 
         let addrs = self.cfg.read().await.listen_client_urls.clone();
         let addrsv: Vec<&str> = addrs.split(",").collect();
-        let adr: Vec<&str> = if addrsv[0].starts_with("http") {
-            let url: Vec<&str> = addrsv[0].split("//").collect();
-            url[1].split(":").collect()
+        // `host:port`, the scheme dropped: the numeric branch below parsed the
+        // whole url, so `http://127.0.0.1:2379` - the form agent.md asks for -
+        // was refused as "invalid socket address syntax"
+        let hostport = if addrsv[0].starts_with("http") {
+            addrsv[0].split_once("//").map(|(_, r)| r).unwrap_or(addrsv[0])
         } else {
-            addrsv[0].split(":").collect()
+            addrsv[0]
         };
+        let adr: Vec<&str> = hostport.split(":").collect();
         let bind = adr[0];
         let adr = if bind.chars().next().unwrap_or(' ').is_numeric() {
-            addrsv[0].parse::<SocketAddr>().map_err(|e| format!("parsing {}: {}", addrs, e))?
+            hostport.parse::<SocketAddr>().map_err(|e| tr!("cluster.listen_addr", url = addrs, err = e))?
         } else {
-            let port = adr[1].parse::<u16>().map_err(|e| format!("expected port in {}: {}", addrs, e))?;
+            // no port at all is the same error as a bad one, not an index panic
+            let port = adr.get(1).copied().unwrap_or("").parse::<u16>()
+                .map_err(|e| tr!("cluster.listen_port", url = addrs, err = e))?;
 
-            let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind).expect(format!("Binding to {}", bind).as_str()).collect();
+            // an Err, not a panic: `serve` already answers Result, and a name that
+            // does not resolve must not take an embedder's task down with it
+            let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind)
+                .map_err(|e| tr!("cluster.resolve", host = bind, err = e))?.collect();
             if ips.len() == 0 {
-                return Err(format!("No IpAddr found {}", bind));
+                return Err(tr!("cluster.no_ip", host = bind));
             }
             SocketAddr::new(ips[0], port)
         };
         let name = self.cfg.read().await.name.clone();
 
-        info!(self.log, "{}Starting server [{}] at: {}", LP, name, addrs);
+        info!(self.log, "{}{}", LP, tr!("cluster.starting", name = name, url = addrs));
         tokio::spawn(async move {
             match srv.serve(adr) // .serve_with_incoming_shutdown(uds_stream, rx.map(drop) )
                 .await {
@@ -295,7 +298,7 @@ impl EtcdNode {
                     println!("bye");
                 }
                 Err(e) => {
-                    eprintln!("{} {}", t!("error"), e);
+                    eprintln!("{}", tr!("cluster.serve", err = e));
                     println!();
                     // println!("{}", arg_config::usage());
                     std::process::exit(10);
@@ -331,7 +334,7 @@ impl EtcdNode {
         // [lockup] dialled with the peer lock released - see `add_peers`
         let cnt = self.add_peers(peers).await;
         if cnt > 0 {
-            info!(self.log, "{}reconfigure: added {} peer(s)", LP, cnt);
+            info!(self.log, "{}{}", LP, tr!("cluster.reconfigure", count = cnt));
         }
 
         if cfg.term > 0 {
@@ -606,7 +609,7 @@ pub struct WatcherConsumer {
 fn parse_uuid(value: &String) -> Result<u64, String> {
     let (a, b) = if value.len() > 0 {
         Uuid::from_str(value.as_str())
-            .map_err(|e| format!("parsing to uuid: [{}]: {}", value, e))?
+            .map_err(|e| tr!("cluster.uuid", value = value, err = e))?
     } else {
         Uuid::new_v4()
     }.as_u64_pair();
@@ -666,6 +669,255 @@ mod header_tests {
 		let c = node("44444444-4444-5444-8444-444444444444",
 		             "55555555-5555-5555-8555-555555555555").await;
 		assert_ne!(a.response_header().cluster_id, c.response_header().cluster_id);
+	}
+}
+
+#[cfg(test)]
+mod event_tests {
+	//! `node.event`, the embedder's channel into a running node (agent.md,
+	//! "Embedding it"): `Data` applies a put, delete or txn as a client's would;
+	//! `Mgmt` reconfigures, restarts, pauses and stops.
+	use super::*;
+	use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, RequestOp, TxnRequest, request_op};
+	use crate::{EtcdEvents, EtcdMgmtEvent, KvEvent};
+
+	async fn node() -> EtcdNode {
+		let mut cfg = crate::cli::EtcdConfig::with_defaults();
+		cfg.cluster = "11111111-1111-5111-8111-111111111111".to_string();
+		cfg.listen_client_urls = "127.0.0.1:0".to_string();
+		EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+			#[cfg(feature = "tracer")] None).await.unwrap()
+	}
+
+	fn put(k: &str, v: &str) -> PutRequest {
+		PutRequest { key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec(), ..Default::default() }
+	}
+
+	/// Poll until `f` holds, for up to two seconds.
+	async fn until<F, Fut>(f: F) -> bool where F: Fn() -> Fut, Fut: std::future::Future<Output = bool> {
+		for _ in 0..100 {
+			if f().await { return true; }
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		false
+	}
+
+	#[tokio::test]
+	async fn data_events_apply_puts_deletes_and_txns() {
+		let n = node().await;
+		n.event.send(EtcdEvents::Data(KvEvent::Put(put("/e/a", "1")))).await.unwrap();
+		n.event.send(EtcdEvents::Data(KvEvent::Put(put("/e/b", "2")))).await.unwrap();
+		n.event.send(EtcdEvents::Data(KvEvent::Delete(DeleteRangeRequest {
+			key: b"/e/a".to_vec(), ..Default::default() }))).await.unwrap();
+		n.event.send(EtcdEvents::Data(KvEvent::Txn(TxnRequest {
+			success: vec![RequestOp { request: Some(request_op::Request::RequestPut(put("/e/c", "3"))) }],
+			..Default::default() }))).await.unwrap();
+		assert!(until(|| async { n.kv_get(b"/e/c").await.is_some() }).await, "the txn was applied");
+		assert_eq!(n.kv_get(b"/e/a").await, None, "the delete was applied");
+		assert_eq!(n.kv_get(b"/e/b").await.as_deref(), Some(&b"2"[..]));
+	}
+
+	/// A restart is term + 1 and a fresh sync - with no peers, nothing to load.
+	#[tokio::test]
+	async fn a_restart_bumps_the_term() {
+		let n = node().await;
+		assert_eq!(n.response_header().raft_term, 1);
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Restart)).await.unwrap();
+		assert!(until(|| async { n.response_header().raft_term == 2 }).await);
+		n.kv_put(b"/after".to_vec(), b"restart".to_vec()).await.unwrap();
+		assert_eq!(n.kv_get(b"/after").await.as_deref(), Some(&b"restart"[..]), "and it keeps serving");
+	}
+
+	/// A pause holds the event loop: an event sent during it waits until it ends.
+	#[tokio::test]
+	async fn a_pause_delays_the_events_behind_it() {
+		let n = node().await;
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Pause(1))).await.unwrap();
+		n.event.send(EtcdEvents::Data(KvEvent::Put(put("/paused", "v")))).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert_eq!(n.kv_get(b"/paused").await, None, "still paused");
+		assert!(until(|| async { n.kv_get(b"/paused").await.is_some() }).await, "applied after the pause");
+	}
+
+	/// Stop ends the event loop: later events are not applied, and the channel
+	/// closes - while the node itself still serves direct calls.
+	#[tokio::test]
+	async fn stop_ends_the_event_loop() {
+		let n = node().await;
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Stop)).await.unwrap();
+		assert!(until(|| async { n.event.is_closed() }).await, "the loop dropped its end");
+		assert!(n.event.send(EtcdEvents::Data(KvEvent::Put(put("/late", "v")))).await.is_err());
+		n.kv_put(b"/direct".to_vec(), b"v".to_vec()).await.unwrap();
+		assert!(n.kv_get(b"/direct").await.is_some());
+	}
+
+	/// A reconfigure applies a whole config: the term, the name, and the prefix
+	/// policy - here a `readonly_prefix` the API may no longer write.
+	#[tokio::test]
+	async fn a_reconfigure_replaces_the_policy_term_and_name() {
+		let n = node().await;
+		n.put(tonic::Request::new(put("/ro/before", "v"))).await.expect("writable before");
+
+		let mut c = crate::cli::EtcdConfig::with_defaults();
+		c.term = 7;
+		c.name = "renamed".to_string();
+		c.readonly_prefix = "/ro/".to_string();
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
+		assert!(until(|| async { n.cfg.read().await.name == "renamed" }).await);
+		assert_eq!(n.response_header().raft_term, 7);
+
+		let e = n.put(tonic::Request::new(put("/ro/after", "v"))).await.unwrap_err();
+		assert_eq!(e.code(), tonic::Code::PermissionDenied);
+		let e = n.delete_range(tonic::Request::new(DeleteRangeRequest {
+			key: b"/ro/".to_vec(), range_end: b"/ro0".to_vec(), ..Default::default() })).await.unwrap_err();
+		assert_eq!(e.code(), tonic::Code::PermissionDenied, "a range reaching a readonly key too");
+		// ...while the embedder still writes there, in-process
+		n.kv_put(b"/ro/embedder".to_vec(), b"v".to_vec()).await.unwrap();
+		assert!(n.kv_get(b"/ro/embedder").await.is_some());
+
+		// a term of 0 in a reconfigure leaves the running term alone
+		let mut c = crate::cli::EtcdConfig::with_defaults();
+		c.term = 0;
+		c.name = "again".to_string();
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
+		assert!(until(|| async { n.cfg.read().await.name == "again" }).await);
+		assert_eq!(n.response_header().raft_term, 7);
+	}
+
+	/// With the `tracer` feature the host hands over a tracer and a meter; the
+	/// KV calls run under them and keep answering.
+	#[cfg(feature = "tracer")]
+	#[tokio::test]
+	async fn a_tracer_and_a_meter_can_be_set_and_cleared() {
+		use opentelemetry::trace::TracerProvider;
+		use crate::etcdpb::etcdserverpb::RangeRequest;
+		let n = node().await;
+		let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder().build().tracer("etcd-test");
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Tracer(Some(tracer)))).await.unwrap();
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Meter(Some(opentelemetry::global::meter("etcd-test"))))).await.unwrap();
+		assert!(until(|| async { n.meter.read().await.is_some() }).await);
+		assert!(n.tracer.read().await.is_some());
+
+		n.put(tonic::Request::new(put("/t/k", "v"))).await.unwrap();
+		let got = n.range(tonic::Request::new(RangeRequest { key: b"/t/k".to_vec(), ..Default::default() }))
+			.await.unwrap().into_inner();
+		assert_eq!(got.kvs[0].value, b"v");
+		n.txn(tonic::Request::new(TxnRequest::default())).await.unwrap();
+		n.delete_range(tonic::Request::new(DeleteRangeRequest { key: b"/t/k".to_vec(), ..Default::default() }))
+			.await.unwrap();
+
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Meter(None))).await.unwrap();
+		n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Tracer(None))).await.unwrap();
+		assert!(until(|| async { n.tracer.read().await.is_none() }).await);
+		assert!(n.meter.read().await.is_none());
+	}
+
+	/// The in-process KV an embedder uses.
+	#[tokio::test]
+	async fn the_embedder_api_reads_and_writes_the_store() {
+		let n = node().await;
+		n.kv_put(b"/svc/a".to_vec(), b"1".to_vec()).await.unwrap();
+		n.kv_put(b"/svc/b".to_vec(), b"2".to_vec()).await.unwrap();
+		n.kv_put(b"/other".to_vec(), b"3".to_vec()).await.unwrap();
+		let mut under = n.kv_prefix(b"/svc/").await;
+		under.sort();
+		assert_eq!(under, vec![(b"/svc/a".to_vec(), b"1".to_vec()), (b"/svc/b".to_vec(), b"2".to_vec())]);
+		n.kv_delete(b"/svc/a".to_vec()).await.unwrap();
+		assert_eq!(n.kv_get(b"/svc/a").await, None);
+		assert_eq!(n.kv_prefix(b"/svc/").await.len(), 1);
+		assert_eq!(n.get_peer_urls().await, "", "a lone node has no peers");
+		assert_eq!(n.queue_dispatcher("/q/nothing").await, None, "no queue, no dispatcher");
+	}
+
+	fn free_port() -> u16 {
+		std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+	}
+
+	async fn ready(port: u16) -> bool {
+		for _ in 0..100 {
+			if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() { return true; }
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		false
+	}
+
+	async fn node_on(listen: &str) -> EtcdNode {
+		let mut cfg = crate::cli::EtcdConfig::with_defaults();
+		cfg.cluster = "11111111-1111-5111-8111-111111111111".to_string();
+		cfg.listen_client_urls = listen.to_string();
+		EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+			#[cfg(feature = "tracer")] None).await.unwrap()
+	}
+
+	/// `serve` binds the first listen url, written as `http://ip:port`, as
+	/// `ip:port`, or as `host:port` resolved by name.
+	#[tokio::test]
+	async fn serve_binds_each_url_form() {
+		for form in ["http://127.0.0.1:{}", "127.0.0.1:{}", "localhost:{},http://127.0.0.1:1"] {
+			let port = free_port();
+			let n = node_on(&form.replace("{}", &port.to_string())).await;
+			n.serve().await.unwrap();
+			assert!(ready(port).await, "{} never bound", form);
+			let mut c = crate::etcdpb::etcdserverpb::maintenance_client::MaintenanceClient::connect(
+				format!("http://127.0.0.1:{}", port)).await.unwrap();
+			let s = c.status(crate::etcdpb::etcdserverpb::StatusRequest::default()).await.unwrap().into_inner();
+			assert_eq!(s.header.unwrap().cluster_id, n.cluster_id, "{}", form);
+		}
+	}
+
+	/// A listen url `serve` cannot use is an error, not a panic.
+	#[tokio::test]
+	async fn serve_refuses_an_unusable_url() {
+		let e = node_on("localhost:port").await.serve().await.unwrap_err();
+		assert!(e.starts_with("ETCD-E012 ") && e.contains("localhost:port"), "{}", e);
+		let e = node_on("http://localhost").await.serve().await.unwrap_err();
+		assert!(e.starts_with("ETCD-E012 ") && e.contains("http://localhost"), "no port at all: {}", e);
+		let e = node_on("127.0.0.1").await.serve().await.unwrap_err();
+		assert!(e.starts_with("ETCD-E011 ") && e.contains("127.0.0.1"), "{}", e);
+		let e = node_on("no-such-host.invalid:2379").await.serve().await.unwrap_err();
+		assert!(e.starts_with("ETCD-E013 ") && e.contains("no-such-host.invalid"), "{}", e);
+	}
+
+	/// `add_all_services` mounts every etcd service on the embedder's own
+	/// router - Auth included, which `serve` adds on its own.
+	#[tokio::test]
+	async fn add_all_services_mounts_the_etcd_api_on_a_shared_router() {
+		use crate::etcdpb::etcdserverpb::{auth_client::AuthClient, kv_client::KvClient, AuthEnableRequest};
+		let n = node().await;
+		let port = free_port();
+		let router = n.add_all_services(Server::builder().add_routes(tonic::service::Routes::default()));
+		let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+		tokio::spawn(async move { let _ = router.serve(addr).await; });
+		assert!(ready(port).await);
+		let url = format!("http://127.0.0.1:{}", port);
+		let mut kv = KvClient::connect(url.clone()).await.unwrap();
+		kv.put(put("/shared", "port"), None).await.unwrap();
+		assert_eq!(n.kv_get(b"/shared").await.as_deref(), Some(&b"port"[..]));
+		let e = AuthClient::connect(url).await.unwrap()
+			.auth_enable(AuthEnableRequest::default()).await.unwrap_err();
+		assert_eq!(e.code(), tonic::Code::Unimplemented, "Auth is there, and unimplemented");
+	}
+
+	#[test]
+	fn a_node_id_must_be_a_uuid_or_nothing() {
+		let e = parse_uuid(&"not-a-uuid".to_string()).unwrap_err();
+		assert!(e.starts_with("ETCD-E016 ") && e.contains("[not-a-uuid]"), "{}", e);
+		let a = parse_uuid(&"22222222-2222-5222-8222-222222222222".to_string()).unwrap();
+		assert_eq!(a, parse_uuid(&"22222222-2222-5222-8222-222222222222".to_string()).unwrap(), "stable");
+		assert_ne!(parse_uuid(&String::new()).unwrap(), parse_uuid(&String::new()).unwrap(),
+			"nothing is a fresh random id each time");
+	}
+
+	/// An empty cluster uuid still starts a node - one that peers with nobody.
+	#[tokio::test]
+	async fn an_empty_cluster_uuid_invents_one() {
+		let mut cfg = crate::cli::EtcdConfig::with_defaults();
+		cfg.listen_client_urls = "127.0.0.1:0".to_string();
+		let a = EtcdNode::init(cfg.clone(), slog::Logger::root(slog::Discard, slog::o!()),
+			#[cfg(feature = "tracer")] None).await.unwrap();
+		let b = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+			#[cfg(feature = "tracer")] None).await.unwrap();
+		assert_ne!(a.cluster_id, b.cluster_id, "two nodes, two invented clusters");
 	}
 }
 

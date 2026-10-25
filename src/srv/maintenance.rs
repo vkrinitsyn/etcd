@@ -14,7 +14,7 @@ type SnapshotResult<T> = Result<Response<T>, Status>;
 #[async_trait]
 impl Maintenance for EtcdNode {
     async fn alarm(&self, _request: Request<AlarmRequest>) -> Result<Response<AlarmResponse>, Status> {
-        Err(Status::unimplemented("UNIMPL"))
+        Err(Status::unimplemented(tr!("srv.unimplemented")))
     }
 
     async fn status(&self, _request: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {

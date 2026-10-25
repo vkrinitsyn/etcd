@@ -25,6 +25,9 @@ This is an experimental Prof of Concept of the features bellow
 - a queue named `ch:<table>` writes its messages straight into a ClickHouse table
   ([clickhouse.md](clickhouse.md), feature `clickhouse`)
 - no message storage, cluster election, as use another cluster implementation
+- messages, errors and `--help` in English, Russian, French, German, Chinese and
+  Japanese: `LANG`, `etcds::set_lang`, or the embedder's logger `o!("lang" => ..)`;
+  every error starts with its `ETCD-Ennn` code
 - ability to build into another rust application as a component, see [rppd](https://github.com/vkrinitsyn/rppd?tab=readme-ov-file#rppd---rust-python-postgres-discovery)
 
 ## Documentation

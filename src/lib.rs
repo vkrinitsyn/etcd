@@ -5,7 +5,14 @@ use tonic::Status;
 use crate::cli::EtcdConfig;
 use crate::etcdpb::etcdserverpb::{DeleteRangeRequest, PutRequest, TxnRequest, WatchResponse};
 
-rust_i18n::i18n!("locales");
+// [i18n] locales/*.yml, compiled in; a language without a message is English
+rust_i18n::i18n!("locales", fallback = "en");
+
+pub use i18n::{lang, message, set_lang};
+
+// first: tr! is declared there, for the modules below
+#[macro_use]
+mod i18n;
 
 #[cfg(feature = "clickhouse")]
 pub(crate) mod clickhouse;
