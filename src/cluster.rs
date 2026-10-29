@@ -325,10 +325,13 @@ impl EtcdNode {
             // does not resolve must not take an embedder's task down with it
             let ips: Vec<std::net::IpAddr> = dns_lookup::lookup_host(bind)
                 .map_err(|e| tr!("cluster.resolve", host = bind, err = e))?.collect();
-            if ips.len() == 0 {
+            // IPv4 first, as etcd's Go listener: `localhost` resolves to ::1 first
+            // where /etc/hosts has `::1 localhost` (Ubuntu 26.04), and a bind
+            // there only is not reached by a client of 127.0.0.1
+            let Some(ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first()) else {
                 return Err(tr!("cluster.no_ip", host = bind));
-            }
-            SocketAddr::new(ips[0], port)
+            };
+            SocketAddr::new(*ip, port)
         };
         let name = self.cfg.read().await.name.clone();
 
