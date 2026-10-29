@@ -31,8 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # build.rs compiles the etcd protos (tonic-prost-build)
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # build.rs compiles the etcd protos (tonic-prost-build); etcd-client's (a test
+      # dependency, and the bridge's) import google/protobuf/descriptor.proto: libprotobuf-dev
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       - run: cargo test ${{ matrix.features }}
 
   coverage:
@@ -48,7 +49,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       # 77: the line coverage measured (77.16%, all features) when this gate came in, not
       # yet the 90 of diff-doc-rs; raise it as the tests grow
       - run: cargo llvm-cov --all-features --lcov --output-path lcov.info --fail-under-lines 77

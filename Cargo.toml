@@ -73,5 +73,5 @@ slog = { version = "^2.8", features=["default"] }
 tonic-prost-build = "^0.14"
 
 [package.metadata.docs.rs]
-features = ["tls", "tls-roots"]
+all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
