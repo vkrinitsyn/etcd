@@ -37,6 +37,13 @@ const PEER_RETRY_SECS: u64 = 20;
 /// without filling the log of a node deliberately running standalone.
 const EMPTY_PEERS_EVERY: u32 = 30;
 
+/// [q-dead] How often a served connection is probed, over HTTP/2 and TCP. A
+/// client whose host died or was cut off leaves its stream half open, and only
+/// a closed stream frees what a queue consumer was handed (`Queue::release_stream`).
+const KEEPALIVE: Duration = Duration::from_secs(30);
+/// [q-dead] How long a probe may go unanswered before the connection is closed.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub(crate) use crate::peer::EtcdPeerNode;
 
 
@@ -78,6 +85,7 @@ impl EtcdNode {
             cfg: Arc::new(RwLock::new(cfg)),
             vault: Arc::new(Default::default()),
             queues: Arc::new(Default::default()),
+            tombstones: Arc::new(Default::default()),
             observers: Arc::new(Default::default()),
             observer_ranges: Arc::new(Default::default()),
             watchers: Arc::new(Default::default()),
@@ -94,16 +102,7 @@ impl EtcdNode {
         };
         // Announce self to peers and sync KV data from fastest responder
         {
-            let cfg = c.cfg.read().await;
-            let my_urls: Vec<String> = cfg.listen_client_urls
-                .split(',')
-                .filter(|u| !u.is_empty())
-                .map(|u| {
-                    if u.starts_with("http") { u.to_string() }
-                    else { format!("http://{}", u) }
-                })
-                .collect();
-            drop(cfg);
+            let my_urls = client_urls(&c.cfg.read().await.listen_client_urls);
 
             let pol = c.policy.read().await.clone();
             match c.peers.read().await.announce_and_sync(my_urls, &c.vault, &pol, &log).await {
@@ -120,6 +119,7 @@ impl EtcdNode {
         // tonic server with `add_all_services`, so anything spawned in `serve()`
         // is dead code for every real cluster node.
         c.spawn_peer_retry();
+        c.spawn_registry_republish();
         let grpc_client = c.clone();
 
         tokio::spawn(async move {
@@ -155,16 +155,7 @@ impl EtcdNode {
                         EtcdMgmtEvent::Restart => {
                             let new_term = grpc_client.term.fetch_add(1, Ordering::Relaxed) + 1;
                             info!(grpc_client.log, "{}{}", LP, tr!("cluster.restart", term = new_term));
-                            let cfg = grpc_client.cfg.read().await;
-                            let my_urls: Vec<String> = cfg.listen_client_urls
-                                .split(',')
-                                .filter(|u| !u.is_empty())
-                                .map(|u| {
-                                    if u.starts_with("http") { u.to_string() }
-                                    else { format!("http://{}", u) }
-                                })
-                                .collect();
-                            drop(cfg);
+                            let my_urls = client_urls(&grpc_client.cfg.read().await.listen_client_urls);
                             // bound first: a guard in the match scrutinee would be held
                             // for the whole sync, network waits included
                             let pol = grpc_client.policy.read().await.clone();
@@ -214,6 +205,12 @@ impl EtcdNode {
             let mut quiet: u32 = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(PEER_RETRY_SECS)).await;
+                // [q-dead] Whether each peer answers, and the registry format it
+                // reads: a queue consumer's node down past the down timeout has
+                // its consumers withdrawn (`Queue::release_gone`), and an older
+                // member gets the registry in the form it reads. A change of
+                // that form is a join: the registry is written again in it.
+                node.probe_peers().await;
                 let urls: Vec<String> = {
                     let cfg = node.cfg.read().await;
                     cfg.peers().iter().map(|s| s.to_string()).collect()
@@ -255,8 +252,53 @@ impl EtcdNode {
         });
     }
 
+    /// [q-registry] Write this node's queue registry again whenever a peer
+    /// joins - admitted, promoted, or announcing itself (`EtcdCluster::joined`).
+    ///
+    /// The registry is written once, when a consumer registers or a dispatcher
+    /// is claimed, and reaches only the peers receiving at that moment. Nodes
+    /// of one cluster start together, so a consumer is often registered before
+    /// any peer is connected: it was then known to no other node, and a
+    /// producer there held its messages with no consumer to hand them to. It
+    /// stayed hidden while every node consumed (topology 93b_etcd_upsert).
+    ///
+    /// One task, and `Notify` keeps one wake-up at most: joins that come
+    /// together are one write of the registry, not one each.
+    fn spawn_registry_republish(&self) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            let joined = node.peers.read().await.joined();
+            loop {
+                joined.notified().await;
+                node.republish_registry().await;
+            }
+        });
+    }
+
+    /// [q-dead] Probe the peers (`EtcdCluster::probe`). A change of the registry
+    /// form is a join: the registry is written again in the other form. A peer
+    /// that answers again after it was down is a join both ways: this node
+    /// writes its registry, and announces itself so the peer writes its own -
+    /// a consumer of either withdrawn as gone meanwhile is registered again.
+    pub(crate) async fn probe_peers(&self) {
+        let held = self.peers.read().await.handles();
+        let (form, back) = EtcdCluster::probe(held).await;
+        if form || !back.is_empty() {
+            self.peers.read().await.joined().notify_one();
+        }
+        if !back.is_empty() {
+            let my_urls = client_urls(&self.cfg.read().await.listen_client_urls);
+            EtcdCluster::announce(back, my_urls, &self.log).await;
+        }
+    }
+
     pub async fn serve(&self) -> Result<(), String> {
-        let mut srv = Server::builder();
+        // [q-dead] keepalive: see KEEPALIVE. An embedder serving these with
+        // `add_all_services` sets it on its own server.
+        let mut srv = Server::builder()
+            .http2_keepalive_interval(Some(KEEPALIVE))
+            .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+            .tcp_keepalive(Some(KEEPALIVE));
 
         let srv = self.add_services(srv.add_service(AuthServer::new(self.clone())), false);
 
@@ -330,6 +372,9 @@ impl EtcdNode {
     }
 
     async fn reconfigure(&self, cfg: EtcdConfig) {
+        // [q-registry] before `add_peers`: a peer connected now is announced
+        // these urls, not the ones from the start
+        self.cfg.write().await.listen_client_urls = cfg.listen_client_urls.clone();
         let peers = cfg.peers();
         // [lockup] dialled with the peer lock released - see `add_peers`
         let cnt = self.add_peers(peers).await;
@@ -348,6 +393,10 @@ impl EtcdNode {
         if !cfg.clickhouse_url.is_empty() {
             current.clickhouse_url = cfg.clickhouse_url;
             current.clickhouse_db = cfg.clickhouse_db;
+        }
+        // [q-dead] unset in the event: the setting stays
+        if cfg.queue_down_timeout.is_some() {
+            current.queue_down_timeout = cfg.queue_down_timeout;
         }
         current.initial_cluster = cfg.initial_cluster;
         current.initial_cluster_token = cfg.initial_cluster_token;
@@ -397,13 +446,20 @@ impl EtcdNode {
     pub(crate) async fn unicast(&self, request: crate::peer::BroadcastRequest, peer_id: NodeId,
         zone_scoped: Option<&str>) -> bool
     {
+        self.unicast_outcome(request, peer_id, zone_scoped).await == crate::peer::Sent::Taken
+    }
+
+    /// [q-dead] `unicast`, telling a refusal from no answer.
+    pub(crate) async fn unicast_outcome(&self, request: crate::peer::BroadcastRequest, peer_id: NodeId,
+        zone_scoped: Option<&str>) -> crate::peer::Sent
+    {
         let (target, me) = {
             let peers = self.peers.read().await;
             (peers.unicast_target(peer_id, zone_scoped).await, peers.me())
         };
-        let Some(target) = target else { return false };
+        let Some(target) = target else { return crate::peer::Sent::Refused };
         let id = tonic::metadata::MetadataValue::from_str(me.to_string().as_str()).ok();
-        EtcdCluster::peer_request(request, target, id).await
+        EtcdCluster::peer_request_outcome(request, target, id).await
     }
 
     /// [lockup] Dial `clients` with the peer lock released, then hold the ones
@@ -419,7 +475,27 @@ impl EtcdNode {
             return 0;
         }
         let dialled = EtcdCluster::dial(urls, cluster_id, timeout_ms, &log).await;
-        self.peers.write().await.admit(dialled).await
+        let fresh = self.peers.write().await.admit_fresh(dialled).await;
+        // [q-registry] `announce_and_sync` announced this node once, at its
+        // start, to the peers it had then. A peer connected since has not heard
+        // of it: announce it now, and the peer writes its queue registry here.
+        // Spawned: `member_add` lands here too, and must not wait on the peer
+        // it is answering.
+        if !fresh.is_empty() {
+            let my_urls = client_urls(&self.cfg.read().await.listen_client_urls);
+            let (peers, log) = (fresh.clone(), self.log.clone());
+            tokio::spawn(async move { EtcdCluster::announce(peers, my_urls, &log).await; });
+            // [q-dead] ...and withdraw what that peer still places on this node
+            // and this node no longer hosts: kept from before a restart that
+            // could not reach it, a dispatcher there would hold it for good
+            let (node, peers) = (self.clone(), fresh.clone());
+            tokio::spawn(async move {
+                for p in peers {
+                    node.withdraw_stale_at(p).await;
+                }
+            });
+        }
+        fresh.len()
     }
 
     pub(crate) fn response_header(&self) -> ResponseHeader {
@@ -542,6 +618,13 @@ pub struct EtcdNode {
     pub(crate) vault: Arc<RwLock<HashMap<KvKey, crate::kv::Kv>>>,
     pub(crate) queues: Arc<RwLock<HashMap<String, Queue>>>,
 
+    /// [q-dead] The newest tombstone seen from each node for each consumer
+    /// registration key, for `QUEUE_IDLE`: that node's registration of that
+    /// stream, or an older one, arriving after it - the two crossed on the way
+    /// here - is not stored. Kept here, not with the queue: a node keeps
+    /// registrations of queues it has no `Queue` for.
+    pub(crate) tombstones: Arc<RwLock<HashMap<(KvKey, NodeId), (u64, tokio::time::Instant)>>>,
+
     /// watchers links
     pub(crate) observers: Arc<RwLock<HashMap<KvKey, EtcdObserverType>>>,
 
@@ -561,7 +644,8 @@ pub struct EtcdNode {
 
     /// queue consumers and reqular kv watchers
     pub(crate) watchers: Arc<RwLock<HashMap<ClientId, EtcdClientType>>>,
-    pub(crate) watch_notify: Sender<crate::kv::Kv>,
+    /// [kv-delete] a changed key for the key watchers, `true` when deleted
+    pub(crate) watch_notify: Sender<(crate::kv::Kv, bool)>,
 
     /// cluster nodes (not clients, see node watchers for clients)
     pub(crate) peers: Arc<RwLock<EtcdCluster>>,
@@ -601,9 +685,24 @@ pub struct EtcdClientNode {
 pub struct WatcherConsumer {
     pub(crate) key: KvKey,
     pub(crate) client: Sender<Result<WatchResponse, Status>>,
+    /// [q-dead] a queue consumer's stream generation (`route::Registration`);
+    /// 0 outside a queue
+    pub(crate) generation: u64,
 
 }
 
+
+/// This node's client urls, as a peer dials them: `listen_client_urls`, each
+/// with a scheme.
+fn client_urls(listen: &str) -> Vec<String> {
+    listen.split(',')
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            if u.starts_with("http") { u.to_string() }
+            else { format!("http://{}", u) }
+        })
+        .collect()
+}
 
 #[inline]
 fn parse_uuid(value: &String) -> Result<u64, String> {

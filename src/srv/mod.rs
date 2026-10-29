@@ -3,7 +3,7 @@ use tonic::metadata::MetadataMap;
 pub mod parking;
 mod kv;
 mod lease;
-mod watch;
+pub(crate) mod watch;
 mod maintenance;
 
 

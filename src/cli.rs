@@ -141,6 +141,81 @@ pub struct EtcdConfig {
     #[arg(long, required = false, default_value = "")]
     pub clickhouse_db: String,
 
+    /// [q-dead] Seconds a queue consumer's node may be down - not reachable as a
+    /// peer by the dispatching node - before its consumers count as gone: their
+    /// registrations withdrawn on their behalf, and what they were handed sent to
+    /// the next consumer (at least once, for those). Unset: 300. 0: never.
+    #[arg(long, required = false)]
+    pub queue_down_timeout: Option<u64>,
+
+    /// [bridge] The etcd queue the binary's bridge consumes and sends to `bridge_to`,
+    /// acknowledging each message once the broker took it. Feature `bridge`; one of
+    /// `bridge_queue`, `bridge_prefix`, `bridge_listen`. Empty: no bridge.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_queue: String,
+
+    /// [bridge] Instead of a queue, a key prefix (`/config/`) whose puts and deletes
+    /// the bridge sends; nothing acknowledged, a change while the watch is down missed.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_prefix: String,
+
+    /// [bridge] Be the AMQP peer on `host:port`: a JMS client's consumer of queue X
+    /// is an etcd consumer of `/q/X`. No `bridge_to` then.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_listen: String,
+
+    /// [bridge] The user a client of `bridge_listen` logs in as (SASL PLAIN);
+    /// anonymous when empty.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_listen_user: String,
+
+    /// [bridge] That user's password.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_listen_password: String,
+
+    /// [bridge] The broker: amqp://, amqps://, mqtt://, mqtts://, kafka:// or
+    /// kafkas://, then `[user:password@]host:port` (Kafka: `host:port,host:port`).
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_to: String,
+
+    /// [bridge] The AMQP address (JMS queue), MQTT topic prefix or Kafka topic.
+    /// Empty: the queue's name, or the prefix's (`/a/b/` is `a.b`).
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_address: String,
+
+    /// [bridge] This consumer's UUID in the queue registry; keep it across restarts
+    /// to keep one registration. Empty: a new one at each start.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_consumer: String,
+
+    /// [bridge] The JMS message type: auto (text when the value is UTF-8), text or bytes.
+    #[arg(long, required = false, default_value = "auto")]
+    pub bridge_body: String,
+
+    /// [bridge] AMQP: JMSXGroupID is the message key, each key pinned to one consumer.
+    #[arg(long, required = false, default_value = "false")]
+    pub bridge_group_by_key: bool,
+
+    /// [bridge] Add the CloudEvents attributes, in the target protocol's binding.
+    #[arg(long, required = false, default_value = "false")]
+    pub bridge_cloudevents: bool,
+
+    /// [bridge] The CloudEvents `type`. Empty: etcd.queue.message.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_ce_type: String,
+
+    /// [bridge] An etcd queue for messages no broker will take. Empty: they are retried.
+    #[arg(long, required = false, default_value = "")]
+    pub bridge_dead_letter: String,
+
+    /// [bridge] Deliveries held between etcd and the broker (0: 64).
+    #[arg(long, required = false, default_value = "64")]
+    pub bridge_buffer: u32,
+
+    /// [bridge] Seconds to wait for the broker: to connect, and to take one message (0: 30).
+    #[arg(long, required = false, default_value = "30")]
+    pub bridge_send_timeout: u64,
+
     /// Maximum number of snapshot files to retain (0 is unlimited).
     #[arg(long, required = false, default_value = "5")]
     pub max_snapshots: u32,
@@ -589,6 +664,21 @@ impl EtcdCliArgs {
 }
 
 impl EtcdConfig {
+    /// [q-dead] `queue_down_timeout` as a duration: 300 s unset, `None` for 0
+    /// (never).
+    pub fn down_timeout(&self) -> Option<std::time::Duration> {
+        match self.queue_down_timeout {
+            None => Some(std::time::Duration::from_secs(300)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(s)),
+        }
+    }
+
+    /// [bridge] a bridge asked for: a queue, a prefix, a listener or a broker named
+    pub fn bridge_given(&self) -> bool {
+        [&self.bridge_queue, &self.bridge_prefix, &self.bridge_listen, &self.bridge_to].iter().any(|s| !s.trim().is_empty())
+    }
+
     /// Every setting at its clap `default_value`.
     pub fn with_defaults() -> Self {
         <EtcdCliArgs as Parser>::parse_from(["etcd"]).config

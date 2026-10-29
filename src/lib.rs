@@ -16,6 +16,9 @@ mod i18n;
 
 #[cfg(feature = "clickhouse")]
 pub(crate) mod clickhouse;
+/// [bridge] a queue or key prefix to a broker: JMS over AMQP 1.0, MQTT 5, Kafka
+#[cfg(feature = "bridge")]
+pub mod bridge;
 #[cfg(feature = "tracer")]
 mod metrics;
 pub mod etcdpb;

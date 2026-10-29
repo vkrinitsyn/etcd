@@ -7,6 +7,7 @@ use slog::*;
 use tokio::{
     sync::Mutex,
     sync::mpsc::{channel},
+    sync::Notify,
     sync::RwLock,
     time::Instant,
 };
@@ -43,6 +44,12 @@ pub struct EtcdCluster {
     node_id: NodeId,
     cluster_id: NodeId,
     log: Logger,
+
+    /// [q-registry] Signalled when a peer starts to receive this node's writes:
+    /// admitted, or promoted. The queue registry is written once, when a
+    /// consumer registers or a dispatcher is claimed, and a peer that was not
+    /// receiving then never learns it - see `EtcdNode::republish_registry`.
+    joined: Arc<Notify>,
 }
 
 /// Lifecycle state of a peer node in the cluster.
@@ -70,6 +77,62 @@ pub(crate) struct EtcdPeerNode {
     pub(crate) kv_client: Arc<Mutex<KvClient<Channel>>>,
     mt_client: Arc<Mutex<MaintenanceClient<Channel>>>,
     cluster_client: Arc<Mutex<ClusterClient<Channel>>>,
+    /// [q-dead] since when this peer has not answered - a call or a probe
+    /// (`EtcdCluster::probe`) - or `None` while it answers
+    pub(crate) down_since: Option<Instant>,
+    /// [q-dead] the queue registry's format this peer reads (`registry_of` its
+    /// `status` version): 1 an older node's, the bare node id
+    pub(crate) registry: u32,
+    /// [q-dead] it answered again after it was down, and the probe has not yet
+    /// made that a join (`EtcdCluster::probe`)
+    pub(crate) recovered: bool,
+}
+
+/// [q-dead] The queue registry's format this node writes and reads:
+/// `<node>;g=<generation>;s=<start>`. 1 is the bare node id of an older node.
+pub(crate) const REGISTRY: u32 = 2;
+
+/// [q-dead] What this node answers `status` with: `rust` as before, then its
+/// crate version and its registry's format - how a peer tells an older node.
+pub(crate) fn status_version() -> String {
+    format!("rust etcds/{} registry/{}", env!("CARGO_PKG_VERSION"), REGISTRY)
+}
+
+/// [q-dead] The registry format a peer reads, from its `status` version. An
+/// older node answers `rust` and nothing more: 1.
+///
+/// The cheapest reliable signal: every node of every version answers `status`,
+/// a node asks it of each peer it connects to, and the probe asks it again
+/// (`EtcdCluster::probe`) - so an upgraded peer is seen as such once it is back.
+pub(crate) fn registry_of(version: &str) -> u32 {
+    version.split_whitespace()
+        .find_map(|w| w.strip_prefix("registry/"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// A peer that answered `status` for this cluster: its id, url, channel, client,
+/// and [q-dead] the version it answered with.
+pub(crate) type Dialled = (NodeId, String, Channel, MaintenanceClient<Channel>, String);
+
+/// [q-dead] How one request to one peer went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// it answered yes
+    Taken,
+    /// it answered no, or could not be reached, or is no target: not carried out
+    Refused,
+    /// no answer within `PEER_RPC_TIMEOUT`: carried out or not, nobody here knows
+    NoAnswer,
+    /// not connected: not carried out (`peer_request_outcome` reports it as
+    /// `Refused`, and marks the peer down)
+    Unreachable,
+}
+
+/// [q-dead] A failed call that did not reach the peer, as opposed to one it
+/// answered with an error.
+fn unreachable(e: &Status) -> bool {
+    matches!(e.code(), tonic::Code::Unavailable) || e.message().contains("transport error")
 }
 
 /// request and corresponding api calls to perform a broadcast
@@ -144,6 +207,7 @@ impl EtcdCluster {
             node_id,
             cluster_id,
             log: log.clone(),
+            joined: Arc::new(Notify::new()),
         };
         
         let peers = cfg.peers();
@@ -160,6 +224,11 @@ impl EtcdCluster {
     /// [peer-retry] How many peers are currently connected.
     pub(crate) fn connected(&self) -> usize {
         self.peers.len()
+    }
+
+    /// [q-registry] The signal that a peer joined: admitted, or promoted.
+    pub(crate) fn joined(&self) -> Arc<Notify> {
+        self.joined.clone()
     }
 
     /// [lockup] The urls in `clients` this node does not hold a peer for yet.
@@ -184,7 +253,7 @@ impl EtcdCluster {
     /// waits behind it. `add_connections` used to do exactly this inside
     /// `peers.write()`, with no limit on `status`.
     pub(crate) async fn dial(urls: Vec<String>, cluster_id: NodeId, connect_timeout_ms: u64, log: &Logger)
-        -> Vec<(NodeId, String, Channel, MaintenanceClient<Channel>)>
+        -> Vec<Dialled>
     {
         let connect_timeout_ms = if connect_timeout_ms > 0 { connect_timeout_ms } else { 1000 };
         let mut found = Vec::new();
@@ -219,7 +288,7 @@ impl EtcdCluster {
                 None => error!(log, "{}{}", LP, tr!("peer.no_header", url = url)),
                 Some(h) if h.cluster_id != cluster_id => error!(log, "{}{}", LP,
                     tr!("peer.wrong_cluster", url = url, ours = cluster_id, theirs = h.cluster_id)),
-                Some(h) => found.push((h.member_id, url, conn, mt)),
+                Some(h) => found.push((h.member_id, url, conn, mt, status.version.clone())),
             }
         }
         found
@@ -228,10 +297,23 @@ impl EtcdCluster {
     /// [lockup] Hold the dialled peers this node does not hold yet - by peer id,
     /// since one node can be reached under more than one url. Short and free of
     /// network waits: the only part of adding a peer that needs the lock.
-    pub(crate) async fn admit(&mut self, dialled: Vec<(NodeId, String, Channel, MaintenanceClient<Channel>)>) -> usize {
+    pub(crate) async fn admit(&mut self, dialled: Vec<Dialled>) -> usize {
+        self.admit_fresh(dialled).await.len()
+    }
+
+    /// [q-registry] `admit`, returning the peers it added, so a caller can
+    /// announce this node to them.
+    pub(crate) async fn admit_fresh(&mut self, dialled: Vec<Dialled>)
+        -> Vec<EtcdPeerNodeType>
+    {
         self.recently_added.retain(|_, t| t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS));
-        let mut cnt = 0;
-        for (member_id, url, conn, mt) in dialled {
+        let mut fresh = Vec::new();
+        for (member_id, url, conn, mt, version) in dialled {
+            // [q-registry] Never this node itself: an announced url such as
+            // `localhost:2379` or `0.0.0.0:2379` dials back to the node that got it.
+            if member_id == self.node_id {
+                continue;
+            }
             let mut exists = false;
             for p in &self.peers {
                 if p.lock().await.peer_id == member_id {
@@ -248,7 +330,7 @@ impl EtcdCluster {
                 }
             }
             self.recently_added.insert(member_id, Instant::now());
-            self.peers.push(Arc::new(Mutex::new(EtcdPeerNode {
+            let peer = Arc::new(Mutex::new(EtcdPeerNode {
                 peer_id: member_id,
                 conn: url,
                 // Unzoned until `apply_zones` labels it on
@@ -289,10 +371,19 @@ impl EtcdCluster {
                 kv_client: Arc::new(Mutex::new(KvClient::new(conn.clone()))),
                 mt_client: Arc::new(Mutex::new(mt)),
                 cluster_client: Arc::new(Mutex::new(ClusterClient::new(conn))),
-            })));
-            cnt += 1;
+                down_since: None,
+                registry: registry_of(&version),
+                recovered: false,
+            }));
+            self.peers.push(peer.clone());
+            fresh.push(peer);
         }
-        cnt
+        // [q-registry] a new peer receives writes from now on, and none of the
+        // queue registry written before
+        if !fresh.is_empty() {
+            self.joined.notify_one();
+        }
+        fresh
     }
 
     /// Dial `clients` and hold the ones that answered, in one go - for `connect`
@@ -333,7 +424,7 @@ impl EtcdCluster {
                 PeerState::Spare => {}
             }
         }
-        BroadcastPlan { targets, node_id: self.node_id, log: self.log.clone() }
+        BroadcastPlan { targets, node_id: self.node_id, log: self.log.clone(), joined: self.joined.clone() }
     }
 
     /// One request to one peer.
@@ -355,23 +446,125 @@ impl EtcdCluster {
     /// [lockup] Bounded by `PEER_RPC_TIMEOUT`: a peer that never answers is a
     /// failed send, which the broadcast then counts as one.
     pub(crate) async fn peer_request(request: BroadcastRequest, peer: EtcdPeerNodeType, peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> bool {
+        Self::peer_request_outcome(request, peer, peer_id).await == Sent::Taken
+    }
+
+    /// [q-dead] `peer_request`, telling a refusal from no answer: a call that
+    /// timed out may have been carried out on the other side.
+    pub(crate) async fn peer_request_outcome(request: BroadcastRequest, peer: EtcdPeerNodeType,
+        peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> Sent
+    {
         let mut kv = {
             let node = peer.lock().await;
             let c = node.kv_client.lock().await.clone();
             c
         };
+        // Ok(answered), Err(status) for a call that failed
         let call = async move {
             match request {
                 BroadcastRequest::Kv(br) => {
                     match br {
-                        KvEvent::Put(kr) => kv.put(kr, peer_id).await.is_ok(),
-                        KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.is_ok(),
-                        KvEvent::Txn(kr) => kv.txn(kr, peer_id).await.is_ok(),
+                        KvEvent::Put(kr) => kv.put(kr, peer_id).await.map(|_| ()),
+                        KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.map(|_| ()),
+                        KvEvent::Txn(kr) => kv.txn(kr, peer_id).await.map(|_| ()),
                     }
                 }
             }
         };
-        tokio::time::timeout(PEER_RPC_TIMEOUT, call).await.unwrap_or(false)
+        let sent = match tokio::time::timeout(PEER_RPC_TIMEOUT, call).await {
+            Ok(Ok(())) => Sent::Taken,
+            // [q-dead] it answered no: it is there
+            Ok(Err(e)) if !unreachable(&e) => Sent::Refused,
+            Ok(Err(_)) => Sent::Unreachable,
+            Err(_) => Sent::NoAnswer,
+        };
+        Self::seen(&peer, sent != Sent::Unreachable && sent != Sent::NoAnswer).await;
+        match sent {
+            Sent::Unreachable => Sent::Refused,
+            s => s,
+        }
+    }
+
+    /// [q-dead] Note whether `peer` answered: down from its first call or
+    /// probe that got no answer, up again at the next that does.
+    pub(crate) async fn seen(peer: &EtcdPeerNodeType, answered: bool) {
+        let mut p = peer.lock().await;
+        if answered {
+            if p.down_since.take().is_some() {
+                p.recovered = true;
+            }
+        } else if p.down_since.is_none() {
+            p.down_since = Some(Instant::now());
+        }
+    }
+
+    /// [q-dead] Ask each peer its `status`: whether it answers - how long a
+    /// queue consumer's node has been down (`down_for`) - and the registry
+    /// format it reads (`legacy_registry`). Each peer's lock is held only to
+    /// clone its client. Returns whether the registry format to write changed,
+    /// and the peers that answer again after they were down - noted by this
+    /// probe or by a call since the last: a partition healed, after which each
+    /// side's registry has to be written to the other again (`probe_peers`).
+    pub(crate) async fn probe(peers: Vec<EtcdPeerNodeType>) -> (bool, Vec<EtcdPeerNodeType>) {
+        let before = Self::legacy_of(&peers).await;
+        let mut back = Vec::new();
+        for p in &peers {
+            let mut mt = p.lock().await.mt_client.lock().await.clone();
+            match tokio::time::timeout(PEER_RPC_TIMEOUT, mt.status(StatusRequest::default())).await {
+                Ok(Ok(s)) => {
+                    Self::seen(p, true).await;
+                    p.lock().await.registry = registry_of(&s.into_inner().version);
+                }
+                _ => Self::seen(p, false).await,
+            }
+            let mut n = p.lock().await;
+            if std::mem::take(&mut n.recovered) {
+                back.push(p.clone());
+            }
+        }
+        (before != Self::legacy_of(&peers).await, back)
+    }
+
+    /// [q-dead] Every peer held, for `probe` - which runs with the lock released.
+    pub(crate) fn handles(&self) -> Vec<EtcdPeerNodeType> {
+        self.peers.clone()
+    }
+
+    /// [q-dead] One peer, by id.
+    pub(crate) async fn handle(&self, peer_id: NodeId) -> Option<EtcdPeerNodeType> {
+        for p in &self.peers {
+            if p.lock().await.peer_id == peer_id {
+                return Some(p.clone());
+            }
+        }
+        None
+    }
+
+    /// [q-dead] How long `peer_id` has not answered; `None` while it answers,
+    /// or for a node not held.
+    pub(crate) async fn down_for(&self, peer_id: NodeId) -> Option<Duration> {
+        for p in &self.peers {
+            let n = p.lock().await;
+            if n.peer_id == peer_id {
+                return n.down_since.map(|t| t.elapsed());
+            }
+        }
+        None
+    }
+
+    /// [q-dead] Is a member of an older version here - one that reads only the
+    /// bare node id in the queue registry? Then this node writes that form.
+    pub(crate) async fn legacy_registry(&self) -> bool {
+        Self::legacy_of(&self.peers).await
+    }
+
+    async fn legacy_of(peers: &[EtcdPeerNodeType]) -> bool {
+        for p in peers {
+            if p.lock().await.registry < REGISTRY {
+                return true;
+            }
+        }
+        false
     }
 
     /// Poll the shared deadline until it's set, then sleep until it expires.
@@ -398,6 +591,8 @@ impl EtcdCluster {
             if node.peer_id == peer_id && node.state == PeerState::Spare {
                 info!(log, "{}{}", LP, tr!("peer.state", peer = node.conn, id = peer_id, state = "InProgress"));
                 node.state = PeerState::InProgress;
+                // [q-registry] receives writes again, and missed those made meanwhile
+                self.joined.notify_one();
                 return true;
             }
         }
@@ -411,6 +606,7 @@ impl EtcdCluster {
             if node.peer_id == peer_id && node.state == PeerState::InProgress {
                 info!(log, "{}{}", LP, tr!("peer.state", peer = node.conn, id = peer_id, state = "Online"));
                 node.state = PeerState::Online;
+                self.joined.notify_one();
                 return true;
             }
         }
@@ -597,6 +793,36 @@ impl EtcdCluster {
         Ok(count)
     }
 
+    /// [q-registry] Announce this node to `peers`, as `announce_and_sync` does
+    /// at its start - for a peer connected since, which has not heard of it.
+    ///
+    /// `announce_and_sync` runs once. A peer that was not up then, or that
+    /// restarted and could not reach this node at its own start, is connected
+    /// later by the retry, and nothing told it this node is here: its queue
+    /// registry stayed where it was written. Its `member_add` answers by
+    /// writing that registry again (`srv::parking`).
+    ///
+    /// Network only: each peer's lock is held to clone its client and released
+    /// before the call, and the call is bounded by `PEER_RPC_TIMEOUT`.
+    pub(crate) async fn announce(peers: Vec<EtcdPeerNodeType>, my_client_urls: Vec<String>, log: &Logger) {
+        let add_req = MemberAddRequest {
+            peer_ur_ls: my_client_urls,
+            is_learner: true,
+        };
+        for p in peers {
+            let (mut cc, conn) = {
+                let node = p.lock().await;
+                let cc = node.cluster_client.lock().await.clone();
+                (cc, node.conn.clone())
+            };
+            match tokio::time::timeout(PEER_RPC_TIMEOUT, cc.member_add(add_req.clone())).await {
+                Ok(Ok(_)) => info!(log, "{}{}", LP, tr!("peer.announced", peer = conn)),
+                Ok(Err(e)) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = conn, err = e)),
+                Err(e) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = conn, err = e)),
+            }
+        }
+    }
+
     /// Return (peer_id, conn, state) for all peers.
     pub(crate) async fn peer_info(&self) -> Vec<(NodeId, String, PeerState)> {
         let mut result = Vec::with_capacity(self.peers.len());
@@ -633,6 +859,8 @@ pub(crate) struct BroadcastPlan {
     targets: Vec<(EtcdPeerNodeType, bool)>,
     node_id: NodeId,
     log: Logger,
+    /// [q-registry] `EtcdCluster::joined`, for a peer this send promotes
+    joined: Arc<Notify>,
 }
 
 impl BroadcastPlan {
@@ -663,6 +891,7 @@ impl BroadcastPlan {
             let is_online = *is_online;
 
             tokio::spawn(async move {
+                // [q-dead] `peer_request` notes whether the peer answered
                 let result = tokio::select! {
                     ok = EtcdCluster::peer_request(r, p, peer_id) => ok,
                     _ = EtcdCluster::await_deadline(&deadline_ms, start) => false,
@@ -713,12 +942,20 @@ impl BroadcastPlan {
         // peer only ever left `InProgress` through the `member_promote` admin
         // API, so in an embedded deployment it never left it at all. Replicating
         // one message successfully is the evidence the state machine wanted.
+        let mut promoted = false;
         for idx in &synced_peers {
             let mut peer = self.targets[*idx].0.lock().await;
             if peer.state == PeerState::InProgress {
                 info!(self.log, "{}{}", LP, tr!("peer.replicated_online", peer = peer.conn));
                 peer.state = PeerState::Online;
+                promoted = true;
             }
+        }
+        // [q-registry] A peer that comes Online gets the queue registry again.
+        // Its first writes went out while it was InProgress, and a failed one
+        // there is not counted - so the registry may be exactly what it missed.
+        if promoted {
+            self.joined.notify_one();
         }
 
         if quorum_total == 0 || ok_count as f32 > half {
@@ -883,6 +1120,38 @@ mod state_tests {
         let again = EtcdCluster::dial(vec![alias], cluster_id, ms, &log).await;
         assert_eq!(peers.admit(again).await, 0, "added within RECENT_WINDOW_SECS: not again");
         assert_eq!(peers.connected(), 0);
+    }
+
+    /// [q-dead] The probe tells a peer that answers from one that does not, and
+    /// reads the registry format each reads: 1 for an older node's `rust`.
+    #[tokio::test]
+    async fn the_probe_tells_who_answers_and_what_it_reads() {
+        assert_eq!(registry_of("rust"), 1, "an older node");
+        assert_eq!(registry_of(&status_version()), REGISTRY);
+        let (_a, a_url) = served(A, cfg(A, "", "")).await;
+        let b = init(cfg(B, "127.0.0.1:0", &a_url)).await;
+        let ch = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
+        let mt = MaintenanceClient::new(ch.clone());
+        b.peers.write().await.admit_fresh(vec![(987654321, "http://127.0.0.1:9".to_string(), ch, mt, "rust".to_string())]).await;
+        assert!(b.peers.read().await.legacy_registry().await, "an older member");
+
+        let held = b.peers.read().await.handles();
+        let _ = EtcdCluster::probe(held).await;
+        let a_id = b.peers.read().await.peer_info().await.into_iter().find(|(id, _, _)| *id != 987654321).unwrap().0;
+        assert_eq!(b.peers.read().await.down_for(a_id).await, None, "A answers");
+        assert!(b.peers.read().await.down_for(987654321).await.is_some(), "the one at a closed port does not");
+    }
+
+    /// [q-registry] A node never holds itself as a peer, though a url it is
+    /// told - another node's `localhost:2379` - may reach it.
+    #[tokio::test]
+    async fn a_node_does_not_admit_itself() {
+        let (a, a_url) = served(A, cfg(A, "", "")).await;
+        let (cluster_id, ms, log) = a.peers.read().await.dial_params();
+        let me = EtcdCluster::dial(vec![a_url], cluster_id, ms, &log).await;
+        assert_eq!(me[0].0, a.node_id, "the url reaches this node");
+        assert_eq!(a.peers.write().await.admit(me).await, 0);
+        assert_eq!(a.peers.read().await.connected(), 0);
     }
 
     /// Spare -> InProgress -> Online through `member_promote`, the admin call;

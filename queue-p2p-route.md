@@ -486,7 +486,9 @@ These cannot both be true, so pick one and say so:
 Given point 4 states duplicate execution is duplicate cost, **at-most-once** is
 the consistent choice, and the deadline is a failure trigger rather than a retry
 trigger. This is the same question as the dead-queue TODO in `src/queue.rs` and
-should be settled once, for both.
+should be settled once, for both. *(Settled so: a message goes out again only when
+the stream it was handed to closes - `release_stream`, and that stream's tombstone
+on every other node - never on a timeout, a stall or a cancel.)*
 
 ### Correlation, and the one-segment limit
 
@@ -509,10 +511,10 @@ Per-request reply queues leak one `Queue` per request for the node's lifetime.
 Nothing today expresses "stop". The pieces that exist:
 
 - the requester can delete its consumer key, which is how an ack works;
-- `handled_by` binds a job to one worker but is never cleared except by the ack
-  retaining the message out;
-- `src/queue.rs` has an open TODO for a dead queue - redelivering a message whose
-  consumer died.
+- `handled_by` binds a job to one worker, and is cleared only by the ack
+  retaining the message out, or by its stream closing (`release_stream`);
+- `src/queue.rs` had an open TODO for a dead queue - redelivering a message whose
+  consumer died - which `release_stream` now is.
 
 A cancel is the same problem seen from the other end - both are "this binding is no
 longer valid" - so design it with that TODO rather than separately. What happens
@@ -606,8 +608,8 @@ a size limit that nothing enforces.
   *here*: it may host a consumer, dispatch a queue and produce. The two senses of
   the word are unrelated, which is why this is stated rather than assumed.
 - **Ack semantics.** Nothing in this document changes `handled_by` ownership or the
-  delete-on-consumer-key ack. Redelivery after a dead consumer is a separate TODO
-  in `src/queue.rs`.
+  delete-on-consumer-key ack. Redelivery after a dead consumer is
+  `release_stream` in `src/queue.rs`.
 
 ## Open
 

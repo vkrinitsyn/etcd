@@ -1,6 +1,6 @@
 [package]
 name = "etcds"
-version = "0.21.3"
+version = "0.22.1"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "support@dbinvent.com"]
 edition = "2024"
 readme = "README.md"
@@ -44,12 +44,24 @@ hyper = { version = "^1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "^0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "^0.1", optional = true }
 bytes = { version = "^1", optional = true }
+# the bridge from a queue or key prefix to a broker: JMS over AMQP 1.0, MQTT 5,
+# Kafka (feature "bridge", the bridge_* settings)
+etcd-client = { version = "^0.21", optional = true }
+fe2o3-amqp = { version = "^0.18.4", features = ["acceptor", "rustls"], optional = true }
+futures-util = { version = "^0.3", optional = true }
+rskafka = { version = "^0.6.0", default-features = false, features = ["transport-tls"], optional = true }
+rumqttc = { version = "^0.25.1", optional = true }
+rustls = { version = "^0.23", optional = true }
+rustls-pki-types = { version = "^1", features = ["std"], optional = true }
+webpki-roots = { version = "^1", optional = true }
 
 [features]
 default = []
 tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # /q/ch:<table>/ and /queue/clickhouse:<table>/ queues write straight to ClickHouse
 clickhouse = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
+# bridge_queue, bridge_prefix or bridge_listen to a broker, started by the binary
+bridge = ["dep:etcd-client", "dep:fe2o3-amqp", "dep:futures-util", "dep:rskafka", "dep:rumqttc", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 
 [dev-dependencies]
 tokio = { version = "^1.44", features = ["full"] }

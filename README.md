@@ -1,8 +1,10 @@
 # etcd
 
-[![Minimum rustc version](https://img.shields.io/badge/rustc-1.64+-lightgray.svg)](https://github.com/etcdv3/etcd-client#rust-version-requirements)
-[![Crate](https://img.shields.io/crates/v/etcd-client.svg)](https://crates.io/crates/etcd-client)
-[![API](https://docs.rs/etcd-client/badge.svg)](https://docs.rs/etcd-client)
+[![ci](https://github.com/vkrinitsyn/etcd/actions/workflows/ci.yml/badge.svg)](https://github.com/vkrinitsyn/etcd/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/vkrinitsyn/etcd/graph/badge.svg)](https://codecov.io/gh/vkrinitsyn/etcd)
+[![audit](https://github.com/vkrinitsyn/etcd/actions/workflows/audit.yml/badge.svg)](https://github.com/vkrinitsyn/etcd/actions/workflows/audit.yml)
+[![crates.io](https://img.shields.io/crates/v/etcds.svg)](https://crates.io/crates/etcds)
+[![docs.rs](https://docs.rs/etcds/badge.svg)](https://docs.rs/etcds)
 
 [![License: Apache](https://img.shields.io/badge/License-Apache%202.0-red.svg)](LICENSE-APACHE)
 OR
@@ -24,6 +26,9 @@ This is an experimental Prof of Concept of the features bellow
   requested process
 - a queue named `ch:<table>` writes its messages straight into a ClickHouse table
   ([clickhouse.md](clickhouse.md), feature `clickhouse`)
+- a bridge from a queue or key prefix to a JMS queue (AMQP 1.0), an MQTT 5 topic
+  or a Kafka topic, or JMS clients served as an AMQP peer
+  ([bridge.md](bridge.md), feature `bridge`)
 - no message storage, cluster election, as use another cluster implementation
 - messages, errors and `--help` in English, Russian, French, German, Chinese and
   Japanese: `LANG`, `etcds::set_lang`, or the embedder's logger `o!("lang" => ..)`;

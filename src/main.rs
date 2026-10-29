@@ -33,6 +33,14 @@ async fn main() -> ExitCode {
         args.config.clone()
     };
     let log = logger(&config);
+    // [bridge] its settings refused before the node starts
+    let bridge = match bridge(&config) {
+        Ok(b) => b,
+        Err(e) => {
+            crit!(log, "{}", e);
+            return ExitCode::from(14);
+        }
+    };
     match EtcdNode::init(
         config, log.clone(),
         #[cfg(feature = "tracer")] None,
@@ -49,14 +57,72 @@ async fn main() -> ExitCode {
         }
     }
 
-    match wait_for_signal().await {
-        Ok(msg) => {
-            exit_with_msg(log, msg, 0)
+    let Some(b) = bridge else {
+        return stopped(log, wait_for_signal().await);
+    };
+    // [bridge] once the node serves, until the signal that stops it; a bridge that
+    // ends on its own failed for good, and takes the node with it
+    let within = stop_within(&b);
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut running = tokio::spawn(run_bridge(b, log.new(o!("bridge" => true)), async {
+        let _ = stop_rx.await;
+    }));
+    tokio::select! {
+        sig = wait_for_signal() => {
+            let _ = stop.send(());
+            let err = match tokio::time::timeout(within, running).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(e))) => Some(e),
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some(format!("not stopped in {:?}", within)),
+            };
+            match err {
+                // what it held may not be back on etcd's line: not an orderly stop
+                Some(e) => exit_with_msg(log, message("main.bridge_stop", &[("err", &e)]), 16),
+                None => stopped(log, sig),
+            }
         }
-        Err(msg) => {
-            exit_with_msg(log, msg, 10)
+        r = &mut running => {
+            let err = match r {
+                Ok(Ok(())) => "stopped".to_string(),
+                Ok(Err(e)) => e,
+                Err(e) => e.to_string(),
+            };
+            exit_with_msg(log, message("main.bridge_failed", &[("err", &err)]), 15)
         }
     }
+}
+
+fn stopped(log: Logger, sig: Result<String, String>) -> ExitCode {
+    match sig {
+        Ok(msg) => exit_with_msg(log, msg, 0),
+        Err(msg) => exit_with_msg(log, msg, 10),
+    }
+}
+
+/// [bridge] The bridge the settings ask for, or why not (exit code 14).
+#[cfg(feature = "bridge")]
+fn bridge(cfg: &EtcdConfig) -> Result<Option<etcds::bridge::node::Bridge>, String> {
+    etcds::bridge::node::settings(cfg).map_err(|e| message("main.bridge", &[("err", &e)]))
+}
+
+#[cfg(feature = "bridge")]
+use etcds::bridge::node::{run as run_bridge, stop_within};
+
+/// [bridge] Without the feature there is no bridge to ask for.
+#[cfg(not(feature = "bridge"))]
+fn bridge(cfg: &EtcdConfig) -> Result<Option<std::convert::Infallible>, String> {
+    if cfg.bridge_given() { Err(message("main.bridge_feature", &[])) } else { Ok(None) }
+}
+
+#[cfg(not(feature = "bridge"))]
+async fn run_bridge(b: std::convert::Infallible, _: Logger, _: impl Future<Output = ()>) -> Result<(), String> {
+    match b {}
+}
+
+#[cfg(not(feature = "bridge"))]
+fn stop_within(b: &std::convert::Infallible) -> std::time::Duration {
+    match *b {}
 }
 
 #[cfg(unix)]

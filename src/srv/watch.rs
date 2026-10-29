@@ -18,16 +18,29 @@ use crate::etcdpb::mvccpb::{Event};
 use crate::{WatchSender, LP};
 
 type WatchResult<T> = Result<Response<T>, Status>;
+
+/// [q-dead] How long a watcher's stream may stay full before the watcher is
+/// cancelled: a notification waits that long, then the next one, and the
+/// writes behind them, wait no more.
+pub(crate) const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
 
 impl EtcdNode {
-    pub(crate) async fn watch_notify(&self, mut receiver: Receiver<crate::kv::Kv>) {
+    pub(crate) async fn watch_notify(&self, mut receiver: Receiver<(crate::kv::Kv, bool)>) {
         let observers = self.observers.clone();
         let observer_ranges = self.observer_ranges.clone();
         let watchers = self.watchers.clone();
         let log = self.log.clone();
+        let node = self.clone();
         tokio::spawn(async move {
-            while let Some(kv) = receiver.recv().await {
+            while let Some((kv, deleted)) = receiver.recv().await {
+                // [kv-delete] a delete is told as etcd tells it: a DELETE event,
+                // the key with no value. Not under the queue prefixes: the
+                // registry is the server's, and a queue consumer watching its
+                // registration key takes messages there, never its withdrawal.
+                if deleted && (kv.key.starts_with(b"/q/") || kv.key.starts_with(b"/queue/")) {
+                    continue;
+                }
                 // [range] Exact-key watchers first - unchanged, and still the
                 // fast path - then the ones registered over a range. Without the
                 // second part a prefix watch never fired at all: the watcher sat
@@ -51,32 +64,50 @@ impl EtcdNode {
                         }
                     }
                 }
+                // [q-dead] The senders taken under the locks, sent to after:
+                // a send into a stream the client does not read waits for room,
+                // and held across it the watchers' lock stopped every watch made
+                // and cancelled on the node - a queue consumer dropped as slow
+                // included - for as long as that client did not read.
+                let mut sends = Vec::new();
                 if !targets.is_empty() {
-                    let v = targets;
-                    for (cid, wid) in v { // expected watcher per client
-                        if let Some(client_watcher) = watchers.read().await.get(&cid) {
+                    let all = watchers.read().await;
+                    for (cid, wid) in targets { // expected watcher per client
+                        if let Some(client_watcher) = all.get(&cid) {
                             if let Some(client) = client_watcher.read().await.watchers.get(&wid) {
-                                info!(log, "{}{}", LP, tr!("srv.watch_notify", key = String::from_utf8_lossy(&kv.key)));
-                                if let Err(_e) = client.client.send(Ok(
-                                    WatchResponse {
-                                        header: None,
-                                        watch_id: wid,
-                                        created: false,
-                                        canceled: false,
-                                        compact_revision: 0,
-                                        cancel_reason: "".to_string(),
-                                        fragment: false,
-                                        events: vec![ Event {
-                                            r#type: 0, // put
-                                            kv: Some(kv.clone().into()),
-                                            prev_kv: None,
-                                        }],
-                                    })).await {
-                                    //
-                                    
-                                }
+                                sends.push((cid, wid, client.client.clone()));
                             }
                         }
+                    }
+                }
+                for (cid, wid, client) in sends {
+                    info!(log, "{}{}", LP, tr!("srv.watch_notify", key = String::from_utf8_lossy(&kv.key)));
+                    // [q-dead] bounded: a watcher that does not take it in time
+                    // is cancelled, as a stalled queue consumer is, rather than
+                    // holding up every write behind it. In a task: the cancel
+                    // takes locks a write waiting on this task may hold.
+                    let sent = tokio::time::timeout(NOTIFY_TIMEOUT, client.send(Ok(
+                        WatchResponse {
+                            header: None,
+                            watch_id: wid,
+                            created: false,
+                            canceled: false,
+                            compact_revision: 0,
+                            cancel_reason: "".to_string(),
+                            fragment: false,
+                            events: vec![ Event {
+                                r#type: if deleted { 1 } else { 0 }, // put, delete
+                                kv: Some(if deleted {
+                                    crate::etcdpb::mvccpb::KeyValue { key: kv.key.clone(), ..Default::default() }
+                                } else {
+                                    kv.clone().into()
+                                }),
+                                prev_kv: None,
+                            }],
+                        }))).await;
+                    if sent.is_err() {
+                        let node = node.clone();
+                        tokio::spawn(async move { node.cancel_slow_watch(cid, wid, client).await });
                     }
                 }
             }

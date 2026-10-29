@@ -132,6 +132,11 @@ impl Cluster for EtcdNode {
         let peers: HashSet<&str> = HashSet::from_iter(ma.peer_ur_ls.iter().map(|p| p.as_str()));
         // [lockup] dialled with the peer lock released - it dials back the caller
         self.add_peers(peers).await;
+        // [q-registry] A node announcing itself has just started, or just
+        // connected: of this node's queue registry it holds nothing, or what a
+        // restart left of it. Write it again - also when the caller is a peer
+        // held already, which `add_peers` does not count as one joining.
+        self.peers.read().await.joined().notify_one();
         Ok(Response::new(MemberAddResponse::default()))
     }
 
@@ -165,14 +170,26 @@ impl Cluster for EtcdNode {
         let peer_id = request.into_inner().id;
         let peers = self.peers.read().await;
         let current = peers.peer_state(peer_id).await;
+        // [q-registry] Promoted, the peer gets this node's whole current part of
+        // the queue registry: its registrations written again (a join), and what
+        // the peer still places on this node that it no longer holds withdrawn
+        // there - however long it was Spare, it misses nothing of this node's.
+        let caught_up = |p: Option<crate::cluster::EtcdPeerNodeType>| {
+            if let Some(p) = p {
+                let node = self.clone();
+                tokio::spawn(async move { node.withdraw_stale_at(p).await; });
+            }
+        };
         match current {
             None => Err(Status::not_found(tr!("srv.no_peer", id = peer_id))),
             Some(PeerState::Spare) => {
                 peers.promote_to_syncing(peer_id, &self.log).await;
+                caught_up(peers.handle(peer_id).await);
                 Ok(Response::new(MemberPromoteResponse::default()))
             }
             Some(PeerState::InProgress) => {
                 peers.promote_to_online(peer_id, &self.log).await;
+                caught_up(peers.handle(peer_id).await);
                 Ok(Response::new(MemberPromoteResponse::default()))
             }
             Some(PeerState::Online) => {

@@ -75,7 +75,10 @@ async fn the_short_spelling_receives_messages_not_its_own_registration() -> Resu
 
     client.put("/q/jobs/p/job-1", "payload", None).await?;
     let (key, value) = next_event(&mut events, 5000).await.expect("the message");
-    assert_eq!((key.as_str(), value.as_str()), ("/q/jobs/1/job-1", "payload"));
+    // `/q/jobs/{idx}/job-1`: the index is the dispatcher's, from its start
+    let parts: Vec<&str> = key.split('/').collect();
+    assert_eq!((parts.len(), parts[1], parts[2], parts[4], value.as_str()), (5, "q", "jobs", "job-1", "payload"), "{}", key);
+    assert!(parts[3].parse::<u64>().is_ok(), "an index: {}", key);
     client.delete(key, None).await?;
 
     assert!(next_event(&mut events, 300).await.is_none(), "nothing else arrives");
@@ -84,8 +87,10 @@ async fn the_short_spelling_receives_messages_not_its_own_registration() -> Resu
     Ok(())
 }
 
-/// A queue's registry is readable like any key: the dispatcher record and the
-/// consumer's host both name the node.
+/// A queue's registry is readable like any key: the dispatcher record names
+/// the node, and the consumer's registration is that node and its stream,
+/// `<node>;g=<generation>;s=<start>` (agent.md, "A registration names a
+/// stream").
 #[tokio::test]
 async fn the_registry_is_readable() -> Result<()> {
     let (node, mut client) = start_server().await;
@@ -100,7 +105,12 @@ async fn the_registry_is_readable() -> Result<()> {
     let rec = client.get("/queue/reg", None).await?;
     assert_eq!(rec.kvs()[0].value_str()?, dispatcher.to_string());
     let host = client.get(format!("/queue/reg/c/{}", me), None).await?;
-    assert_eq!(host.kvs()[0].value_str()?, dispatcher.to_string());
+    let reg = host.kvs()[0].value_str()?;
+    let mut fields = reg.split(';');
+    assert_eq!(fields.next(), Some(dispatcher.to_string().as_str()), "{}", reg);
+    let rest: Vec<&str> = fields.collect();
+    assert!(rest.iter().any(|f| f.starts_with("g=")), "a stream generation: {}", reg);
+    assert!(rest.iter().any(|f| f.starts_with("s=")), "the node's start: {}", reg);
     Ok(())
 }
 
@@ -114,6 +124,7 @@ async fn a_cancelled_consumer_takes_no_more_messages() -> Result<()> {
     let id = stream.message().await?.unwrap().watch_id();
     client.put("/q/cq/p/a", "1", None).await?;
     let (key, _) = next_event(&mut stream, 5000).await.expect("the first message");
+    let first_idx: u64 = key.split('/').nth(3).unwrap().parse().unwrap();
     client.delete(key, None).await?;
 
     stream.cancel(id).await?;
@@ -124,6 +135,54 @@ async fn a_cancelled_consumer_takes_no_more_messages() -> Result<()> {
     let second = Uuid::new_v4();
     let mut other = client.watch(format!("/q/cq/c/{}", second), None).await?;
     let (key, value) = next_event(&mut other, 5000).await.expect("the waiting message");
-    assert_eq!((key.as_str(), value.as_str()), ("/q/cq/2/b", "2"));
+    assert_eq!((key, value.as_str()), (format!("/q/cq/{}/b", first_idx + 1), "2"));
+    Ok(())
+}
+
+/// [q-idx] A dispatcher's indexes start from the clock, not 1: a node started
+/// later starts higher. (A dispatcher moving to a node whose queue was made
+/// earlier is `a_new_dispatcher_starts_its_indexes_from_now`, in queue.rs.)
+#[tokio::test]
+async fn indexes_do_not_repeat_across_dispatchers() -> Result<()> {
+    async fn first_index() -> Result<u64> {
+        let (_node, mut client) = start_server().await;
+        let mut stream = client.watch(format!("/q/idx/c/{}", Uuid::new_v4()), None).await?;
+        client.put("/q/idx/p/m", "1", None).await?;
+        let (key, _) = next_event(&mut stream, 3000).await.expect("delivered");
+        Ok(key.split('/').nth(3).unwrap().parse().unwrap())
+    }
+    let older = first_index().await?;
+    let newer = first_index().await?;
+    assert!(older > 1_000_000_000_000_000, "from the clock, not 1: {}", older);
+    assert!(newer > older, "a later dispatcher starts above: {} then {}", older, newer);
+    Ok(())
+}
+
+/// [kv-delete] A delete under the queue prefixes is no event: a consumer
+/// watching its registration key hears nothing of the registry's changes, and
+/// a key watcher over `/q/` neither.
+#[tokio::test]
+async fn queue_deletes_are_no_watch_events() -> Result<()> {
+    use etcd_client::WatchOptions;
+    let (_node, mut client) = start_server().await;
+    let me = Uuid::new_v4();
+    let reg = format!("/q/qd/c/{}", me);
+    let mut consumer = client.watch(reg.as_str(), None).await?;
+    let mut range = client.watch("/q/", Some(WatchOptions::new().with_prefix())).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // the registry's records, deleted as a node withdrawing would
+    client.delete("/q/qd", None).await?;
+    client.delete("/q/", Some(etcd_client::DeleteOptions::new().with_prefix())).await?;
+    for s in [&mut consumer, &mut range] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        while let Ok(Ok(Some(resp))) = tokio::time::timeout_at(deadline, s.message()).await {
+            for ev in resp.events() {
+                assert!(ev.event_type() != EventType::Delete, "a queue delete reached a watcher: {:?}", ev.kv().map(|k| k.key_str().unwrap_or("").to_string()));
+            }
+        }
+    }
+    // and the consumer still consumes
+    client.put("/q/qd/p/m", "1", None).await?;
+    assert!(next_event(&mut consumer, 3000).await.is_some());
     Ok(())
 }

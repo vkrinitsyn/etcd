@@ -224,9 +224,50 @@ impl EtcdNode {
     pub(crate) async fn put_kv(&self, r: PutRequest, from_peer: &Option<String>)
         -> Result<Response<PutResponse>, Status>
     {
+        let key = String::from_utf8_lossy(&r.key).to_string();
+        if let Some(cid) = crate::route::consumer_of(&key) {
+            if let Some(reg) = crate::route::Registration::parse(&String::from_utf8_lossy(&r.value)) {
+                if reg.state == crate::route::StreamState::Closed {
+                    return self.put_tombstone(r, cid, reg, key, from_peer).await;
+                }
+                // [q-dead] a node's registration of a stream its tombstone
+                // already closed - the two crossed on the way - is not stored
+                // (generation 0, an older form, names no stream: not dead by it)
+                let dead = reg.generation > 0 && self.tombstones.read().await.get(&(r.key.clone(), reg.node))
+                    .map_or(false, |(g, at)| at.elapsed() < crate::queue::QUEUE_IDLE && reg.generation <= *g);
+                if dead {
+                    return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
+                }
+                // [q-dead] a node's registration from a later incarnation: what
+                // was handed to its streams from before the restart goes back
+                if reg.since > 0 {
+                    let (name, queues, log) = (QueueNameKey::new(key.clone()).queue_name, self.queues.clone(), self.log.clone());
+                    tokio::spawn(async move {
+                        let q = queues.read().await.get(&name).cloned();
+                        if let Some(q) = q {
+                            q.release_older(&cid, reg.node, reg.since, &log).await;
+                        }
+                    });
+                }
+            }
+        }
         let kv: kv::Kv = r.clone().into();
         let prev_kv = self.vault.write().await.insert(r.key.clone(), kv.clone());
-        let _ = self.watch_notify.send(kv).await;
+        let _ = self.watch_notify.send((kv, false)).await;
+        // [q-registry] A consumer registration is news to a dispatcher holding
+        // messages nobody could take: wake it, rather than leave them for the
+        // next put. Spawned: a registration is written from `create_watcher`,
+        // which holds `queues.write()`.
+        if crate::route::consumer_of(&key).is_some() {
+            let name = QueueNameKey::new(key).queue_name;
+            let queues = self.queues.clone();
+            tokio::spawn(async move {
+                let q = queues.read().await.get(&name).cloned();
+                if let Some(q) = q {
+                    q.wake();
+                }
+            });
+        }
         // [prefix] A local key is never broadcast. Decided by the KEY,
         // not by `from_peer` - that comes from the client-settable
         // XPEER header, so a caller could otherwise assert peerhood and
@@ -248,12 +289,95 @@ impl EtcdNode {
         }))
     }
 
+    /// [q-dead] A consumer stream's tombstone (`StreamState::Closed`): that
+    /// stream closed. Never stored. It removes the registration it supersedes -
+    /// that stream's, or an older one, even of another node the client left -
+    /// and never a newer one; what this node holds for that stream goes to the
+    /// next consumer; and it is replicated as written. Only from the node it
+    /// names, as a withdrawal is.
+    async fn put_tombstone(&self, r: PutRequest, cid: uuid::Uuid, t: crate::route::Registration, key: String,
+        from_peer: &Option<String>) -> Result<Response<PutResponse>, Status>
+    {
+        // [q-dead] ...or on its behalf (`;gone`): its node down past the down
+        // timeout, any node may say so
+        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok()) {
+            if sender != t.node && !t.gone {
+                return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
+            }
+        }
+        // [q-dead] ...unless the named node answers here - cut off from the
+        // writer, not from this node - or is this node: not gone, here
+        if t.gone {
+            let peers = self.peers.read().await;
+            let here = t.node == peers.me()
+                || (peers.handle(t.node).await.is_some() && peers.down_for(t.node).await.is_none());
+            drop(peers);
+            if here {
+                return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
+            }
+        }
+        {
+            let mut vault = self.vault.write().await;
+            let stale = vault.get(&r.key)
+                .and_then(|kv| crate::route::Registration::parse(&String::from_utf8_lossy(&kv.value)))
+                .map_or(false, |s| s.removed_by(&t));
+            if stale {
+                vault.remove(&r.key);
+            }
+        }
+        if !t.gone {
+            // [q-dead] that node's newest, for a registration crossing it - not
+            // one written on its behalf: back, its node registers its stream again
+            let mut tombs = self.tombstones.write().await;
+            tombs.retain(|_, (_, at)| at.elapsed() < crate::queue::QUEUE_IDLE);
+            let k = (r.key.clone(), t.node);
+            if tombs.get(&k).map_or(true, |(g, _)| t.generation >= *g) {
+                tombs.insert(k, (t.generation, tokio::time::Instant::now()));
+            }
+        }
+        // spawned, as the wake above: this can be written under `queues.write()`
+        let (name, queues, log) = (QueueNameKey::new(key).queue_name, self.queues.clone(), self.log.clone());
+        tokio::spawn(async move {
+            let q = queues.read().await.get(&name).cloned();
+            if let Some(q) = q {
+                q.release_stream(&cid, t.node, t.generation, &log).await;
+                // [q-dead] a newer tombstone of another node removes an older
+                // registration of this one: written again if it lives here
+                q.sync_registration(&cid, false).await;
+            }
+        });
+        if from_peer.is_none() && self.policy.read().await.propagates(&r.key) {
+            let scope = if self.policy.read().await.is_zone_scoped(&r.key) {
+                Some(self.peers.read().await.my_zone().to_string())
+            } else { None };
+            // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
+            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
+                PutRequest { prev_kv: false, ignore_value: true, ..r })), scope.as_deref()).await?;
+        }
+        Ok(Response::new(PutResponse { header: None, prev_kv: None }))
+    }
+
     /// TODO implement all variation of request
     /// TODO implement kv owner and queue consumer access 
     pub(crate) async fn delete_impl(&self, request: Request<DeleteRangeRequest>) -> Result<Response<DeleteRangeResponse>, Status> {
         let from_peer = peer(request.metadata());
         let r = request.into_inner();
         trace!(self.log, "{}", tr!("kv.delete", key = String::from_utf8_lossy(&r.key)));
+
+        // [q-registry] A consumer's registration is withdrawn by the node it
+        // names, and by no other. A client that moved to another node is
+        // registered there; its old node withdrawing it later - its old stream
+        // closed - would take a live consumer off this node, and hand out again
+        // what it is still working on.
+        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok()) {
+            if r.range_end.is_empty() && crate::route::consumer_of(&String::from_utf8_lossy(&r.key)).is_some() {
+                let host = self.vault.read().await.get(&r.key)
+                    .and_then(|kv| crate::route::Registration::parse(&String::from_utf8_lossy(&kv.value)));
+                if matches!(host, Some(h) if h.node != sender) {
+                    return Ok(Response::new(DeleteRangeResponse { header: None, deleted: 0, prev_kvs: vec![] }));
+                }
+            }
+        }
 
         // [range] A DeleteRange carrying a `range_end` deletes the RANGE. This
         // used to `remove(&r.key)` and nothing else, so a prefix delete removed
@@ -273,6 +397,10 @@ impl EtcdNode {
             doomed.iter().filter_map(|k| vault.remove(k)).collect()
         };
         let deleted = removed.len() as i64;
+        // [kv-delete] a key watcher hears of a delete, as of a put
+        for kv in &removed {
+            let _ = self.watch_notify.send((kv.clone(), true)).await;
+        }
 
         let qn = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
         if let Some(q) = self.queues.read().await.get(&qn.queue_name) {
@@ -328,8 +456,8 @@ impl EtcdNode {
             (succeeded, responses, modified)
         };
 
-        for kv in &modified {
-            let _ = self.watch_notify.send(kv.clone()).await;
+        for change in &modified {
+            let _ = self.watch_notify.send(change.clone()).await;
         }
 
         // [prefix] A txn carries many keys and is broadcast whole, so it can
@@ -417,7 +545,8 @@ impl EtcdNode {
         }
     }
 
-    fn execute_op(req: &request_op::Request, vault: &mut HashMap<KvKey, kv::Kv>) -> (ResponseOp, Vec<kv::Kv>) {
+    /// The response, and the keys changed: `true` for a delete.
+    fn execute_op(req: &request_op::Request, vault: &mut HashMap<KvKey, kv::Kv>) -> (ResponseOp, Vec<(kv::Kv, bool)>) {
         let mut modified = Vec::new();
         let response = match req {
             request_op::Request::RequestRange(r) => {
@@ -444,7 +573,7 @@ impl EtcdNode {
             request_op::Request::RequestPut(r) => {
                 let new_kv: kv::Kv = r.clone().into();
                 let prev = vault.insert(r.key.clone(), new_kv.clone());
-                modified.push(new_kv);
+                modified.push((new_kv, false));
                 ResponseOp {
                     response: Some(response_op::Response::ResponsePut(PutResponse {
                         header: None,
@@ -460,6 +589,7 @@ impl EtcdNode {
                     .collect();
                 let removed: Vec<kv::Kv> = doomed.iter().filter_map(|k| vault.remove(k)).collect();
                 let deleted = removed.len() as i64;
+                modified.extend(removed.iter().map(|kv| (kv.clone(), true)));
                 let prev_kvs = if r.prev_kv {
                     removed.into_iter().map(|x| x.into()).collect()
                 } else {

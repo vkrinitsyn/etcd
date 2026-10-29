@@ -300,3 +300,56 @@ async fn next_events(stream: &mut etcd_client::WatchStream) -> Vec<(Vec<u8>, Vec
         }
     }
 }
+
+/// Watch frames until one carries events: (type, key, value) each.
+async fn next_typed(stream: &mut etcd_client::WatchStream) -> Vec<(EventType, Vec<u8>, Vec<u8>)> {
+    loop {
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), stream.message())
+            .await.expect("an event in time").expect("watch stream").expect("watch open");
+        let evs: Vec<_> = resp.events().iter()
+            .filter_map(|e| e.kv().map(|kv| (e.event_type(), kv.key().to_vec(), kv.value().to_vec())))
+            .collect();
+        if !evs.is_empty() {
+            return evs;
+        }
+    }
+}
+
+/// [kv-delete] A watcher hears of a delete as etcd tells it - a DELETE event,
+/// the key, no value - by key, by range and in a txn.
+#[tokio::test]
+async fn test_watch_sees_deletes() -> Result<()> {
+    use etcd_client::WatchOptions;
+    let (_node, mut client) = start_server().await;
+    let mut stream = client.watch("wd/", Some(WatchOptions::new().with_prefix())).await?;
+
+    client.put("wd/a", "1", None).await?;
+    assert_eq!(next_typed(&mut stream).await, vec![(EventType::Put, b"wd/a".to_vec(), b"1".to_vec())]);
+    client.delete("wd/a", None).await?;
+    assert_eq!(next_typed(&mut stream).await, vec![(EventType::Delete, b"wd/a".to_vec(), vec![])]);
+
+    client.put("wd/r/1", "x", None).await?;
+    client.put("wd/r/2", "y", None).await?;
+    next_typed(&mut stream).await;
+    next_typed(&mut stream).await;
+    client.delete("wd/r/", Some(DeleteOptions::new().with_prefix())).await?;
+    let mut keys = vec![];
+    while keys.len() < 2 {
+        for (t, k, _) in next_typed(&mut stream).await {
+            assert_eq!(t, EventType::Delete);
+            keys.push(k);
+        }
+    }
+    keys.sort();
+    assert_eq!(keys, vec![b"wd/r/1".to_vec(), b"wd/r/2".to_vec()], "each key a range delete took");
+
+    client.put("wd/t", "z", None).await?;
+    next_typed(&mut stream).await;
+    client.txn(Txn::new().and_then(vec![TxnOp::delete("wd/t", None)])).await?;
+    assert_eq!(next_typed(&mut stream).await, vec![(EventType::Delete, b"wd/t".to_vec(), vec![])]);
+
+    // a delete of a key that was not there is no event
+    client.delete("wd/none", None).await?;
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(500), next_typed(&mut stream)).await.is_err());
+    Ok(())
+}

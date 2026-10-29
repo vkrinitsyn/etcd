@@ -55,12 +55,26 @@ The rules a client can rely on (`src/queue.rs`):
   accepted, the message is not delivered again, but it stays in the dispatcher's
   memory and the queue is never reaped ([agent.md](agent.md), known gaps).
 - **A slow consumer is dropped.** A consumer that does not take a message within
-  5 s, or whose stream has closed, loses its registration; the message goes to the
-  next consumer or waits.
-- **Handed over means gone from the line.** A message delivered and never
-  acknowledged is not delivered again, even when the consumer dies holding it
-  (the "dead queue" TODO): acknowledge after the work, and make the work safe to
+  5 s gets nothing more (its registration says `draining`) and a `canceled` frame
+  with the reason (ETCD-E052): watch again to receive. One whose stream has
+  closed loses its registration. The message goes to the next consumer or waits.
+- **A gone consumer's messages go to the next one.** A message delivered and never
+  acknowledged is handed out again when the stream it went to closes - whatever
+  the client did since: a client that connects again, to this node or another, is
+  a new stream, and what the old one held, read or unread, goes back to the line.
+  One that stalls or cancels its watch gets nothing new, and keeps what it holds
+  until its stream closes; watching again on that same stream, it keeps it on.
+  Never on a timeout. So a message can reach a second consumer after the first
+  did part of the work: acknowledge after the work, and make the work safe to
   find unfinished.
+- **While a consumer's node is down,** what it was handed waits, for the down
+  timeout (`queue_down_timeout`, 5 minutes; 0 never): a node back within it keeps
+  it. Past it the consumer counts as gone, its registration is withdrawn on its
+  behalf, and what it was handed goes to the next consumer - **at least once**
+  for those messages: a node that was only cut off, not dead, may run them too.
+  Make such work safe to run twice. A node that restarts withdraws, at start and
+  from each peer it connects to later, what it no longer hosts, and a stream from
+  before its restart is known dead wherever its client registers again.
 - **Acknowledge on commit, not on failure.** The acknowledgement is the queue's
   side of the consumer's commit: delete the key when the work's transaction has
   committed (in YT Cluster, the cluster commit). On a rollback do not
@@ -71,9 +85,22 @@ The rules a client can rely on (`src/queue.rs`):
 - **Memory only.** Messages live in the dispatcher's memory: a restart of that
   node loses them, and so does the dispatcher dying before it indexed a message
   from a producer on another node (below).
+- **A key watcher must keep reading.** One that does not take a notification
+  within 2 s is cancelled - a `canceled` frame with the reason (ETCD-E085) - as a
+  slow consumer is: watch again to receive. Writes never wait on it.
+- **A rolling upgrade keeps routing.** While any node runs an older version, the
+  nodes write the registry in the older form (the bare node id), which every
+  version reads; until the last one is upgraded, what a closed stream held goes
+  back once its client has no stream left on that node, rather than at once.
 - **The server writes the registry.** `/q/{name}` (the dispatcher) and
-  `/q/{name}/c/{uuid}` (a consumer's node) are ordinary replicated keys the
-  server maintains. Read them if you like; a put there overwrites the routing.
+  `/q/{name}/c/{uuid}` (a consumer's node and stream: `<node>;g=<generation>`,
+  `;s=` the node's start, `;draining` added for one that receives no more;
+  `;closed` a tombstone, `;gone` one written for a node down too long) are
+  ordinary replicated keys the server maintains, and writes again whenever a
+  peer joins. Read them if you like; a put there overwrites the routing. A peer
+  held Spare - it failed a write - gets no writes, the registry neither: it gets
+  the registry again when it is promoted, so it does not dispatch on what it
+  missed.
 
 Request/reply pairs, and how few network hops a message takes between nodes, are
 in [queue-p2p-route.md](queue-p2p-route.md). A queue named `ch:<table>` writes its

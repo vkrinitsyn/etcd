@@ -22,7 +22,9 @@ impl Maintenance for EtcdNode {
         let header = self.response_header();
         Ok(Response::new(StatusResponse {
             header: Some(header),
-            version: "rust".to_string(),
+            // [q-dead] its crate version and registry format, for a peer to tell
+            // an older node (`peer::registry_of`)
+            version: crate::peer::status_version(),
             db_size: vault_size,
             leader: 0,
             raft_index: 0,

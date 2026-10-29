@@ -157,6 +157,136 @@ pub fn consumer_of(key: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(n[4]).ok()
 }
 
+/// [q-dead] What a consumer's stream is doing, as its registration says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamState {
+    /// it takes new messages
+    Receiving,
+    /// it stalled or cancelled its watch, its stream still open: nothing new,
+    /// and it keeps what it was handed
+    Draining,
+    /// its stream closed: a tombstone, written to release what that stream was
+    /// handed on every node and then removed - never stored
+    Closed,
+}
+
+/// [q-dead] What `/q/{name}/c/{client}` holds: `<node>;g=<generation>`, then
+/// `;draining` or `;closed`.
+///
+/// The generation names one stream of the client - one connection to one
+/// node - so a message handed to it is released when THAT stream closes,
+/// whatever the client registered since: a client that moved to another node,
+/// or connected again, has a new stream with a new generation. Generations
+/// grow with time (`queue::next_gen`), so the newer of two registrations is
+/// the one with the larger generation.
+///
+/// A bare node id - what an older node writes - is generation 0, receiving. A
+/// value with fields does not parse as a bare node id, so an older node routes
+/// nothing to it.
+///
+/// `;s=<incarnation>`: when the writing node's process started, on the same
+/// clock as the generations. A stream of that node with a generation below it
+/// is from before a restart, and dead: nothing will ever write its tombstone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Registration {
+    pub node: NodeId,
+    pub generation: u64,
+    pub state: StreamState,
+    /// the node's incarnation; 0 not given
+    pub since: u64,
+    /// [q-dead] a tombstone written on behalf of `node`, down too long to
+    /// write it (`;gone`): taken from any node
+    pub gone: bool,
+}
+
+const DRAINING: &str = "draining";
+const CLOSED: &str = "closed";
+const GONE: &str = "gone";
+
+impl Registration {
+    pub fn new(node: NodeId, generation: u64, state: StreamState) -> Self {
+        Registration { node, generation, state, since: 0, gone: false }
+    }
+
+    /// [q-dead] The tombstone of `node`'s stream `generation`, written on its
+    /// behalf: `node` has been down longer than the queue's down timeout.
+    pub fn gone(node: NodeId, generation: u64) -> Self {
+        Registration { gone: true, ..Registration::new(node, generation, StreamState::Closed) }
+    }
+
+    /// [q-dead] The registration as an older node writes and reads it: the bare
+    /// node id (`queue::legacy`).
+    pub fn render_legacy(&self) -> String {
+        self.node.to_string()
+    }
+
+    /// [q-dead] With the writing node's incarnation.
+    pub fn since(mut self, since: u64) -> Self {
+        self.since = since;
+        self
+    }
+
+    /// [q-dead] Is stream `generation` of `node` dead by this registration -
+    /// this one of the same node from a later incarnation?
+    ///
+    /// Generation 0 - an older node's bare registration - is unknown, never
+    /// older: a node writes it while an older member is here, and its streams
+    /// then live on past the end of the upgrade.
+    pub fn outlives(&self, node: NodeId, generation: u64) -> bool {
+        self.node == node && generation > 0 && generation < self.since
+    }
+
+    pub fn render(&self) -> String {
+        let mut s = format!("{}{}g={}", self.node, SEP, self.generation);
+        if self.since > 0 {
+            s.push_str(&format!("{}s={}", SEP, self.since));
+        }
+        match self.state {
+            StreamState::Receiving => {}
+            StreamState::Draining => { s.push(SEP); s.push_str(DRAINING); }
+            StreamState::Closed => { s.push(SEP); s.push_str(CLOSED); }
+        }
+        if self.gone {
+            s.push(SEP);
+            s.push_str(GONE);
+        }
+        s
+    }
+
+    /// `None` for anything but a registration.
+    pub fn parse(v: &str) -> Option<Self> {
+        let mut it = v.trim().split(SEP);
+        let node: NodeId = it.next()?.trim().parse().ok()?;
+        let mut r = Registration::new(node, 0, StreamState::Receiving);
+        for f in it {
+            let f = f.trim();
+            if let Some(g) = f.strip_prefix("g=") {
+                r.generation = g.trim().parse().ok()?;
+            } else if let Some(g) = f.strip_prefix("s=") {
+                r.since = g.trim().parse().ok()?;
+            } else if f == DRAINING {
+                r.state = StreamState::Draining;
+            } else if f == CLOSED {
+                r.state = StreamState::Closed;
+            } else if f == GONE {
+                r.gone = true;
+            }
+        }
+        Some(r)
+    }
+
+    /// A tombstone `t` removes this registration: it names this stream, or
+    /// one older than the stream that closed. A newer one - the client
+    /// registered again since - stays.
+    ///
+    /// Another node's generation 0 - an older node's bare registration - is no
+    /// older than anything.
+    pub fn removed_by(&self, t: &Registration) -> bool {
+        (self.node == t.node && self.generation <= t.generation)
+            || (self.generation > 0 && self.generation < t.generation)
+    }
+}
+
 /// Why a node is claiming a queue's dispatcher slot.
 ///
 /// The dispatcher is an **endpoint**, never a third party: it sits on the node
@@ -319,6 +449,67 @@ mod tests {
         // a delivery is not a registration
         assert_eq!(consumer_of(&format!("{}/7/key", k)), None);
         assert_eq!(consumer_of("/q/rpc"), None);
+    }
+
+    /// [q-dead] A registration names its host, its stream and that stream's
+    /// state; an older node's bare id is generation 0, receiving; only a bare id
+    /// parses as a delivery target for an older node.
+    #[test]
+    fn a_registration_names_its_host_stream_and_state() {
+        let r = Registration::new(42, 7, StreamState::Receiving);
+        assert_eq!(r.render(), "42;g=7");
+        assert_eq!(Registration::parse("42;g=7"), Some(r));
+        let d = Registration::new(42, 7, StreamState::Draining);
+        assert_eq!(d.render(), "42;g=7;draining");
+        assert_eq!(Registration::parse(&d.render()), Some(d));
+        let c = Registration::new(42, 7, StreamState::Closed);
+        assert_eq!(Registration::parse(&c.render()), Some(c));
+        assert_eq!(Registration::parse(" 42 "), Some(Registration::new(42, 0, StreamState::Receiving)));
+        assert!(d.render().trim().parse::<NodeId>().is_err(), "no target for an older node");
+        assert_eq!(Registration::parse(""), None);
+        assert_eq!(Registration::parse("junk;draining"), None);
+        assert_eq!(Registration::parse("42;g=x"), None);
+        let i = Registration::new(42, 7, StreamState::Receiving).since(5);
+        assert_eq!(i.render(), "42;g=7;s=5");
+        assert_eq!(Registration::parse("42;g=7;s=5"), Some(i));
+    }
+
+    /// [q-dead] A tombstone written on behalf of a down node says so; the
+    /// legacy form is the bare node id.
+    #[test]
+    fn a_tombstone_on_behalf_of_a_down_node_says_so() {
+        let g = Registration::gone(42, 7);
+        assert_eq!(g.render(), "42;g=7;closed;gone");
+        assert_eq!(Registration::parse(&g.render()), Some(g));
+        assert!(!Registration::new(42, 7, StreamState::Closed).gone);
+        assert_eq!(Registration::new(42, 7, StreamState::Draining).since(5).render_legacy(), "42");
+    }
+
+    /// [q-dead] A stream of a node from before its incarnation is dead.
+    #[test]
+    fn a_stream_from_before_its_node_restarted_is_dead() {
+        let r = Registration::new(1, 100, StreamState::Receiving).since(50);
+        assert!(r.outlives(1, 49));
+        assert!(!r.outlives(1, 50), "of this incarnation");
+        assert!(!r.outlives(2, 49), "another node's");
+        assert!(!Registration::new(1, 100, StreamState::Receiving).outlives(1, 49), "no incarnation given");
+        assert!(!r.outlives(1, 0), "generation 0 is unknown, not older");
+        let t = Registration::new(1, 10, StreamState::Closed);
+        assert!(!Registration::new(2, 0, StreamState::Receiving).removed_by(&t), "another node's bare one");
+        assert!(Registration::new(1, 0, StreamState::Receiving).removed_by(&t), "its own node's");
+    }
+
+    /// [q-dead] A tombstone removes its own stream and older ones - on any
+    /// node, as a client that moved closes the stream it moved to - and never
+    /// a newer registration.
+    #[test]
+    fn a_tombstone_removes_its_stream_and_older_ones_only() {
+        let t = Registration::new(1, 10, StreamState::Closed);
+        assert!(Registration::new(1, 10, StreamState::Receiving).removed_by(&t));
+        assert!(Registration::new(1, 3, StreamState::Draining).removed_by(&t), "an older stream there");
+        assert!(Registration::new(2, 5, StreamState::Receiving).removed_by(&t), "older, on the node it left");
+        assert!(!Registration::new(2, 11, StreamState::Receiving).removed_by(&t), "registered again since");
+        assert!(!Registration::new(1, 11, StreamState::Receiving).removed_by(&t), "a newer stream there");
     }
 
     #[test]

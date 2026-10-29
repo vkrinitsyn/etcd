@@ -1,0 +1,60 @@
+name: ci
+
+# The tests with each feature set, and the line coverage of them all: under 77% fails
+# the run. The coverage goes to Codecov (the README badge) through GitHub's OIDC token -
+# no secret; the repository is enabled once at codecov.io.
+# The tests start their own servers (in-process, or the etcds binary) and the ClickHouse
+# ones a fake HTTP endpoint: no service containers.
+on:
+  push:
+    branches-ignore: ["dependabot/**"]   # their pull request runs it
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # a branch's newer push cancels its older run; on main each run stands (the badge):
+  # a cancelled run there shows as failing
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # default; OpenTelemetry; the built-in ClickHouse queue consumer; the broker bridge
+        features: ["", "--features tracer", "--features clickhouse", "--features bridge"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # build.rs compiles the etcd protos (tonic-prost-build)
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - run: cargo test ${{ matrix.features }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # Codecov's OIDC upload
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # 77: the line coverage measured (77.16%, all features) when this gate came in, not
+      # yet the 90 of diff-doc-rs; raise it as the tests grow
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info --fail-under-lines 77
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          use_oidc: true
+          # a fork's pull request has no token: the gate above holds without the upload
+          fail_ci_if_error: false
