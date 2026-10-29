@@ -1,6 +1,6 @@
 [package]
 name = "etcds"
-version = "0.22.1"
+version = "0.22.2"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "support@dbinvent.com"]
 edition = "2024"
 readme = "README.md"
@@ -50,7 +50,8 @@ etcd-client = { version = "^0.21", optional = true }
 fe2o3-amqp = { version = "^0.18.4", features = ["acceptor", "rustls"], optional = true }
 futures-util = { version = "^0.3", optional = true }
 rskafka = { version = "^0.6.0", default-features = false, features = ["transport-tls"], optional = true }
-rumqttc = { version = "^0.25.1", optional = true }
+# native-tls: rumqttc's rustls feature brings rustls-webpki 0.102 (RUSTSEC-2026-0049 and others)
+rumqttc = { version = "^0.25.1", default-features = false, features = ["use-native-tls"], optional = true }
 rustls = { version = "^0.23", optional = true }
 rustls-pki-types = { version = "^1", features = ["std"], optional = true }
 webpki-roots = { version = "^1", optional = true }

@@ -30,7 +30,8 @@ async fn etcd() -> (EtcdNode, String) {
     let addr = format!("127.0.0.1:{}", free_port());
     let mut cfg = etcds::cli::EtcdConfig::with_defaults();
     cfg.listen_client_urls = addr.clone();
-    let node = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!())).await.unwrap();
+    let node = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+        #[cfg(feature = "tracer")] None).await.unwrap();
     node.serve().await.unwrap();
     let endpoint = format!("http://{}", addr);
     let mut c = Client::connect([endpoint.as_str()], None).await.unwrap();

@@ -23,7 +23,7 @@ use std::time::Duration;
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::{Packet, PubAckReason, PublishProperties};
 use rumqttc::v5::{AsyncClient, Event, MqttOptions};
-use rumqttc::Transport;
+use rumqttc::{TlsConfiguration, Transport};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -55,7 +55,8 @@ impl Mqtt {
             opts.set_credentials(u, p);
         }
         if tls {
-            opts.set_transport(Transport::tls_with_default_config());
+            // native-tls: the system's TLS and trusted roots
+            opts.set_transport(Transport::Tls(TlsConfiguration::Native));
         }
         let (client, mut eventloop) = AsyncClient::new(opts, 10);
         let (tx, mut events) = mpsc::channel(16);

@@ -31,7 +31,8 @@ pub fn free_port() -> u16 {
 pub async fn etcd_on(addr: &str) -> EtcdNode {
     let mut cfg = etcds::cli::EtcdConfig::with_defaults();
     cfg.listen_client_urls = addr.to_string();
-    let node = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!())).await.unwrap();
+    let node = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),
+        #[cfg(feature = "tracer")] None).await.unwrap();
     node.serve().await.unwrap();
     let endpoint = format!("http://{}", addr);
     let mut c = Client::connect([endpoint.as_str()], None).await.unwrap();

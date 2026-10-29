@@ -47,7 +47,8 @@ async fn bridge_once(target: &str, address: &str, shape: Shape) {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut ec = etcds::cli::EtcdConfig::with_defaults();
     ec.listen_client_urls = format!("127.0.0.1:{}", port);
-    let node = EtcdNode::init(ec, slog::Logger::root(slog::Discard, slog::o!())).await.unwrap();
+    let node = EtcdNode::init(ec, slog::Logger::root(slog::Discard, slog::o!()),
+        #[cfg(feature = "tracer")] None).await.unwrap();
     node.serve().await.unwrap();
     let etcd = format!("http://127.0.0.1:{}", port);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -211,7 +212,8 @@ async fn live_kafka_tombstones() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut ec = etcds::cli::EtcdConfig::with_defaults();
     ec.listen_client_urls = format!("127.0.0.1:{}", port);
-    let node = EtcdNode::init(ec, slog::Logger::root(slog::Discard, slog::o!())).await.unwrap();
+    let node = EtcdNode::init(ec, slog::Logger::root(slog::Discard, slog::o!()),
+        #[cfg(feature = "tracer")] None).await.unwrap();
     node.serve().await.unwrap();
     let etcd = format!("http://127.0.0.1:{}", port);
     tokio::time::sleep(Duration::from_millis(300)).await;
