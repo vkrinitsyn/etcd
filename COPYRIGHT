@@ -1,0 +1,7 @@
+etcd (etcds) - an etcd v3 API server, a light one for queue management.
+
+Copyright (c) 2025-2026 Vladimir Krinitsyn, DBinvent
+
+Licensed under the MIT license or the Apache License 2.0, at your option: see
+LICENSE-MIT and LICENSE-APACHE. The crates it is built with keep their own licenses,
+as Cargo.lock lists them.

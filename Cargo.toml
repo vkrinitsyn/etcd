@@ -7,7 +7,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 description = "An etcd v3 API server - light server version for queue management"
 repository = "https://github.com/vkrinitsyn/etcd.git"
-homepage = "https://github.com/vkrinitsyn/etcd"
+homepage = "https://vkrinitsyn.github.io/"
 keywords = ["etcd", "v3", "api", "server", "queue"]
 
 [dependencies]

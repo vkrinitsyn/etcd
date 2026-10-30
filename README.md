@@ -15,8 +15,9 @@ It provides asynchronous client backed by [tokio](https://github.com/tokio-rs/to
 and [tonic](https://github.com/hyperium/tonic).
 
 
-> [!IMPORTANT]
-This is an experimental Prof of Concept of the features bellow
+> [!NOTE]
+> Provided by [DBinvent](https://www.dbinvent.com), and an essential part of
+> [YT Cluster](https://www.dbinvent.com/cluster/)
 
 ## Features
 - etcd API v3 compatible client using protobuf to leverage existing ecosystem
