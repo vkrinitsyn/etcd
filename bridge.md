@@ -10,7 +10,8 @@ messages.
 
 etcds runs it, built with the `bridge` feature, from the `bridge_*` settings -
 flags, or keys of its config file. The bridge is a client of its own node, over
-gRPC at the node's first client URL. The code is `src/bridge/`: `node.rs` the
+gRPC at the node's first client URL - or, embedded in the program that runs the
+node, of that node in-process (`Config::node`, below). The code is `src/bridge/`: `node.rs` the
 settings, `mod.rs` the delivery, `listener.rs`, `mapping.rs`, `cloudevents.rs`
 and `target/` the brokers. It was the separate crate etcd2jms until 2026-10-29.
 
@@ -57,6 +58,32 @@ exits 16 (ETCD-E107). The node is reached over plain `http://` at its first
 
 In a program of its own: `bridge::run` (a queue or a prefix) and
 `listener::listen`, each with a `bridge::Config` and a future that stops it.
+
+## TLS and logins
+
+`amqps://`, `mqtts://` and `kafkas://` connect over TLS and check the broker's
+certificate and its name: against the public roots, or, with `?ca=<PEM file>`,
+against the CAs in that file only.
+
+```text
+amqps://app:secret@broker:5671?ca=/etc/bridge/ca.pem    AMQP over TLS, SASL PLAIN, a private CA
+mqtts://app:secret@broker:8883?ca=/etc/bridge/ca.pem    MQTT 5 over TLS, a login, a private CA
+kafkas://broker:9093?ca=/etc/bridge/ca.pem              Kafka SSL, a private CA (no login: below)
+```
+
+- **The login** is the URL's `user:password@`, percent-decoded (`%40` for an `@`,
+  `%25` for a `%`): SASL PLAIN on AMQP, the CONNECT user and password on MQTT.
+  Kafka takes none.
+- **`amqps://` is TLS from its first byte** (port 5671; AMQP 1.0 core 5.2.1, the
+  alternative establishment), as Artemis, RabbitMQ and Azure Service Bus serve it.
+- **The public roots** are webpki's on AMQP and Kafka (rustls), and the system's on
+  MQTT (native-tls).
+- **Refused at start:** a CA file that does not read or holds no certificate,
+  `ca` on a plain `amqp://`, `mqtt://` or `kafka://`, and any other option on
+  AMQP and MQTT.
+- **Not built:** a client certificate (mTLS), and TLS on the listener.
+
+`live/security/run.sh` (Tests, below) checks these against real brokers.
 
 ## Delivery
 
@@ -119,6 +146,23 @@ is replayed. A change while the bridge is down, or while etcd has dropped its
 watch as slow (2 s, ETCD-E085) is missed; a send that fails is retried as above
 while the bridge runs. Keys under `/q/` are queue traffic and refused as a
 prefix.
+
+A prefix holding a key the node serves to **no remote caller** is refused as
+well - `local_only_prefix`, its `local_only_prefix_except` branches aside: the
+bridge reads as a local client and sends to a broker, so it would carry those
+keys out of the node (an embedder's secret store under `/secret/`, its key wraps
+and metadata). The prefix is asked as a remote caller's watch of it would be: what
+the node lets one watch, the bridge may send. The binary checks it at start, from
+its own settings (exit code 14); `bridge::run` checks it against `Config::policy`
+and, in-process, the node's own - at the start and at every change it sends, so a
+reconfigure that keeps the prefix local stops the bridge (`Config::served_out`).
+Over gRPC with no `Config::policy`, nothing is known and nothing refused: an
+embedder bridging its own node over loopback sets it.
+
+A queue is asked the same way, as a remote consumer's watch of it would be, in both
+spellings (`/q/{name}/c/{uuid}`, `/queue/{name}/consumer/{uuid}`): a queue the node
+gives no remote consumer, the bridge does not send either - `bridge_queue` at start
+(exit code 14), the listener at each client link (refused, the link closed).
 
 ## AMQP 1.0 / JMS
 
@@ -252,7 +296,25 @@ events.
 
 `etcds::bridge::run(config, logger, shutdown)` runs the bridge in another
 tokio program until `shutdown` completes, `etcds::bridge::listener::listen` the
-listener; `Config::validate` says what they refuse. `etcds::bridge::mapping`,
+listener; `Config::validate` says what they refuse. Build the `Config` over its
+`Default` - `Config { queue, target_url, address, ..Default::default() }` - and a
+field added later does not break the build.
+
+Since 0.23.0: `Config` has `node` and `policy` (a struct literal without
+`..Default::default()` needs both); `amqps://` is TLS from its first byte, so a
+broker that wants the AMQP TLS header first is not served; an AMQP login is
+percent-decoded, as MQTT's always was (`%40` for an `@`); an option on an AMQP or
+MQTT URL other than `ca=` is refused; and a queue - the listener's links too - that
+the node serves to no remote consumer is refused, as a key prefix was.
+
+A program that runs the node itself sets `Config::node` to its `EtcdNode`: the
+bridge then watches and writes in-process - `EtcdNode::new_watcher` for its
+watch, `kv_delete` for an acknowledge, `kv_put` for the dead-letter queue - with
+no connection, so no TLS to meet and no client listener to dial, and `etcd` and
+`etcd_user` are not used. Its stream ends as a gRPC one does: dropped, the node
+sees the consumer gone and hands out again what it held. Without it, `etcd` names
+the endpoints, over gRPC, and `Config::policy` the node's prefix policy for the
+check above. `etcds::bridge::mapping`,
 `etcds::bridge::cloudevents` and `etcds::bridge::broker::{mqtt::topic,
 kafka::partition_of}` are the shapes alone. An embedder of `EtcdNode` gets no
 bridge from the `bridge_*` settings: those are the binary's.
@@ -268,7 +330,12 @@ etcds node:
   sent again with the same id; a broker down past etcd's slow-consumer limit,
   with the watch made again and every message delivered once, in order; a
   configuration refused; a key prefix's puts and deletes sent in order, the
-  keys left in place;
+  keys left in place; and in-process (`Config::node`): delivery with the
+  acknowledgement, a kept message back on the line once the bridge stops, the
+  dead-letter queue, a key prefix, a restart under the same consumer, and a prefix
+  the node keeps local refused (as over gRPC, with `Config::policy`); the unit
+  tests add a reconfigure that keeps a running bridge's prefix local, which stops
+  it, and the changes that came before an in-process watch's `created` frame, kept;
 - `tests/bridge_failures.rs`: brokers and etcd going away, cut and refusing;
 - `tests/bridge_listener.rs` and `tests/bridge_listener_outcomes.rs`, with an
   AMQP client: a client's accept acknowledges; a client that leaves, holding a
@@ -292,8 +359,26 @@ docker build -t e2j-jms-listener live/jms-listener
 docker run --rm e2j-jms-listener amqp://host:5672 user password queue count idle-seconds
 ```
 
+`live/security/run.sh` - `DOCKER_HOST=ssh://<docker host> live/security/run.sh`
+(`KEEP=1` keeps the containers) - runs each bridge over TLS with a login, against
+brokers that serve only that, and reads back with Python clients (`live/security/python/`:
+paho-mqtt, Qpid Proton, confluent-kafka), as an application does:
+
+- **what must work:** MQTT (Mosquitto, `mqtts`), AMQP (Artemis, `amqps`) and
+  Kafka (`kafkas`), each with a CA made for the run in `?ca=` and a login whose
+  password holds `@ % ?`, every message read back and acknowledged in etcd; MQTT with
+  a CA file of two (a rotation); the listener with its login;
+- **what must be refused:** a bridge trusting another CA, or the public roots only,
+  or with a wrong password (nothing sent, the message held, not acknowledged) - and
+  MQTT trusting another CA on a node whose system store trusts the brokers' (`ca=`
+  is the only trust); a Python client with no TLS or another CA, to each broker, or a
+  wrong password; the listener with a wrong login or none; a bridge prefix over the
+  node's local-only keys and a bridge queue the node keeps local (exit code 14), and a
+  listener client of such a queue (its link refused, the message left in etcd).
+
 Run so far against ActiveMQ Artemis 2.42 (AMQP and MQTT 5), Eclipse Mosquitto
-2.0 and Apache Kafka 3.9 (KRaft, PLAINTEXT); the listener with Qpid JMS 2.7.
+2.0 and Apache Kafka 3.9 (KRaft, PLAINTEXT, and SSL in `live/security`); the
+listener with Qpid JMS 2.7.
 
 ## Built, and not
 

@@ -1,6 +1,6 @@
 [package]
 name = "etcds"
-version = "0.22.2"
+version = "0.23.0"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "support@dbinvent.com"]
 edition = "2024"
 readme = "README.md"
@@ -53,6 +53,9 @@ rskafka = { version = "^0.6.0", default-features = false, features = ["transport
 # native-tls: rumqttc's rustls feature brings rustls-webpki 0.102 (RUSTSEC-2026-0049 and others)
 rumqttc = { version = "^0.25.1", default-features = false, features = ["use-native-tls"], optional = true }
 rustls = { version = "^0.23", optional = true }
+# [bridge-ca] the AMQP client's TLS with a CA of its own: fe2o3-amqp takes a connector of the
+# version it brings
+tokio-rustls = { version = "^0.26", default-features = false, optional = true }
 rustls-pki-types = { version = "^1", features = ["std"], optional = true }
 webpki-roots = { version = "^1", optional = true }
 
@@ -62,7 +65,7 @@ tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # /q/ch:<table>/ and /queue/clickhouse:<table>/ queues write straight to ClickHouse
 clickhouse = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
 # bridge_queue, bridge_prefix or bridge_listen to a broker, started by the binary
-bridge = ["dep:etcd-client", "dep:fe2o3-amqp", "dep:futures-util", "dep:rskafka", "dep:rumqttc", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+bridge = ["dep:etcd-client", "dep:fe2o3-amqp", "dep:futures-util", "dep:rskafka", "dep:rumqttc", "dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 tokio = { version = "^1.44", features = ["full"] }

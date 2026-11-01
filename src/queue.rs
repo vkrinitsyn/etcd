@@ -590,8 +590,8 @@ impl Queue {
                 return;
             }
             let reason = tr!("queue.stalled", timeout = format!("{:?}", DISPATCH_TIMEOUT));
-            let _ = ch.send(Ok(WatchResponse { watch_id: watcher, canceled: true, cancel_reason: reason,
-                ..Default::default() })).await;
+            let _ = ch.send(Ok(WatchResponse { header: Some(etcd.response_header()), watch_id: watcher, canceled: true,
+                cancel_reason: reason, ..Default::default() })).await;
         });
     }
 
@@ -1102,9 +1102,12 @@ impl Queue {
                     // live one.
                     let mut delivered = false;
                     let me = queue.etcd.read().await.peers.read().await.me();
+                    // [watch-header] every frame carries the header: etcd's Go client reads
+                    // it unchecked (`*pbresp.Header`), and a frame with none crashed it
+                    let header = Some(queue.etcd.read().await.response_header());
                     for (cid, wid, generation, client) in candidates {
                         let resp = WatchResponse {
-                            header: None,
+                            header: header.clone(),
                             watch_id: wid,
                             created: false,
                             canceled: false,
@@ -1360,9 +1363,10 @@ impl Queue {
                     .map(|(wid, w)| (*wid, w.client.clone())).collect(),
             }
         };
+        let header = Some(self.etcd.read().await.response_header()); // [watch-header]
         for (wid, ch) in watchers {
             let resp = WatchResponse {
-                header: None,
+                header: header.clone(),
                 watch_id: wid,
                 created: false,
                 canceled: false,
@@ -2009,6 +2013,7 @@ impl EtcdNode {
 
         if let Err(e) = sender.send(Ok(
             WatchResponse {
+                header: Some(self.response_header()), // [watch-header]
                 watch_id: r.watch_id,
                 created: true, .. Default::default()
             }
@@ -2114,20 +2119,55 @@ impl EtcdNode {
             }
             c.watchers.remove(&watch_id)?
         };
-        let empty = {
+        // [range] ...and drop the key's entry and its range with the last watcher
+        // that used it, or every cancelled prefix watch leaves a scan entry behind.
+        // [watch-gone] Seen empty and dropped under the same two guards, taken in the
+        // notify's order: a watch made on the key in between (`create_watcher`) keeps
+        // both, rather than being wiped - created, and never told of a change
+        {
+            let mut ranges = self.observer_ranges.write().await;
             let mut obs = self.observers.write().await;
             if let Some(o) = obs.get_mut(&w.key) {
                 o.retain(|(o_cid, o_wid)| !(o_cid == cid && o_wid == &watch_id));
-                o.is_empty()
-            } else { false }
-        };
-        // [range] ...and drop the range with the last watcher that used
-        // it, or every cancelled prefix watch leaves a scan entry behind.
-        if empty {
-            self.observers.write().await.remove(&w.key);
-            self.observer_ranges.write().await.remove(&w.key);
+                if o.is_empty() {
+                    obs.remove(&w.key);
+                    ranges.remove(&w.key);
+                }
+            }
+        }
+        // [watch-gone] ...and the client with its last watch, or every stream ever
+        // made leaves its client's entry behind. The client's lock is taken under the
+        // map's, as `create_watcher` takes them, so no watch is made into it meanwhile
+        {
+            let mut all = self.watchers.write().await;
+            if let Some(e) = all.get(cid) {
+                if Arc::ptr_eq(e, &c) && e.read().await.watchers.is_empty() {
+                    all.remove(cid);
+                }
+            }
         }
         Some(w)
+    }
+
+    /// [watch-gone] The key watches of a stream whose requests have ended - its client
+    /// gone, or an in-process watcher's request channel dropped - taken off at once, as
+    /// etcd closes such a stream, rather than at the next change under them (or never,
+    /// with none). `cids`: each client id the stream used. A queue consumer's watch is
+    /// the queue's, dropped when its channel closes (`drop_closed`).
+    pub(crate) async fn forget_stream(&self, cids: &HashSet<ClientId>, ch: &Sender<Result<WatchResponse, Status>>) {
+        for cid in cids {
+            let Some(c) = self.watchers.read().await.get(cid).cloned() else { continue };
+            let on: Vec<(WatcherId, Vec<u8>)> = c.read().await.watchers.iter()
+                .filter(|(_, w)| w.client.same_channel(ch))
+                .map(|(id, w)| (*id, w.key.clone()))
+                .collect();
+            for (wid, key) in on {
+                let observer = self.observers.read().await.get(&key).map_or(false, |o| o.contains(&(*cid, wid)));
+                if observer {
+                    self.forget_watch(cid, wid, Some(ch)).await;
+                }
+            }
+        }
     }
 
     /// [q-dead] A key watcher that did not take a notification within
@@ -2145,7 +2185,8 @@ impl EtcdNode {
             }
         }
         let reason = tr!("srv.watch_slow", timeout = format!("{:?}", crate::srv::watch::NOTIFY_TIMEOUT));
-        let _ = ch.send(Ok(WatchResponse { watch_id: wid, canceled: true, cancel_reason: reason, ..Default::default() })).await;
+        let _ = ch.send(Ok(WatchResponse { header: Some(self.response_header()), watch_id: wid, canceled: true,
+            cancel_reason: reason, ..Default::default() })).await;
     }
 
     pub(crate) async fn remove_watcher(&self, r: WatchCancelRequest, cid: ClientId) {
@@ -2165,7 +2206,7 @@ impl EtcdNode {
             }
 
             if let Err(e) = w.client.send(Ok(
-                WatchResponse { watch_id: r.watch_id, canceled: true, .. Default::default() }
+                WatchResponse { header: Some(self.response_header()), watch_id: r.watch_id, canceled: true, .. Default::default() }
             )).await {
                 warn!(self.log, "{}{}", LP, tr!("queue.cancel_send_failed", err = e));
             }
@@ -2847,7 +2888,12 @@ pub(crate) mod node_tests {
         let cancel = rx.recv().await.unwrap().unwrap();
         assert!(cancel.canceled && cancel.watch_id == 1, "told its watch is over: {:?}", cancel);
         assert!(cancel.cancel_reason.starts_with("ETCD-E052 "), "{}", cancel.cancel_reason);
-        assert!(!n.watchers.read().await[&slow].read().await.watchers.contains_key(&1), "as a cancel takes it");
+        // [watch-gone] the client's entry goes with its last watch
+        let left = match n.watchers.read().await.get(&slow).cloned() {
+            Some(c) => c.read().await.watchers.contains_key(&1),
+            None => false,
+        };
+        assert!(!left, "as a cancel takes it");
         drop((req, rx)); // goes, m2 unfinished
         assert_eq!(c.next_after_drain().await.0, "/q/full/2/m2", "what it held and did not finish");
     }

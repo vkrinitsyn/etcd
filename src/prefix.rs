@@ -55,7 +55,7 @@ pub fn is_remote(remote: Option<std::net::SocketAddr>) -> bool {
 
 /// The first key after every key that starts with `p`: etcd's prefix range end.
 /// `None` when there is none (`p` empty, or all `0xff`).
-fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
     let mut e = p.to_vec();
     while let Some(&last) = e.last() {
         if last == 0xff {

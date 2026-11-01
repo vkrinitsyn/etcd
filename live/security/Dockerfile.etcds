@@ -1,0 +1,8 @@
+# etcds with the bridge, built on the host (cargo build --features bridge: a debug build, its
+# debug log lines in), and
+# etcdctl to put on its queues
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates etcd-client \
+    && rm -rf /var/lib/apt/lists/*
+COPY etcds /usr/local/bin/etcds
+ENTRYPOINT ["/usr/local/bin/etcds"]

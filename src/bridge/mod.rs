@@ -2,7 +2,9 @@
 //! a broker, or JMS clients served as an AMQP peer. [`node`] reads the
 //! `bridge_*` settings for the binary; [`broker`] holds the brokers, [`listener`]
 //! the AMQP peer, [`mapping`] the JMS message and [`cloudevents`] its attributes.
-//! The bridge is a client of the node like any other, over gRPC.
+//! The bridge is a client of the node like any other, over gRPC - or, in the
+//! process that runs the node (an embedder's, as ytserv), of that node itself
+//! ([`Config::node`]): no connection, so no TLS to meet and no listener to dial.
 //!
 //! The bridge: an etcd queue consumer that sends each message to a broker -
 //! AMQP 1.0 (JMS), MQTT 5 or Kafka ([`crate::bridge::broker`]) - and acknowledges it
@@ -53,6 +55,7 @@ pub mod broker;
 
 use crate::bridge::mapping::{Delivery, KvEvent, Shape};
 use crate::bridge::broker::{Kind, Sent, Target};
+use crate::etcdpb::etcdserverpb::{watch_request, WatchCreateRequest, WatchRequest};
 
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -94,6 +97,42 @@ pub struct Config {
     pub buffer: usize,
     /// how long to wait for the broker: to connect, and to settle one message
     pub send_timeout: Duration,
+    /// [bridge-local] the node, when it runs in this process (an embedder's, as
+    /// ytserv's): watched and written in-process - no connection, so no TLS to meet
+    /// and no listener of its own to dial (`etcd` and `etcd_user` are not used then).
+    /// `None`: the `etcd` endpoints, over gRPC
+    pub node: Option<crate::cluster::EtcdNode>,
+    /// [bridge-secret] the node's prefix policy: a `prefix` holding a key it serves to
+    /// no remote caller (`local_only_prefix`, its exceptions aside) is refused - the
+    /// bridge sends what it reads off the node out of it, and reads as a local client.
+    /// In-process, the node's own is read too, at the start and at every change sent,
+    /// and both must allow it. `None` over gRPC: not known, nothing refused - an
+    /// embedder bridging its own node over loopback sets it
+    pub policy: Option<crate::prefix::PrefixPolicy>,
+}
+
+/// A base to set the fields an embedder needs over - `Config { queue, target_url,
+/// ..Default::default() }` - so a field added later keeps such code building: no
+/// endpoints, queue or target (`validate` refuses it as it is), a random consumer,
+/// and the binary's defaults - a buffer of 64, a send timeout of 30 s
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            etcd: vec![],
+            etcd_user: None,
+            queue: String::new(),
+            prefix: None,
+            consumer: Uuid::new_v4(),
+            target_url: String::new(),
+            address: String::new(),
+            shape: Shape::default(),
+            dead_letter: None,
+            buffer: 64,
+            send_timeout: Duration::from_secs(30),
+            node: None,
+            policy: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -110,6 +149,8 @@ impl std::fmt::Debug for Config {
             .field("dead_letter", &self.dead_letter)
             .field("buffer", &self.buffer)
             .field("send_timeout", &self.send_timeout)
+            .field("node", &self.node.as_ref().map(|_| "in-process"))
+            .field("policy", &self.policy)
             .finish()
     }
 }
@@ -123,8 +164,8 @@ impl Config {
             }
             Ok(())
         }
-        if self.etcd.is_empty() {
-            return Err("no etcd endpoint".into());
+        if self.etcd.is_empty() && self.node.is_none() {
+            return Err("no etcd endpoint, and no node in-process".into());
         }
         match &self.prefix {
             None => queue_name("queue", &self.queue)?,
@@ -148,6 +189,9 @@ impl Config {
         }
         if broker::kind(&self.target_url)? == Kind::Kafka {
             broker::kafka::KafkaUrl::parse(&self.target_url)?;
+        } else if let (_, Some(ca)) = broker::tls_ca(&self.target_url)? {
+            // [bridge-ca] read at start: a CA that does not, refused before anything is sent
+            broker::ca_roots(&ca)?;
         }
         if broker::kind(&self.target_url)? == Kind::Mqtt && self.address.contains(['+', '#']) {
             return Err(format!("MQTT topic prefix {:?}: no wildcards", self.address));
@@ -160,13 +204,162 @@ impl Config {
         }
         Ok(())
     }
+
+    /// [bridge-secret] Refused when `prefix` holds a key `policy` serves to no remote
+    /// caller: the bridge reads as a local client and sends to a broker, so it would
+    /// carry those keys out of the node - an embedder's secret store under `/secret/`
+    /// (its envelopes' metadata, its key wraps) to whoever reads the broker. Asked as
+    /// a remote caller would be: what the node gives one, the bridge may send
+    ///
+    /// A queue (the listener's links too) is asked as a remote consumer's watch of it
+    /// is, in both spellings: a queue a remote consumer may not take, the bridge may not
+    /// send either.
+    pub fn served_out(&self, policy: &crate::prefix::PrefixPolicy) -> Result<(), String> {
+        let remote = Some(std::net::SocketAddr::from(([192, 0, 2, 1], 0))); // TEST-NET-1: any non-loopback
+        let Some(p) = &self.prefix else {
+            let keys = [consumer_key(self), format!("/queue/{}/consumer/{}", self.queue, self.consumer)];
+            return match keys.iter().all(|k| policy.range_may_serve(k.as_bytes(), &[], remote)) {
+                true => Ok(()),
+                false => Err(format!("queue {:?}: the node serves it to no remote consumer (local_only_prefix) - \
+                    the bridge would send its messages out of it", self.queue)),
+            };
+        };
+        let end = crate::prefix::prefix_end(p.as_bytes()).unwrap_or_else(|| vec![0]);
+        if policy.range_may_serve(p.as_bytes(), &end, remote) {
+            Ok(())
+        } else {
+            Err(format!("prefix {:?}: it holds keys the node serves to no remote caller (local_only_prefix) - \
+                the bridge would send them out of it", p))
+        }
+    }
+
+    /// [bridge-secret] `served_out` against the node's own policy in-process, as it is
+    /// now, and against the one given
+    pub(crate) async fn kept_in(&self) -> Result<(), String> {
+        if let Some(n) = &self.node {
+            self.served_out(&*n.policy.read().await)?;
+        }
+        if let Some(p) = &self.policy {
+            self.served_out(p)?;
+        }
+        Ok(())
+    }
+}
+
+/// [bridge-local] The node a stream's deliveries came from: the acknowledge and the
+/// dead-letter put go back the same way. In-process they are the embedder's own writes
+/// (`EtcdNode::kv_delete`, `kv_put`): the same put and delete a gRPC call makes, less
+/// its `readonly_prefix` refusal - a prefix only the embedder writes - and its metrics
+#[derive(Clone)]
+enum Link {
+    Grpc(Client),
+    Local(crate::cluster::EtcdNode),
+}
+
+impl Link {
+    async fn delete(&mut self, key: Vec<u8>) -> Result<(), String> {
+        match self {
+            Link::Grpc(c) => c.delete(key, None).await.map(|_| ()).map_err(|e| e.to_string()),
+            Link::Local(n) => n.kv_delete(key).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn put(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        match self {
+            Link::Grpc(c) => c.put(key, value, None).await.map(|_| ()).map_err(|e| e.to_string()),
+            Link::Local(n) => n.kv_put(key.into_bytes(), value).await.map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// [bridge-local] One watch response, from either link: canceled (and why), or its
+/// events as (a put, the key, the value)
+struct Frame {
+    canceled: bool,
+    reason: String,
+    events: Vec<(bool, Vec<u8>, Vec<u8>)>,
+}
+
+/// [bridge-local] A watch stream: gRPC's, or one of the node in this process
+/// (`EtcdNode::new_watcher`). Dropped, an in-process one closes as a gRPC one does:
+/// the node sees its consumer gone and hands out again what it held
+enum Watch {
+    Grpc(WatchStream),
+    Local {
+        req: mpsc::Sender<WatchRequest>,
+        rx: mpsc::Receiver<Result<crate::etcdpb::etcdserverpb::WatchResponse, tonic::Status>>,
+        watch_id: i64,
+        /// what came before the watch's `created` frame: a prefix watch is told of a
+        /// change from the moment it is registered, which is before that frame is sent
+        early: std::collections::VecDeque<Frame>,
+    },
+}
+
+/// One in-process response as a `Frame`
+fn local_frame(r: crate::etcdpb::etcdserverpb::WatchResponse) -> Frame {
+    Frame {
+        canceled: r.canceled,
+        reason: r.cancel_reason,
+        events: r.events.into_iter()
+            .filter_map(|ev| {
+                let put = ev.r#type == crate::etcdpb::mvccpb::event::EventType::Put as i32;
+                ev.kv.map(|kv| (put, kv.key, kv.value))
+            })
+            .collect(),
+    }
+}
+
+/// A watch of `key`, or of every key under it
+fn create(key: &str, prefix: bool, watch_id: i64) -> WatchRequest {
+    let range_end = if prefix { crate::prefix::prefix_end(key.as_bytes()).unwrap_or_else(|| vec![0]) } else { vec![] };
+    WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
+        WatchCreateRequest { key: key.as_bytes().to_vec(), range_end, watch_id, ..Default::default() })) }
+}
+
+impl Watch {
+    async fn next(&mut self) -> Result<Option<Frame>, String> {
+        match self {
+            Watch::Grpc(s) => match s.message().await {
+                Ok(Some(r)) => Ok(Some(Frame {
+                    canceled: r.canceled(),
+                    reason: r.cancel_reason().to_string(),
+                    events: r.events().iter()
+                        .filter_map(|ev| ev.kv().map(|kv| (ev.event_type() == EventType::Put, kv.key().to_vec(), kv.value().to_vec())))
+                        .collect(),
+                })),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            },
+            Watch::Local { rx, early, .. } => {
+                if let Some(f) = early.pop_front() {
+                    return Ok(Some(f));
+                }
+                match rx.recv().await {
+                    Some(Ok(r)) => Ok(Some(local_frame(r))),
+                    Some(Err(s)) => Err(s.to_string()),
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Watched again on the same stream, after a cancel
+    async fn again(&mut self, key: &str, prefix: bool) -> Result<(), String> {
+        match self {
+            Watch::Grpc(s) => s.watch(key, prefix.then(|| WatchOptions::new().with_prefix())).await.map_err(|e| e.to_string()),
+            Watch::Local { req, watch_id, .. } => {
+                *watch_id += 1;
+                req.send(create(key, prefix, *watch_id)).await.map_err(|_| "the node's watch is gone".to_string())
+            }
+        }
+    }
 }
 
 /// A delivery with the stream it came on: `client` is that stream's
 /// connection, used for the acknowledge.
 struct Held {
     stream: u64,
-    client: Client,
+    client: Link,
     delivery: Delivery,
 }
 
@@ -186,27 +379,44 @@ pub(crate) async fn run_on(
     link: Option<fe2o3_amqp::Sender>,
 ) -> Result<(), String> {
     cfg.validate()?;
+    cfg.kept_in().await?;
     broker::tls_provider();
     let (tx, rx) = mpsc::channel(cfg.buffer);
     let stream = Arc::new(AtomicU64::new(0));
     let target = Arc::new(Mutex::new(None));
-    let mut watch = tokio::spawn(watch_loop(cfg.clone(), log.clone(), tx, stream.clone()));
+    // [bridge-secret] why the watch stopped, set before its sender goes: the forward
+    // task then ends as well (its channel closed), and `select!` may see that first
+    let why = Arc::new(std::sync::Mutex::new(None::<String>));
+    let mut watch = tokio::spawn(watch_loop(cfg.clone(), log.clone(), tx, stream.clone(), why.clone()));
     let mut forward = match link {
         Some(sender) => tokio::spawn(link_loop(cfg.clone(), log.clone(), rx, stream, sender)),
         None => tokio::spawn(forward_loop(cfg.clone(), log.clone(), rx, stream, target.clone())),
     };
-    let result = tokio::select! {
+    // which one ended: its handle is spent - awaited again, it panicked "polled after
+    // completion" instead of the run returning its error
+    let (result, watch_ended, forward_ended) = tokio::select! {
         _ = shutdown => {
             info!(log, "shutting down");
-            Ok(())
+            (Ok(()), false, false)
         }
-        r = &mut watch => Err(format!("the watch task ended: {:?}", r)),
-        r = &mut forward => Err(format!("the forward task ended: {:?}", r)),
+        r = &mut watch => (match r {
+            Ok(Err(e)) => Err(e),
+            r => Err(format!("the watch task ended: {:?}", r)),
+        }, true, false),
+        r = &mut forward => (Err(format!("the forward task ended: {:?}", r)), false, true),
     };
     watch.abort();
     forward.abort();
-    let _ = watch.await;
-    let _ = forward.await;
+    if !watch_ended {
+        let _ = watch.await;
+    }
+    if !forward_ended {
+        let _ = forward.await;
+    }
+    let result = match (result, why.lock().map(|mut w| w.take()).unwrap_or_default()) {
+        (Err(_), Some(why)) => Err(why),
+        (r, _) => r,
+    };
     // the forward task is gone, and its lock with it
     if let Some(t) = target.lock().await.take() {
         t.close(cfg.send_timeout).await;
@@ -218,15 +428,20 @@ pub fn consumer_key(cfg: &Config) -> String {
     format!("/q/{}/c/{}", cfg.queue, cfg.consumer)
 }
 
-async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: Arc<AtomicU64>) {
+/// Ends only with the reason the bridge must stop (`Err`), or `Ok` once the forward task is gone
+async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: Arc<AtomicU64>,
+    why: Arc<std::sync::Mutex<Option<String>>>) -> Result<(), String> {
     let key = cfg.prefix.clone().unwrap_or_else(|| consumer_key(&cfg));
-    let opts = cfg.prefix.as_ref().map(|_| WatchOptions::new().with_prefix());
+    let prefixed = cfg.prefix.is_some();
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
     loop {
-        let (client, mut stream) = match connect_watch(&cfg, &key, opts.clone()).await {
+        let (client, mut stream) = match connect_watch(&cfg, &key, prefixed).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(log, "etcd {:?}: {}", cfg.etcd, e);
+                match &cfg.node {
+                    Some(_) => warn!(log, "the node in-process: {}", e),
+                    None => warn!(log, "etcd {:?}: {}", cfg.etcd, e),
+                }
                 backoff.wait().await;
                 continue;
             }
@@ -241,32 +456,42 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
         let mut rewatch = Backoff::new(REWATCH_MIN, BACKOFF_MAX);
 
         loop {
-            match stream.message().await {
+            match stream.next().await {
                 Ok(Some(resp)) => {
                     // the stream works: a failure after this starts the backoff over
                     backoff.reset();
-                    if resp.canceled() {
-                        warn!(log, "watch canceled: {}, watching again", resp.cancel_reason());
+                    // [bridge-secret] in-process, the node's policy as it is now: a
+                    // reconfigure that keeps the prefix's keys local stops the bridge
+                    if let (Some(n), false) = (&cfg.node, resp.events.is_empty()) {
+                        if let Err(e) = cfg.served_out(&*n.policy.read().await) {
+                            error!(log, "stopped: {}", e);
+                            if let Ok(mut w) = why.lock() {
+                                *w = Some(e.clone());
+                            }
+                            return Err(e);
+                        }
+                    }
+                    if resp.canceled {
+                        warn!(log, "watch canceled: {}, watching again", resp.reason);
                         rewatch.wait().await;
-                        if let Err(e) = stream.watch(key.as_str(), opts.clone()).await {
+                        if let Err(e) = stream.again(key.as_str(), prefixed).await {
                             warn!(log, "watch again: {}", e);
                             break;
                         }
                         continue;
                     }
-                    for ev in resp.events() {
-                        let Some(kv) = ev.kv() else { continue };
-                        let delivery = match (&cfg.prefix, ev.event_type()) {
-                            (None, EventType::Put) => Delivery::new(&cfg.queue, kv.key(), kv.value()),
-                            (None, EventType::Delete) => continue,
-                            (Some(p), EventType::Put) => Delivery::kv(p, kv.key(), kv.value(), KvEvent::Put),
-                            (Some(p), EventType::Delete) => Delivery::kv(p, kv.key(), kv.value(), KvEvent::Delete),
+                    for (put, k, v) in resp.events {
+                        let delivery = match (&cfg.prefix, put) {
+                            (None, true) => Delivery::new(&cfg.queue, &k, &v),
+                            (None, false) => continue,
+                            (Some(p), true) => Delivery::kv(p, &k, &v, KvEvent::Put),
+                            (Some(p), false) => Delivery::kv(p, &k, &v, KvEvent::Delete),
                         };
                         rewatch.reset();
                         debug!(log, "received {}", delivery.delivery_key);
                         let held = Held { stream: id, client: client.clone(), delivery };
                         if tx.send(held).await.is_err() {
-                            return; // the forward task is gone
+                            return Ok(()); // the forward task is gone
                         }
                     }
                 }
@@ -288,7 +513,30 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
     }
 }
 
-async fn connect_watch(cfg: &Config, key: &str, watch: Option<WatchOptions>) -> Result<(Client, WatchStream), String> {
+async fn connect_watch(cfg: &Config, key: &str, prefix: bool) -> Result<(Link, Watch), String> {
+    // [bridge-local] the node in this process: its watcher, as a gRPC Watch's
+    if let Some(node) = &cfg.node {
+        let (req, req_rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(cfg.buffer.max(16));
+        node.new_watcher(req_rx, tx, &Uuid::new_v4()).await;
+        req.send(create(key, prefix, 1)).await.map_err(|_| "the node took no watch".to_string())?;
+        // its `created` frame - a change under a prefix may come before it, kept
+        let deadline = tokio::time::Instant::now() + ETCD_TIMEOUT;
+        let mut early = std::collections::VecDeque::new();
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(Ok(r))) if r.canceled => return Err(format!("the node refused the watch: {}", r.cancel_reason)),
+                Ok(Some(Ok(r))) if r.created => {
+                    return Ok((Link::Local(node.clone()), Watch::Local { req, rx, watch_id: 1, early }));
+                }
+                Ok(Some(Ok(r))) => early.push_back(local_frame(r)),
+                Ok(Some(Err(s))) => return Err(s.to_string()),
+                Ok(None) => return Err("the node closed the watch".into()),
+                Err(_) => return Err(format!("no answer in {:?}", ETCD_TIMEOUT)),
+            }
+        }
+    }
+    let watch = prefix.then(|| WatchOptions::new().with_prefix());
     let mut opts = ConnectOptions::new()
         .with_connect_timeout(ETCD_TIMEOUT)
         .with_keep_alive(ETCD_KEEPALIVE, ETCD_KEEPALIVE)
@@ -303,7 +551,7 @@ async fn connect_watch(cfg: &Config, key: &str, watch: Option<WatchOptions>) -> 
         Ok::<_, etcd_client::Error>((client, stream))
     };
     match tokio::time::timeout(ETCD_TIMEOUT, connect).await {
-        Ok(r) => r.map_err(|e| e.to_string()),
+        Ok(r) => r.map(|(c, s)| (Link::Grpc(c), Watch::Grpc(s))).map_err(|e| e.to_string()),
         Err(_) => Err(format!("no answer in {:?}", ETCD_TIMEOUT)),
     }
 }
@@ -454,9 +702,9 @@ async fn give_up(cfg: &Config, log: &Logger, held: &mut Held, why: &str) -> bool
     };
     // one segment: a watched key's `/` would cut it short
     let key = format!("/q/{}/p/{}", dlq, held.delivery.key.replace('%', "%25").replace('/', "%2F"));
-    let put = held.client.put(key, held.delivery.value.clone(), None);
+    let put = held.client.put(key, held.delivery.value.clone());
     match tokio::time::timeout(ETCD_TIMEOUT, put).await {
-        Ok(Ok(_)) => {
+        Ok(Ok(())) => {
             warn!(log, "{}: {}, put on dead-letter queue {}", dk, why, dlq);
             acknowledge(log, held).await;
             true
@@ -483,8 +731,8 @@ async fn acknowledge(log: &Logger, held: &mut Held) {
         return;
     }
     for attempt in 1..=ACK_TRIES {
-        match tokio::time::timeout(ETCD_TIMEOUT, held.client.delete(held.delivery.raw_key.clone(), None)).await {
-            Ok(Ok(_)) => {
+        match tokio::time::timeout(ETCD_TIMEOUT, held.client.delete(held.delivery.raw_key.clone())).await {
+            Ok(Ok(())) => {
                 debug!(log, "acknowledged {}", dk);
                 return;
             }
@@ -552,7 +800,86 @@ mod tests {
             dead_letter: None,
             buffer: 64,
             send_timeout: Duration::from_secs(30),
+            node: None,
+            policy: None,
         }
+    }
+
+    /// [bridge-local] What came before the watch's `created` frame is read first, in order
+    #[tokio::test]
+    async fn an_in_process_watch_reads_what_came_before_created_first() {
+        let (req, _req_rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(4);
+        let frame = |k: &str| Frame { canceled: false, reason: String::new(), events: vec![(true, k.as_bytes().to_vec(), vec![])] };
+        let mut w = Watch::Local { req, rx, watch_id: 1, early: [frame("/p/a"), frame("/p/b")].into_iter().collect() };
+        tx.send(Ok(crate::etcdpb::etcdserverpb::WatchResponse { events: vec![crate::etcdpb::mvccpb::Event {
+            r#type: 1, kv: Some(crate::etcdpb::mvccpb::KeyValue { key: b"/p/c".to_vec(), ..Default::default() }), prev_kv: None }],
+            ..Default::default() })).await.unwrap();
+        let keys: Vec<(bool, Vec<u8>)> = vec![w.next().await, w.next().await, w.next().await].into_iter()
+            .map(|f| { let f = f.unwrap().unwrap(); (f.events[0].0, f.events[0].1.clone()) }).collect();
+        assert_eq!(keys, vec![(true, b"/p/a".to_vec()), (true, b"/p/b".to_vec()), (false, b"/p/c".to_vec())], "a delete is type 1");
+    }
+
+    /// [bridge-secret] In-process the node's policy is read at every change sent: a
+    /// reconfigure that keeps the prefix's keys local stops the bridge
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_process_bridge_stops_once_its_prefix_is_kept_local() {
+        let n = crate::queue::node_tests::node("33333333-3333-5333-8333-333333333333").await;
+        let mut c = cfg();
+        c.etcd = vec![];
+        c.node = Some(n.clone());
+        c.prefix = Some("/cfg/".into());
+        c.target_url = "amqp://127.0.0.1:1".into(); // no broker: what is sent waits
+        c.address = "cfg".into();
+        let log = Logger::root(slog::Discard, slog::o!());
+        let run = tokio::spawn(run(c, log, std::future::pending()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        *n.policy.write().await = crate::prefix::PrefixPolicy::new("", "", "/cfg/", "");
+        n.kv_put(b"/cfg/x".to_vec(), b"1".to_vec()).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(10), run).await.expect("stopped").unwrap();
+        assert!(ended.is_err(), "ended, not shut down: {:?}", ended);
+        // the caller is told why, not "the watch task ended: Ok(())"
+        let e = ended.unwrap_err();
+        assert!(e.contains("serves to no remote caller"), "the reason returned: {}", e);
+    }
+
+    /// [bridge-secret] The stop's reason is what `run` returns, every time: the forward
+    /// task ends with the watch (its channel closed), and `select!` took either one
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_policy_stop_reason_is_returned_every_time() {
+        for round in 0..30 {
+            let n = crate::queue::node_tests::node("44444444-4444-5444-8444-444444444444").await;
+            let mut c = cfg();
+            c.etcd = vec![];
+            c.node = Some(n.clone());
+            c.prefix = Some("/cfg/".into());
+            c.target_url = "amqp://127.0.0.1:1".into();
+            c.address = "cfg".into();
+            let run = tokio::spawn(run(c, Logger::root(slog::Discard, slog::o!()), std::future::pending()));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *n.policy.write().await = crate::prefix::PrefixPolicy::new("", "", "/cfg/", "");
+            n.kv_put(b"/cfg/x".to_vec(), b"1".to_vec()).await.unwrap();
+            let e = tokio::time::timeout(Duration::from_secs(10), run).await.expect("stopped").unwrap().unwrap_err();
+            assert!(e.contains("serves to no remote caller"), "round {}: {}", round, e);
+        }
+    }
+
+    /// [bridge-secret] `run` refuses a queue its policy gives no remote consumer - in
+    /// either spelling - before it watches anything; another queue it runs
+    #[tokio::test]
+    async fn run_refuses_a_queue_kept_local() {
+        for local in ["/q/payroll/", "/queue/payroll/"] {
+            let mut c = cfg();
+            c.queue = "payroll".into();
+            c.policy = Some(crate::prefix::PrefixPolicy::new("", "", local, ""));
+            let log = Logger::root(slog::Discard, slog::o!());
+            let r = tokio::time::timeout(Duration::from_secs(5), run(c, log, std::future::pending())).await
+                .expect("refused at once");
+            assert!(r.unwrap_err().contains("no remote consumer"), "{}", local);
+        }
+        let mut c = cfg();
+        c.policy = Some(crate::prefix::PrefixPolicy::new("", "", "/q/payroll/", ""));
+        assert!(c.served_out(c.policy.as_ref().unwrap()).is_ok(), "the queue jobs");
     }
 
     #[test]

@@ -41,10 +41,23 @@ pub struct Mqtt {
     address: String,
 }
 
+/// [bridge-ca] A TLS connector trusting the CAs in `path` only: the system's roots off
+fn native_connector(path: &str) -> Result<rumqttc::tokio_native_tls::native_tls::TlsConnector, String> {
+    use rumqttc::tokio_native_tls::native_tls::{Certificate, TlsConnector};
+    let mut b = TlsConnector::builder();
+    b.disable_built_in_roots(true);
+    for der in super::ca_certs(path)? {
+        b.add_root_certificate(Certificate::from_der(&der).map_err(|e| format!("ca {}: {}", path, e))?);
+    }
+    b.build().map_err(|e| format!("ca {}: {}", path, e))
+}
+
 impl Mqtt {
     pub async fn connect(cfg: &Config) -> Result<Self, String> {
-        let (user, hostport) = split_url(&cfg.target_url);
-        let tls = cfg.target_url.starts_with("mqtts://");
+        // [bridge-ca] `mqtts://...?ca=<PEM file>`: the CAs in that file trusted, no other
+        let (url, ca) = super::tls_ca(&cfg.target_url)?;
+        let (user, hostport) = split_url(&url);
+        let tls = url.starts_with("mqtts://");
         let (host, port) = match hostport.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| format!("port {:?}: {}", p, e))?),
             None => (hostport.clone(), if tls { 8883 } else { 1883 }),
@@ -55,8 +68,14 @@ impl Mqtt {
             opts.set_credentials(u, p);
         }
         if tls {
-            // native-tls: the system's TLS and trusted roots
-            opts.set_transport(Transport::Tls(TlsConfiguration::Native));
+            // native-tls: the system's TLS and trusted roots - or, with a CA file, every
+            // CA in it and no other (rumqttc's `SimpleNative` adds its first one to the
+            // system's roots)
+            let config = match ca {
+                Some(path) => TlsConfiguration::NativeConnector(native_connector(&path)?),
+                None => TlsConfiguration::Native,
+            };
+            opts.set_transport(Transport::Tls(config));
         }
         let (client, mut eventloop) = AsyncClient::new(opts, 10);
         let (tx, mut events) = mpsc::channel(16);

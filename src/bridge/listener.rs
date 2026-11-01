@@ -155,7 +155,12 @@ async fn consume(sender: Sender, template: Config, log: Logger, mut stopping: wa
     cfg.prefix = None;
     cfg.address = queue.clone();
     let log = log.new(slog::o!("queue" => queue.clone(), "consumer" => cfg.consumer.to_string()));
-    if let Err(e) = cfg.validate() {
+    // [bridge-secret] a queue the node serves to no remote consumer is refused to a
+    // client here as well: it is one
+    if let Err(e) = match cfg.validate() {
+        Ok(()) => cfg.kept_in().await,
+        e => e,
+    } {
         warn!(log, "link refused: {}", e);
         let _ = sender.close().await;
         return;

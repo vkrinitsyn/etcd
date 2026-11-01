@@ -65,6 +65,8 @@ async fn bridge_once(target: &str, address: &str, shape: Shape) {
         dead_letter: None,
         buffer: 16,
         send_timeout: Duration::from_secs(10),
+        node: None,
+        policy: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let run = tokio::spawn(bridge::run(cfg, log(), async {
@@ -229,6 +231,8 @@ async fn live_kafka_tombstones() {
         dead_letter: None,
         buffer: 16,
         send_timeout: Duration::from_secs(10),
+        node: None,
+        policy: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let run = tokio::spawn(bridge::run(cfg, log(), async {

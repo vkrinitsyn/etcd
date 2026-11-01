@@ -33,8 +33,6 @@ use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandl
 use rskafka::BackoffConfig;
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
 
 use super::{Sent, split_url};
 use crate::bridge::Config;
@@ -116,18 +114,14 @@ impl KafkaUrl {
     /// TLS trusting `ca`, or the public roots - with AWS-LC named: the AMQP
     /// client brings it and rskafka ring, and rustls takes no default then.
     fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>, String> {
-        let mut roots = rustls::RootCertStore::empty();
-        match &self.ca {
-            Some(path) => {
-                for cert in CertificateDer::pem_file_iter(path).map_err(|e| format!("ca {}: {}", path, e))? {
-                    roots.add(cert.map_err(|e| format!("ca {}: {}", path, e))?).map_err(|e| format!("ca {}: {}", path, e))?;
-                }
-                if roots.is_empty() {
-                    return Err(format!("ca {}: no certificate in it", path));
-                }
+        let roots = match &self.ca {
+            Some(path) => super::ca_roots(path)?,
+            None => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                roots
             }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
+        };
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

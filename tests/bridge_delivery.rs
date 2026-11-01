@@ -116,6 +116,8 @@ fn config(etcd: &str, amqp: &str, queue: &str, dead_letter: Option<&str>) -> Con
         dead_letter: dead_letter.map(str::to_string),
         buffer: 16,
         send_timeout: Duration::from_secs(5),
+        node: None,
+        policy: None,
     }
 }
 
@@ -401,4 +403,137 @@ async fn a_key_prefix_sends_puts_and_deletes_and_leaves_the_keys() {
     let got = c.get("/config/cache", None).await.unwrap();
     assert_eq!(got.kvs().first().map(|kv| kv.value().to_vec()), Some(b"redis://b".to_vec()), "the key stays");
     stop(b).await;
+}
+
+// ── [bridge-local] the node in this process ──────────────────────────────────
+
+/// `config`, the node in-process: no endpoint, no connection
+fn in_process(node: &EtcdNode, amqp: &str, queue: &str, dead_letter: Option<&str>) -> Config {
+    Config { etcd: vec![], node: Some(node.clone()), ..config("", amqp, queue, dead_letter) }
+}
+
+/// [bridge-local] In-process as over gRPC: delivered in order, acknowledged - gone from
+/// the queue once the broker took them
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_accepted_messages_are_acknowledged_in_order() {
+    let (node, etcd) = etcd().await;
+    let (amqp, mut rx) = broker(|_, _| Settle::Accept).await;
+    let b = start(in_process(&node, &amqp, "ijobs", None));
+    let mut c = producer(&etcd).await;
+    for i in 0..5 {
+        c.put(format!("/q/ijobs/p/k{}", i), format!("v{}", i), None).await.unwrap();
+    }
+    for i in 0..5 {
+        assert_eq!(text(&next(&mut rx).await), format!("v{}", i));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(b).await;
+    assert!(drain(&etcd, "ijobs", Duration::from_secs(2)).await.is_empty(), "left unacknowledged");
+}
+
+/// [bridge-local] What the broker would not take is held while the bridge runs and,
+/// once it stops - its in-process watch dropped - back on the line, as a closed gRPC
+/// stream's is
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_a_kept_message_is_back_once_the_bridge_stops() {
+    let (node, etcd) = etcd().await;
+    let (amqp, mut rx) = broker(bad_is_malformed).await;
+    let b = start(in_process(&node, &amqp, "ikeep", None));
+    let mut c = producer(&etcd).await;
+    c.put("/q/ikeep/p/x", "bad one", None).await.unwrap();
+    assert_eq!(text(&next(&mut rx).await), "bad one");
+    assert_eq!(text(&next(&mut rx).await), "bad one", "retried");
+    stop(b).await;
+    assert_eq!(drain(&etcd, "ikeep", Duration::from_secs(20)).await, vec![b"bad one".to_vec()]);
+}
+
+/// [bridge-local] The dead-letter put goes in-process too
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_rejected_goes_to_dead_letter() {
+    let (node, etcd) = etcd().await;
+    let (amqp, mut rx) = broker(bad_is_malformed).await;
+    let b = start(in_process(&node, &amqp, "iorders", Some("iorders-dlq")));
+    let mut c = producer(&etcd).await;
+    c.put("/q/iorders/p/a", "bad order", None).await.unwrap();
+    c.put("/q/iorders/p/b", "good order", None).await.unwrap();
+    assert_eq!(text(&next(&mut rx).await), "bad order");
+    assert_eq!(text(&next(&mut rx).await), "good order");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(b).await;
+    assert!(drain(&etcd, "iorders", Duration::from_secs(2)).await.is_empty(), "left unacknowledged");
+    assert_eq!(drain(&etcd, "iorders-dlq", Duration::from_secs(2)).await, vec![b"bad order".to_vec()]);
+}
+
+/// [bridge-local] A key prefix in-process: its puts and deletes, nothing beside it
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_a_key_prefix_sends_its_changes() {
+    let (node, etcd) = etcd().await;
+    let (amqp, mut rx) = broker(|_, _| Settle::Accept).await;
+    let mut cfg = in_process(&node, &amqp, "unused", None);
+    cfg.prefix = Some("/iconfig/".into());
+    let b = start(cfg);
+    let mut c = producer(&etcd).await;
+    c.put("/iconfig/db", "pg://a", None).await.unwrap();
+    c.put("/other/x", "not watched", None).await.unwrap();
+    c.delete("/iconfig/db", None).await.unwrap();
+    assert_eq!(text(&next(&mut rx).await), "pg://a");
+    let m = next(&mut rx).await;
+    match &m.body {
+        Body::Data(d) => assert!(d.iter().all(|x| x.0.is_empty()), "a delete has no value"),
+        other => panic!("not an empty data body: {:?}", other),
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(rx.try_recv().is_err(), "nothing from outside the prefix");
+    stop(b).await;
+}
+
+/// [bridge-secret] In-process, the node's own policy: a prefix holding keys it serves to
+/// no remote caller is refused before anything is watched - and over gRPC, the policy
+/// given
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefix_the_node_keeps_local_is_refused_in_process() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut ec = etcds::cli::EtcdConfig::with_defaults();
+    ec.listen_client_urls = addr;
+    ec.local_only_prefix = "/secret/".into();
+    let node = EtcdNode::init(ec, slog::Logger::root(slog::Discard, slog::o!()),
+        #[cfg(feature = "tracer")] None).await.unwrap();
+    let log = slog::Logger::root(slog::Discard, slog::o!());
+    let mut cfg = in_process(&node, "amqp://127.0.0.1:1", "unused", None);
+    cfg.prefix = Some("/secret/".into());
+    let e = bridge::run(cfg.clone(), log.clone(), std::future::pending()).await.unwrap_err();
+    assert!(e.contains("serves to no remote caller"), "{}", e);
+    let mut grpc = config("http://127.0.0.1:1", "amqp://127.0.0.1:1", "unused", None);
+    grpc.prefix = Some("/sec".into()); // over /secret/ (`/` alone lies over the queues: refused before)
+    grpc.policy = Some(etcds::prefix::PrefixPolicy::new("", "", "/secret/", ""));
+    assert!(bridge::run(grpc, log, std::future::pending()).await.unwrap_err().contains("serves to no remote caller"));
+}
+
+/// [bridge-local] An embedder that stops its in-process bridge and starts it again at
+/// once, under the same consumer: the second one consumes - the first one's stream gone
+/// (review, 2026-11-01)
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_a_restart_under_the_same_consumer_consumes() {
+    let (node, etcd) = etcd().await;
+    let (amqp, mut rx) = broker(|_, _| Settle::Accept).await;
+    let first = in_process(&node, &amqp, "irestart", None);
+    let consumer = first.consumer;
+    let b = start(first);
+    let mut c = producer(&etcd).await;
+    c.put("/q/irestart/p/a", "one", None).await.unwrap();
+    assert_eq!(text(&next(&mut rx).await), "one");
+    tokio::time::sleep(Duration::from_millis(300)).await; // its acknowledge lands: at least once
+    stop(b).await;
+    let second = Config { consumer, ..in_process(&node, &amqp, "irestart", None) };
+    let b = start(second);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..3 {
+        c.put(format!("/q/irestart/p/k{}", i), format!("v{}", i), None).await.unwrap();
+    }
+    for i in 0..3 {
+        assert_eq!(text(&next(&mut rx).await), format!("v{}", i));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(b).await;
+    assert!(drain(&etcd, "irestart", Duration::from_secs(2)).await.is_empty(), "left unacknowledged");
 }

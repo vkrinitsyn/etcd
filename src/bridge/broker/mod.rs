@@ -40,6 +40,65 @@ pub fn kind(url: &str) -> Result<Kind, String> {
     }
 }
 
+/// [bridge-ca] An AMQP or MQTT target URL and the CA file it names, `?ca=<PEM file>`:
+/// the URL without it, for the client, and the file. Only on `amqps://` and `mqtts://`;
+/// any other option refused. Kafka's URL has options of its own (`kafka::KafkaUrl`)
+///
+/// The options start at the first `?` after the host - after the last `@`, as
+/// `split_url` reads the login - so a `?` in a password is the password's. An `@` in
+/// the CA's path is written `%40`: one as it is would put the host after it, and the
+/// `ca=` is refused rather than left unread.
+pub fn tls_ca(url: &str) -> Result<(String, Option<String>), String> {
+    let start = url.find("://").map_or(0, |s| s + 3);
+    let host = url[start..].rfind('@').map_or(start, |a| start + a + 1);
+    let Some(q) = url[host..].find('?').map(|q| host + q) else {
+        if url[start..].contains("?ca=") || url[start..].contains("&ca=") {
+            return Err(format!("{}: a ca= that cannot be read - an '@' in its path is written %40, \
+                a '?' in a password %3F", crate::bridge::redact(url)));
+        }
+        return Ok((url.to_string(), None));
+    };
+    let (base, query) = (&url[..q], &url[q + 1..]);
+    let tls = url.starts_with("amqps://") || url.starts_with("mqtts://");
+    let mut ca = None;
+    for opt in query.split('&').filter(|o| !o.is_empty()) {
+        match opt.split_once('=') {
+            Some(("ca", path)) if !path.is_empty() => {
+                if !tls {
+                    return Err(format!("{}: ca on a plain connection - amqps:// or mqtts://", crate::bridge::redact(base)));
+                }
+                ca = Some(percent_decode(path));
+            }
+            // the option's name only: what follows the `=` is the caller's
+            _ => return Err(format!("{}: option {:?} - only ca=<PEM file>", crate::bridge::redact(base),
+                opt.split('=').next().unwrap_or_default())),
+        }
+    }
+    Ok((base.to_string(), ca))
+}
+
+/// [bridge-ca] The certificates a PEM file holds, every one, read at start: none in
+/// it, or a file that does not read, is refused
+pub fn ca_certs(path: &str) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, String> {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    let certs = CertificateDer::pem_file_iter(path).map_err(|e| format!("ca {}: {}", path, e))?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| format!("ca {}: {}", path, e))?;
+    if certs.is_empty() {
+        return Err(format!("ca {}: no certificate in it", path));
+    }
+    Ok(certs)
+}
+
+/// [bridge-ca] The CAs a PEM file holds, for rustls (AMQP, Kafka)
+pub fn ca_roots(path: &str) -> Result<rustls::RootCertStore, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in ca_certs(path)? {
+        roots.add(cert).map_err(|e| format!("ca {}: {}", path, e))?;
+    }
+    Ok(roots)
+}
+
 pub enum Target {
     /// boxed: a connection, session and link are large beside the others
     Amqp(Box<amqp::Amqp>),
@@ -129,6 +188,35 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [bridge-ca] `?ca=` on amqps:// and mqtts://: the URL without it for the client and
+    /// the file; on a plain one, or any other option, refused; a file that does not read,
+    /// or holds no certificate, refused at start
+    #[test]
+    fn a_ca_on_amqps_and_mqtts_and_nothing_else() {
+        assert_eq!(tls_ca("amqps://app:pw@h:5671?ca=/etc/ca.pem").unwrap(),
+            ("amqps://app:pw@h:5671".to_string(), Some("/etc/ca.pem".to_string())));
+        assert_eq!(tls_ca("mqtts://h:8883?ca=/c.pem").unwrap(), ("mqtts://h:8883".to_string(), Some("/c.pem".to_string())));
+        assert_eq!(tls_ca("mqtts://h:8883").unwrap(), ("mqtts://h:8883".to_string(), None));
+        assert!(tls_ca("amqp://h:5672?ca=/c.pem").unwrap_err().contains("plain connection"));
+        assert!(tls_ca("mqtts://h:8883?qos=2").unwrap_err().contains("only ca="));
+        assert!(tls_ca("amqps://h:5671?ca=").is_err(), "an empty path");
+        // a `?` in a password is the password's; the error never shows it
+        assert_eq!(tls_ca("mqtts://app:ab?cd@h:8883?ca=/c.pem").unwrap(),
+            ("mqtts://app:ab?cd@h:8883".to_string(), Some("/c.pem".to_string())));
+        assert_eq!(tls_ca("mqtts://app:ab?cd@h:8883").unwrap(), ("mqtts://app:ab?cd@h:8883".to_string(), None));
+        let e = tls_ca("amqps://app:ab?cd@h:5671?qos=2").unwrap_err();
+        assert!(e.contains("\"qos\"") && !e.contains("ab?cd") && !e.contains("cd@"), "{}", e);
+        assert!(!tls_ca("mqtts://h:8883?token=s3cret").unwrap_err().contains("s3cret"), "an option's value not shown");
+        // an `@` in the path: %40, or refused - never read as no ca at all
+        assert_eq!(tls_ca("amqps://app:pw@h:5671?ca=/etc/a%40b.pem").unwrap().1, Some("/etc/a@b.pem".to_string()));
+        assert!(tls_ca("amqps://app:pw@h:5671?ca=/etc/a@b.pem").unwrap_err().contains("%40"));
+        assert!(ca_roots("/nonexistent/ca.pem").unwrap_err().contains("/nonexistent/ca.pem"));
+        let f = std::env::temp_dir().join(format!("etcds-ca-{}", std::process::id()));
+        std::fs::write(&f, "not a certificate\n").unwrap();
+        assert!(ca_roots(&f.display().to_string()).unwrap_err().contains("no certificate"));
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn a_tls_default_once_both_providers_are_in() {

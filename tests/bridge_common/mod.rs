@@ -149,6 +149,8 @@ pub fn config(etcd: &str, target: &str, queue: &str, dead_letter: Option<&str>) 
         dead_letter: dead_letter.map(str::to_string),
         buffer: 16,
         send_timeout: Duration::from_secs(5),
+        node: None,
+        policy: None,
     }
 }
 

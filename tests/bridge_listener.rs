@@ -51,6 +51,13 @@ impl slog::Drain for Lines {
 }
 
 async fn listening_logged(etcd: &str, user: Option<(&str, &str)>, log: slog::Logger) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<Result<(), String>>) {
+    listening_with(etcd, user, log, None).await
+}
+
+/// The listener with the node's prefix policy given (`Config::policy`).
+async fn listening_with(etcd: &str, user: Option<(&str, &str)>, log: slog::Logger, policy: Option<etcds::prefix::PrefixPolicy>)
+    -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<Result<(), String>>)
+{
     let bind = format!("127.0.0.1:{}", free_port());
     let template = Config {
         etcd: vec![etcd.to_string()],
@@ -64,6 +71,8 @@ async fn listening_logged(etcd: &str, user: Option<(&str, &str)>, log: slog::Log
         dead_letter: None,
         buffer: 16,
         send_timeout: Duration::from_secs(5),
+        node: None,
+        policy,
     };
     let l = Listen { bind: bind.clone(), user: user.map(|(u, p)| (u.to_string(), p.to_string())) };
     let (stop, stopped) = oneshot::channel::<()>();
@@ -174,6 +183,49 @@ async fn a_client_that_leaves_unaccepted_leaves_it_on_the_line() {
     assert_eq!(drain(&etcd, "jobs", Duration::from_secs(8)).await, vec![b"not done".to_vec()]);
     let _ = stop.send(());
     assert_eq!(h.await.unwrap(), Ok(()));
+}
+
+/// [bridge-secret] A client link to a queue the node serves to no remote consumer is
+/// refused as it attaches - the client is such a consumer - and the queue's messages
+/// stay in etcd; a link to another queue is served
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_to_a_queue_kept_local_is_refused() {
+    let (_node, etcd) = etcd().await;
+    let lines = Lines::default();
+    let log = slog::Logger::root(slog::Fuse(lines.clone()), slog::o!());
+    let policy = etcds::prefix::PrefixPolicy::new("", "", "/q/payroll/", "");
+    let (url, stop, h) = listening_with(&etcd, None, log, Some(policy)).await;
+    let mut c = Client::connect([etcd.as_str()], None).await.unwrap();
+    c.put("/q/payroll/p/k1", "salary", None).await.unwrap();
+
+    let mut conn = anonymous("jms-payroll", &url).await;
+    let mut session = Session::begin(&mut conn).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(3), async {
+        let source = Source::builder().address("payroll").build();
+        match Receiver::builder().name("p1").source(source).attach(&mut session).await {
+            Err(e) => Err(e.to_string()),
+            Ok(mut r) => r.recv::<Body<Value>>().await.map(|d| text(d.body())).map_err(|e| e.to_string()),
+        }
+    })
+    .await;
+    assert!(!matches!(got, Ok(Ok(_))), "a queue kept local reached a client: {:?}", got);
+    assert!(lines.0.lock().unwrap().iter().any(|l| l.contains("link refused") || l.contains("no remote consumer")),
+        "refused, saying so: {:?}", lines.0.lock().unwrap());
+    // still in etcd: a local consumer takes it
+    assert_eq!(drain(&etcd, "payroll", Duration::from_secs(2)).await, vec![b"salary".to_vec()]);
+
+    // another queue is served, on a session of its own
+    let mut conn2 = anonymous("jms-orders", &url).await;
+    let mut s2 = Session::begin(&mut conn2).await.unwrap();
+    let source = Source::builder().address("orders").build();
+    let mut recv = Receiver::builder().name("o1").source(source).attach(&mut s2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.put("/q/orders/p/o1", "order 1", None).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), recv.recv::<Body<Value>>()).await.expect("delivered").unwrap();
+    assert_eq!(text(d.body()), "order 1");
+    recv.accept(&d).await.unwrap();
+    let _ = stop.send(());
+    let _ = h.await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

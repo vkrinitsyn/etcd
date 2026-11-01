@@ -80,7 +80,16 @@ pub fn settings(cfg: &EtcdConfig) -> Result<Option<Bridge>, String> {
         // 0 is the type's default (`EtcdConfig::default()`), not a setting
         buffer: if cfg.bridge_buffer == 0 { 64 } else { cfg.bridge_buffer as usize },
         send_timeout: Duration::from_secs(if cfg.bridge_send_timeout == 0 { 30 } else { cfg.bridge_send_timeout }),
+        node: None,
+        // [bridge-secret] the node's own, as `EtcdNode::init` builds it
+        policy: Some(crate::prefix::PrefixPolicy::new(&cfg.local_prefix, &cfg.local_prefix_except,
+            &cfg.local_only_prefix, &cfg.zone_prefix).with_local_only_except(&cfg.local_only_prefix_except)),
     };
+    // [bridge-secret] refused here, before the node starts, not at the first watch; a
+    // listener's queue comes with each link, which is checked as it attaches
+    if let (Some(p), None) = (&c.policy, &listen) {
+        c.served_out(p)?;
+    }
     match listen {
         // a listener's template: its queue, address and target come from each
         // client's link - checked here with stand-ins, so a bad setting stops the
@@ -138,6 +147,57 @@ mod tests {
         let mut c = EtcdConfig::with_defaults();
         f(&mut c);
         c
+    }
+
+    /// [bridge-secret] a prefix holding keys the node serves to no remote caller is
+    /// refused at start - the bridge would carry them out of it; one of the subtree's
+    /// exceptions, or a prefix beside it, is not
+    #[test]
+    fn a_prefix_the_node_keeps_local_is_refused() {
+        let with = |prefix: &str| cfg(|c| {
+            c.listen_client_urls = "localhost:2379".into();
+            c.bridge_prefix = prefix.into();
+            c.bridge_to = "kafka://k:9092".into();
+            c.local_only_prefix = "/secret/".into();
+            c.local_only_prefix_except = "/secret/encrypted/".into();
+        });
+        for p in ["/secret/", "/secret/@meta/", "/", "/s"] {
+            let e = settings(&with(p)).err().unwrap_or_else(|| panic!("{} accepted", p));
+            assert!(e.contains("serves to no remote caller"), "{}: {}", p, e);
+        }
+        for p in ["/secret/encrypted/", "/config/", "/secrets-not/"] {
+            assert!(matches!(settings(&with(p)), Ok(Some(Bridge::Send(_)))), "{} refused", p);
+        }
+        // no local-only prefix: nothing refused, as before
+        let mut c = with("/secret/");
+        c.local_only_prefix = String::new();
+        assert!(settings(&c).is_ok());
+    }
+
+    /// [bridge-secret] a queue the node serves to no remote consumer is refused at start,
+    /// either spelling of the policy; a queue beside it, or a policy over its producer
+    /// keys only (a remote consumer is served then, so the bridge is), is not. A listener
+    /// is not refused at start: its queues come with its links (`listener::consume`)
+    #[test]
+    fn a_queue_the_node_keeps_local_is_refused() {
+        let with = |queue: &str, local: &str| cfg(|c| {
+            c.listen_client_urls = "localhost:2379".into();
+            c.bridge_queue = queue.into();
+            c.bridge_to = "kafka://k:9092".into();
+            c.local_only_prefix = local.into();
+        });
+        for local in ["/q/payroll/", "/queue/payroll/", "/q/", "/"] {
+            let e = settings(&with("payroll", local)).err().unwrap_or_else(|| panic!("{} accepted", local));
+            assert!(e.contains("no remote consumer"), "{}: {}", local, e);
+        }
+        for (q, local) in [("jobs", "/q/payroll/"), ("payroll", "/q/payroll/p/"), ("payroll", "/secret/")] {
+            assert!(matches!(settings(&with(q, local)), Ok(Some(Bridge::Send(_)))), "{} under {} refused", q, local);
+        }
+        let mut l = with("", "/");
+        l.bridge_queue = String::new();
+        l.bridge_to = String::new();
+        l.bridge_listen = "127.0.0.1:5672".into();
+        assert!(matches!(settings(&l), Ok(Some(Bridge::Listen(..)))), "a listener at start");
     }
 
     #[test]

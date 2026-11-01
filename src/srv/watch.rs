@@ -19,6 +19,30 @@ use crate::{WatchSender, LP};
 
 type WatchResult<T> = Result<Response<T>, Status>;
 
+/// [watch-gone] How often a stream whose requests ended is looked at for a reader.
+const UNREAD_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [watch-gone] After a stream's requests end. etcd serves it on - a half-closed
+/// stream, as a client that drops its watcher half (`let (_, stream) =
+/// client.watch(..)`) leaves - while its watches hold it; once no one reads it, its
+/// key watches are taken off, with no change under them needed to find them. Holds
+/// no sender between looks, so a stream with no watch left ends for its reader at once.
+async fn forget_when_unread(etcd: EtcdNode, cids: std::collections::HashSet<Uuid>, sender: WatchSender) {
+    let weak = sender.downgrade();
+    drop(sender);
+    loop {
+        match weak.upgrade() {
+            None => return, // no watch holds it: it has ended
+            Some(s) if s.is_closed() => {
+                etcd.forget_stream(&cids, &s).await;
+                return;
+            }
+            Some(_) => {}
+        }
+        tokio::time::sleep(UNREAD_CHECK).await;
+    }
+}
+
 /// [q-dead] How long a watcher's stream may stay full before the watcher is
 /// cancelled: a notification waits that long, then the next one, and the
 /// writes behind them, wait no more.
@@ -88,7 +112,7 @@ impl EtcdNode {
                     // takes locks a write waiting on this task may hold.
                     let sent = tokio::time::timeout(NOTIFY_TIMEOUT, client.send(Ok(
                         WatchResponse {
-                            header: None,
+                            header: Some(node.response_header()), // [watch-header]
                             watch_id: wid,
                             created: false,
                             canceled: false,
@@ -105,9 +129,20 @@ impl EtcdNode {
                                 prev_kv: None,
                             }],
                         }))).await;
-                    if sent.is_err() {
-                        let node = node.clone();
-                        tokio::spawn(async move { node.cancel_slow_watch(cid, wid, client).await });
+                    match sent {
+                        Ok(Ok(())) => {}
+                        // [watch-gone] its stream closed - the client gone, an in-process
+                        // watcher dropped: forgotten. Taken for sent, a closed client's prefix
+                        // or key watch stayed registered for good, one more each time a client
+                        // went (review of the etcds bridge, 2026-11-01)
+                        Ok(Err(_)) => {
+                            let node = node.clone();
+                            tokio::spawn(async move { let _ = node.forget_watch(&cid, wid, Some(&client)).await; });
+                        }
+                        Err(_) => {
+                            let node = node.clone();
+                            tokio::spawn(async move { node.cancel_slow_watch(cid, wid, client).await });
+                        }
                     }
                 }
             }
@@ -128,7 +163,9 @@ impl Watch for EtcdNode {
         let etcd = self.clone();
         tokio::spawn(async move {
             let mut cid = Uuid::new_v4(); // lets give this client a temporary ID 
-            
+            // [watch-gone] each id the stream watched under: its key watches go with it
+            let mut cids = std::collections::HashSet::from([cid]);
+
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(r) => {
@@ -137,7 +174,7 @@ impl Watch for EtcdNode {
                                 // refused, as etcd refuses a watch: created and
                                 // canceled at once, with the reason
                                 let _ = sender.send(Ok(WatchResponse {
-                                    header: None,
+                                    header: Some(etcd.response_header()), // [watch-header]
                                     watch_id: c.watch_id,
                                     created: true,
                                     canceled: true,
@@ -150,6 +187,7 @@ impl Watch for EtcdNode {
                             }
                         }
                         cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
+                        cids.insert(cid);
                     }
                     Err(e) => {
                         warn!(etcd.log, "{}{}", LP, tr!("srv.watch_error", client = cid, err = e.message()));
@@ -157,6 +195,7 @@ impl Watch for EtcdNode {
                 }
             }
             info!(etcd.log, "{}{}", LP, tr!("srv.watch_end", client = cid));
+            forget_when_unread(etcd, cids, sender).await;
         });
 
         let output_stream = ReceiverStream::new(receiver);
@@ -171,10 +210,14 @@ impl EtcdNode {
         let mut cid = client_id.clone();
 
         tokio::spawn(async move {
+            // [watch-gone] each id the stream watched under: its key watches go with it
+            let mut cids = std::collections::HashSet::from([cid]);
             while let Some(r) = stream.recv().await {
                 cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
+                cids.insert(cid);
             }
             info!(etcd.log, "{}{}", LP, tr!("srv.watch_end", client = cid));
+            forget_when_unread(etcd, cids, sender).await;
         });
     }
 
@@ -192,6 +235,7 @@ impl EtcdNode {
                     debug!(self.log, "{}{}", LP, tr!("srv.progress", client = cid));
                     if let Err(e) = sender.send(Ok(
                             WatchResponse {
+                                header: Some(self.response_header()), // [watch-header]
                                 watch_id: *watchers.get(0).unwrap_or(&0),
                                 fragment: watchers.len() > 1, ..Default::default()
                             }
@@ -235,6 +279,150 @@ mod tests {
         n.kv_put(b"/range/".to_vec(), b"v".to_vec()).await.unwrap();
         assert_eq!(c.next().await.0, "/range/");
         assert!(c.quiet().await, "exactly one event");
+    }
+
+    /// [watch-gone] A watcher whose stream has gone is forgotten at the first change it is
+    /// not told of - not left registered for good, one more each time a client goes
+    #[tokio::test]
+    async fn a_closed_watcher_is_forgotten() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let gone = Consumer::watch(&n, &cid, "/gone-key", 1).await;
+        drop(gone);
+        n.kv_put(b"/gone-key".to_vec(), b"1".to_vec()).await.unwrap();
+        let mut left = 1;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            left = match n.watchers.read().await.get(&cid).cloned() {
+                Some(c) => c.read().await.watchers.len(),
+                None => 0,
+            };
+            if left == 0 {
+                break;
+            }
+        }
+        assert_eq!(left, 0, "the closed watcher is still registered");
+        let mut entry = true;
+        for _ in 0..50 {
+            entry = n.watchers.read().await.get(&cid).is_some();
+            if !entry {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!entry, "its client's entry went with its last watch");
+        assert!(n.observers.read().await.get(b"/gone-key".as_slice()).map_or(true, |o| o.is_empty()));
+    }
+
+    /// [watch-gone] A stream whose requests end is still told, as etcd serves a half-closed
+    /// stream; once its responses are not read either, its key watches and its client's
+    /// entry are taken off at once - no change under the key is needed to find them
+    #[tokio::test]
+    async fn a_stream_is_forgotten_once_neither_end_is_held() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, "/ended-key", 1).await;
+        drop(std::mem::replace(&mut c.req, tokio::sync::mpsc::channel(1).0)); // the requests end
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        n.kv_put(b"/ended-key".to_vec(), b"1".to_vec()).await.unwrap();
+        assert_eq!(c.next().await, ("/ended-key".to_string(), "1".to_string()), "a half-closed stream is still told");
+        drop(c);
+        let mut gone = false;
+        for _ in 0..250 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if n.watchers.read().await.get(&cid).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the client's entry is still there, with no change under its key");
+        assert!(n.observers.read().await.get(b"/ended-key".as_slice()).map_or(true, |o| o.is_empty()));
+        // a key watch on a stream still open is left as it is
+        let mut live = Consumer::watch(&n, &Uuid::new_v4(), "/ended-key", 1).await;
+        n.kv_put(b"/ended-key".to_vec(), b"2".to_vec()).await.unwrap();
+        assert_eq!(live.next().await, ("/ended-key".to_string(), "2".to_string()));
+    }
+
+    /// [watch-gone] Responses no longer read while requests may still come: forgotten at
+    /// the first change it is not told of (the notify's closed channel)
+    #[tokio::test]
+    async fn a_watcher_no_one_reads_is_forgotten_at_the_next_change() {
+        let n = node(A).await;
+        let cid = Uuid::new_v4();
+        let mut c = Consumer::watch(&n, &cid, "/unread-key", 1).await;
+        drop(std::mem::replace(&mut c.rx, tokio::sync::mpsc::channel(1).1)); // no one reads
+        n.kv_put(b"/unread-key".to_vec(), b"1".to_vec()).await.unwrap();
+        let mut gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if n.watchers.read().await.get(&cid).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the unread watcher is still registered");
+        assert!(n.observers.read().await.get(b"/unread-key".as_slice()).map_or(true, |o| o.is_empty()));
+        drop(c);
+    }
+
+    /// [watch-header] Every frame a watcher gets carries the response header - created,
+    /// a key's event, progress, cancel, a queue delivery: etcd's Go client reads it
+    /// unchecked (`*pbresp.Header`), and etcdctl 3.4 crashed on the first frame with none
+    #[tokio::test]
+    async fn every_watch_frame_carries_a_header() {
+        use crate::etcdpb::etcdserverpb::{WatchRequest, WatchCreateRequest, WatchCancelRequest, WatchProgressRequest};
+        use crate::etcdpb::etcdserverpb::watch_request::RequestUnion;
+        let n = node(A).await;
+        let (req, req_rx) = tokio::sync::mpsc::channel(10);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        n.new_watcher(req_rx, tx, &Uuid::new_v4()).await;
+        async fn next(rx: &mut tokio::sync::mpsc::Receiver<Result<crate::etcdpb::etcdserverpb::WatchResponse, tonic::Status>>)
+            -> crate::etcdpb::etcdserverpb::WatchResponse
+        {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("a frame").unwrap().unwrap()
+        }
+        let create = |key: String, watch_id: i64| WatchRequest { request_union: Some(RequestUnion::CreateRequest(
+            WatchCreateRequest { key: key.into_bytes(), watch_id, ..Default::default() })) };
+        req.send(create("/hdr/k".into(), 1)).await.unwrap();
+        let f = next(&mut rx).await;
+        assert!(f.created && f.header.is_some(), "created: {:?}", f);
+        n.kv_put(b"/hdr/k".to_vec(), b"v".to_vec()).await.unwrap();
+        let f = next(&mut rx).await;
+        assert!(!f.events.is_empty() && f.header.is_some(), "a key's event: {:?}", f);
+        req.send(WatchRequest { request_union: Some(RequestUnion::ProgressRequest(WatchProgressRequest {})) }).await.unwrap();
+        let f = next(&mut rx).await;
+        assert!(f.header.is_some(), "progress: {:?}", f);
+        req.send(WatchRequest { request_union: Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id: 1 })) }).await.unwrap();
+        let f = next(&mut rx).await;
+        assert!(f.canceled && f.header.is_some(), "cancel: {:?}", f);
+        let cid = Uuid::new_v4();
+        req.send(create(format!("/q/hdr/c/{}", cid), 2)).await.unwrap();
+        let f = next(&mut rx).await;
+        assert!(f.created && f.header.is_some(), "a consumer's created: {:?}", f);
+        crate::queue::node_tests::produce(&n, "/q/hdr/p/m1", "1").await;
+        let f = next(&mut rx).await;
+        assert!(!f.events.is_empty() && f.header.is_some(), "a queue delivery: {:?}", f);
+        let h = f.header.unwrap();
+        assert!(h.cluster_id != 0 || h.member_id != 0, "the node's own: {:?}", h);
+    }
+
+    /// [watch-gone] A watch made on a key while the key's last watch goes is told of
+    /// the next change: the entry and range seen empty were dropped after the new one
+    /// was in them, and the new watch, created, heard nothing (stress, many rounds)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_watch_made_as_the_last_one_goes_is_told() {
+        use crate::etcdpb::etcdserverpb::{WatchRequest, WatchCancelRequest};
+        use crate::etcdpb::etcdserverpb::watch_request::RequestUnion;
+        let n = node(A).await;
+        for round in 0..100 {
+            let key = format!("/race/{}", round);
+            let a = Consumer::watch(&n, &Uuid::new_v4(), &key, 1).await;
+            let cancel = a.req.send(WatchRequest { request_union: Some(RequestUnion::CancelRequest(WatchCancelRequest { watch_id: 1 })) });
+            let (n2, k2) = (n.clone(), key.clone());
+            let (_, mut b) = tokio::join!(cancel, async move { Consumer::watch(&n2, &Uuid::new_v4(), &k2, 1).await });
+            n.kv_put(key.as_bytes().to_vec(), b"v".to_vec()).await.unwrap();
+            assert_eq!(b.next().await.0, key, "round {}: the new watch heard nothing", round);
+        }
     }
 
     /// A watcher whose stream has gone does not stop the others being told.
