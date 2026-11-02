@@ -1,7 +1,7 @@
 # etcd
 
 [![ci](https://github.com/vkrinitsyn/etcd/actions/workflows/ci.yml/badge.svg)](https://github.com/vkrinitsyn/etcd/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/vkrinitsyn/etcd/graph/badge.svg)](https://codecov.io/gh/vkrinitsyn/etcd)
+[![coverage](https://raw.githubusercontent.com/vkrinitsyn/etcd/badges/coverage.svg?sanitize=true)](https://github.com/vkrinitsyn/etcd/actions/workflows/ci.yml)
 [![audit](https://github.com/vkrinitsyn/etcd/actions/workflows/audit.yml/badge.svg)](https://github.com/vkrinitsyn/etcd/actions/workflows/audit.yml)
 [![crates.io](https://img.shields.io/crates/v/etcds.svg)](https://crates.io/crates/etcds)
 [![docs.rs](https://docs.rs/etcds/badge.svg)](https://docs.rs/etcds)
