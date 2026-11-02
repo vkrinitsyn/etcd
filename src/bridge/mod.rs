@@ -387,11 +387,13 @@ pub(crate) async fn run_on(
     // [bridge-secret] why the watch stopped, set before its sender goes: the forward
     // task then ends as well (its channel closed), and `select!` may see that first
     let why = Arc::new(std::sync::Mutex::new(None::<String>));
-    let mut watch = tokio::spawn(watch_loop(cfg.clone(), log.clone(), tx, stream.clone(), why.clone()));
-    let mut forward = match link {
+    // [bridge] the run's tasks end with it: a run dropped mid-way (a listener's link whose
+    // client did not finish within the stop's wait) aborts them, not leaves them behind
+    let mut watch = Aborting(tokio::spawn(watch_loop(cfg.clone(), log.clone(), tx, stream.clone(), why.clone())));
+    let mut forward = Aborting(match link {
         Some(sender) => tokio::spawn(link_loop(cfg.clone(), log.clone(), rx, stream, sender)),
         None => tokio::spawn(forward_loop(cfg.clone(), log.clone(), rx, stream, target.clone())),
-    };
+    });
     // which one ended: its handle is spent - awaited again, it panicked "polled after
     // completion" instead of the run returning its error
     let (result, watch_ended, forward_ended) = tokio::select! {
@@ -399,19 +401,19 @@ pub(crate) async fn run_on(
             info!(log, "shutting down");
             (Ok(()), false, false)
         }
-        r = &mut watch => (match r {
+        r = &mut watch.0 => (match r {
             Ok(Err(e)) => Err(e),
             r => Err(format!("the watch task ended: {:?}", r)),
         }, true, false),
-        r = &mut forward => (Err(format!("the forward task ended: {:?}", r)), false, true),
+        r = &mut forward.0 => (Err(format!("the forward task ended: {:?}", r)), false, true),
     };
-    watch.abort();
-    forward.abort();
+    watch.0.abort();
+    forward.0.abort();
     if !watch_ended {
-        let _ = watch.await;
+        let _ = (&mut watch.0).await;
     }
     if !forward_ended {
-        let _ = forward.await;
+        let _ = (&mut forward.0).await;
     }
     let result = match (result, why.lock().map(|mut w| w.take()).unwrap_or_default()) {
         (Err(_), Some(why)) => Err(why),
@@ -750,6 +752,15 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or_default()
 }
 
+/// [bridge] A task that ends with its owner: dropped, it is aborted, not left running
+struct Aborting<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Aborting<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The URL without its password, for the log.
 pub fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {
@@ -880,6 +891,20 @@ mod tests {
         let mut c = cfg();
         c.policy = Some(crate::prefix::PrefixPolicy::new("", "", "/q/payroll/", ""));
         assert!(c.served_out(c.policy.as_ref().unwrap()).is_ok(), "the queue jobs");
+    }
+
+    /// [bridge] a run's task ends with the run: dropped mid-way, it is aborted
+    #[tokio::test]
+    async fn a_task_ends_with_its_run() {
+        let done = Arc::new(AtomicU64::new(0));
+        let d = done.clone();
+        let t = Aborting(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            d.store(1, Ordering::SeqCst);
+        }));
+        drop(t);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(done.load(Ordering::SeqCst), 0, "the task went on after its run was dropped");
     }
 
     #[test]

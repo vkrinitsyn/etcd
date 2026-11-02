@@ -258,7 +258,8 @@ next wake-up. With no `clickhouse_url` the messages just stay queued.
 ## In YT Cluster
 
 YT Cluster's server, ytserv, embeds this crate (as `etcd`, with the `tracer` and
-`clickhouse` features in its default build) and is its main user. What it sets,
+`clickhouse` features in its default build, and `bridge` in ytserv-all) and is its
+main user. What it sets,
 and what it builds on top - **keep this section in step with ytserv**: a change
 there to how it uses etcd is a change here.
 
@@ -313,7 +314,25 @@ there to how it uses etcd is a change here.
   - The forwarded-message gap below is the common case here: a message put
     through any node but the dispatcher's is acknowledged and applied, but stays
     in the dispatcher's memory.
-- **rppd** (in ytserv-py) consumes queues for Python functions through the same
+- **The bridge** (ytserv-all; ytserv's `state/bridge.rs`). The `bridge_*` settings
+  are node level and named as this crate's, with two differences:
+  - **the broker's password is no setting:** `bridge_to_secret` (the password of
+    `bridge_to`'s user) and `bridge_listen_password_secret` name a secret of
+    ytserv's store, opened in-process when ytserv builds the `Config` - the config
+    rows that replicate hold the name only;
+  - an empty `bridge_consumer` is a UUID of the node's own, the same at every
+    start, not a new one.
+
+  The bridge runs on the node in-process (`Config::node`), with the node's policy,
+  so a prefix under `/secret/` is refused (`served_out`). It is built through
+  `bridge::node::settings` and `bridge::node::run`, by one task of its own that a
+  configuration only hands the settings to (a stop waits on the broker). It is
+  built again when a setting it reads changes or its secret's value does (a put, a
+  rotation), and tried again every 10 s when it does not start. A listener beyond a
+  loopback address needs a login (it has no TLS), and a `bridge_consumer` given is
+  each node's own row. Its state is in `yt_info('E')` `bridge`; end to end:
+  `topology/36b_skv_bridge.sh` in yt-cluster-tests.
+- **rppd** (in ytserv-all) consumes queues for Python functions through the same
   in-process watch API.
 
 ## Known gaps
