@@ -1,5 +1,5 @@
 //! [bridge] Feature `bridge` (bridge.md): this node's queue or key prefix sent to
-//! a broker, or JMS clients served as an AMQP peer. [`node`] reads the
+//! a broker or an HTTP(S) endpoint, or JMS clients served as an AMQP peer. [`node`] reads the
 //! `bridge_*` settings for the binary; [`broker`] holds the brokers, [`listener`]
 //! the AMQP peer, [`mapping`] the JMS message and [`cloudevents`] its attributes.
 //! The bridge is a client of the node like any other, over gRPC - or, in the
@@ -7,8 +7,8 @@
 //! ([`Config::node`]): no connection, so no TLS to meet and no listener to dial.
 //!
 //! The bridge: an etcd queue consumer that sends each message to a broker -
-//! AMQP 1.0 (JMS), MQTT 5 or Kafka ([`crate::bridge::broker`]) - and acknowledges it
-//! in etcd only after the broker took it.
+//! AMQP 1.0 (JMS), MQTT 5, Kafka, or an HTTP(S) endpoint ([`crate::bridge::broker`]) -
+//! and acknowledges it in etcd only after the other side took it.
 //!
 //! Two tasks joined by a bounded channel, so the watch is always read:
 //!
@@ -84,10 +84,11 @@ pub struct Config {
     /// this consumer's id in the queue's registry
     pub consumer: Uuid,
     /// the broker: `amqp://`, `amqps://`, `mqtt://`, `mqtts://` or `kafka://`,
-    /// then `[user:password@]host:port`
+    /// then `[user:password@]host:port`; or an endpoint: `http[s]://`, the same, then
+    /// its path and query
     pub target_url: String,
     /// where on the broker: the AMQP address (the JMS queue), the MQTT topic
-    /// prefix, or the Kafka topic
+    /// prefix, or the Kafka topic. An HTTP(S) endpoint has its URL: not used
     pub address: String,
     /// how a delivery becomes a message
     pub shape: Shape,
@@ -158,49 +159,56 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// What `run` refuses to start with.
     pub fn validate(&self) -> Result<(), String> {
-        fn queue_name(what: &str, q: &str) -> Result<(), String> {
-            if q.is_empty() || q.contains('/') {
-                return Err(format!("{} {:?}: one path segment, not empty", what, q));
-            }
-            Ok(())
-        }
+        let segment = |q: &str| !q.is_empty() && !q.contains('/');
         if self.etcd.is_empty() && self.node.is_none() {
-            return Err("no etcd endpoint, and no node in-process".into());
+            return Err(tr!("bridge.no_endpoint"));
         }
         match &self.prefix {
-            None => queue_name("queue", &self.queue)?,
+            None if !segment(&self.queue) => return Err(tr!("bridge.queue_name", queue = format!("{:?}", self.queue))),
+            None => {}
             Some(p) => {
                 // nor one over the queues: under it are the server's registry
                 // records, which are no one's changes
                 let over = |ns: &str| p.starts_with(ns) || ns.starts_with(p.as_str());
                 if !p.starts_with('/') || over("/q/") || over("/queue/") {
-                    return Err(format!("prefix {:?}: a key prefix from /, not over the queues", p));
+                    return Err(tr!("bridge.bad_prefix", prefix = format!("{:?}", p)));
                 }
             }
         }
         if let Some(d) = &self.dead_letter {
-            queue_name("dead-letter queue", d)?;
+            if !segment(d) {
+                return Err(tr!("bridge.dead_letter_name", queue = format!("{:?}", d)));
+            }
             if d == &self.queue {
-                return Err("the dead-letter queue is the queue itself".into());
+                return Err(tr!("bridge.dead_letter_self"));
             }
         }
-        if self.address.is_empty() {
-            return Err("no address".into());
+        let kind = broker::kind(&self.target_url)?;
+        if self.address.is_empty() && kind != Kind::Http {
+            return Err(tr!("bridge.no_address"));
         }
-        if broker::kind(&self.target_url)? == Kind::Kafka {
-            broker::kafka::KafkaUrl::parse(&self.target_url)?;
-        } else if let (_, Some(ca)) = broker::tls_ca(&self.target_url)? {
-            // [bridge-ca] read at start: a CA that does not, refused before anything is sent
-            broker::ca_roots(&ca)?;
+        // [bridge-ca] read at start: a CA that does not, refused before anything is sent
+        match kind {
+            Kind::Kafka => { broker::kafka::KafkaUrl::parse(&self.target_url)?; }
+            Kind::Http => {
+                if let Some(ca) = broker::http::HttpUrl::parse(&self.target_url)?.ca {
+                    broker::ca_roots(&ca)?;
+                }
+            }
+            Kind::Amqp | Kind::Mqtt => {
+                if let (_, Some(ca)) = broker::tls_ca(&self.target_url)? {
+                    broker::ca_roots(&ca)?;
+                }
+            }
         }
-        if broker::kind(&self.target_url)? == Kind::Mqtt && self.address.contains(['+', '#']) {
-            return Err(format!("MQTT topic prefix {:?}: no wildcards", self.address));
+        if kind == Kind::Mqtt && self.address.contains(['+', '#']) {
+            return Err(tr!("bridge.mqtt_wildcard", topic = format!("{:?}", self.address)));
         }
         if self.buffer == 0 {
-            return Err("buffer 0: at least 1".into());
+            return Err(tr!("bridge.buffer_zero"));
         }
         if self.send_timeout < Duration::from_secs(1) {
-            return Err(format!("send timeout {:?}: at least 1 s", self.send_timeout));
+            return Err(tr!("bridge.send_timeout_short", timeout = format!("{:?}", self.send_timeout)));
         }
         Ok(())
     }
@@ -220,16 +228,14 @@ impl Config {
             let keys = [consumer_key(self), format!("/queue/{}/consumer/{}", self.queue, self.consumer)];
             return match keys.iter().all(|k| policy.range_may_serve(k.as_bytes(), &[], remote)) {
                 true => Ok(()),
-                false => Err(format!("queue {:?}: the node serves it to no remote consumer (local_only_prefix) - \
-                    the bridge would send its messages out of it", self.queue)),
+                false => Err(tr!("bridge.queue_local", queue = format!("{:?}", self.queue))),
             };
         };
         let end = crate::prefix::prefix_end(p.as_bytes()).unwrap_or_else(|| vec![0]);
         if policy.range_may_serve(p.as_bytes(), &end, remote) {
             Ok(())
         } else {
-            Err(format!("prefix {:?}: it holds keys the node serves to no remote caller (local_only_prefix) - \
-                the bridge would send them out of it", p))
+            Err(tr!("bridge.prefix_local", prefix = format!("{:?}", p)))
         }
     }
 
@@ -349,7 +355,7 @@ impl Watch {
             Watch::Grpc(s) => s.watch(key, prefix.then(|| WatchOptions::new().with_prefix())).await.map_err(|e| e.to_string()),
             Watch::Local { req, watch_id, .. } => {
                 *watch_id += 1;
-                req.send(create(key, prefix, *watch_id)).await.map_err(|_| "the node's watch is gone".to_string())
+                req.send(create(key, prefix, *watch_id)).await.map_err(|_| tr!("bridge.node_watch_gone"))
             }
         }
     }
@@ -398,14 +404,14 @@ pub(crate) async fn run_on(
     // completion" instead of the run returning its error
     let (result, watch_ended, forward_ended) = tokio::select! {
         _ = shutdown => {
-            info!(log, "shutting down");
+            info!(log, "{}", tr!("bridge.shutting_down"));
             (Ok(()), false, false)
         }
         r = &mut watch.0 => (match r {
             Ok(Err(e)) => Err(e),
-            r => Err(format!("the watch task ended: {:?}", r)),
+            r => Err(tr!("bridge.watch_ended", err = format!("{:?}", r))),
         }, true, false),
-        r = &mut forward.0 => (Err(format!("the forward task ended: {:?}", r)), false, true),
+        r = &mut forward.0 => (Err(tr!("bridge.forward_ended", err = format!("{:?}", r))), false, true),
     };
     watch.0.abort();
     forward.0.abort();
@@ -441,8 +447,8 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
             Ok(c) => c,
             Err(e) => {
                 match &cfg.node {
-                    Some(_) => warn!(log, "the node in-process: {}", e),
-                    None => warn!(log, "etcd {:?}: {}", cfg.etcd, e),
+                    Some(_) => warn!(log, "{}", tr!("bridge.warn_node", err = e)),
+                    None => warn!(log, "{}", tr!("bridge.warn_etcd", etcd = format!("{:?}", cfg.etcd), err = e)),
                 }
                 backoff.wait().await;
                 continue;
@@ -452,8 +458,8 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
         // etcd's to hand out again
         let id = current.fetch_add(1, Ordering::SeqCst) + 1;
         match &cfg.prefix {
-            None => info!(log, "consuming {}", key; "stream" => id),
-            Some(_) => info!(log, "watching {}*", key; "stream" => id),
+            None => info!(log, "{}", tr!("bridge.consuming", key = key); "stream" => id),
+            Some(_) => info!(log, "{}", tr!("bridge.watching", key = key); "stream" => id),
         }
         let mut rewatch = Backoff::new(REWATCH_MIN, BACKOFF_MAX);
 
@@ -466,7 +472,7 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
                     // reconfigure that keeps the prefix's keys local stops the bridge
                     if let (Some(n), false) = (&cfg.node, resp.events.is_empty()) {
                         if let Err(e) = cfg.served_out(&*n.policy.read().await) {
-                            error!(log, "stopped: {}", e);
+                            error!(log, "{}", tr!("bridge.stopped", err = e));
                             if let Ok(mut w) = why.lock() {
                                 *w = Some(e.clone());
                             }
@@ -474,10 +480,10 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
                         }
                     }
                     if resp.canceled {
-                        warn!(log, "watch canceled: {}, watching again", resp.reason);
+                        warn!(log, "{}", tr!("bridge.watch_canceled", reason = resp.reason));
                         rewatch.wait().await;
                         if let Err(e) = stream.again(key.as_str(), prefixed).await {
-                            warn!(log, "watch again: {}", e);
+                            warn!(log, "{}", tr!("bridge.watch_again", err = e));
                             break;
                         }
                         continue;
@@ -490,7 +496,7 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
                             (Some(p), false) => Delivery::kv(p, &k, &v, KvEvent::Delete),
                         };
                         rewatch.reset();
-                        debug!(log, "received {}", delivery.delivery_key);
+                        debug!(log, "{}", tr_lazy!("bridge.received", key = delivery.delivery_key));
                         let held = Held { stream: id, client: client.clone(), delivery };
                         if tx.send(held).await.is_err() {
                             return Ok(()); // the forward task is gone
@@ -498,11 +504,11 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
                     }
                 }
                 Ok(None) => {
-                    warn!(log, "etcd closed the watch stream");
+                    warn!(log, "{}", tr!("bridge.etcd_closed"));
                     break;
                 }
                 Err(e) => {
-                    warn!(log, "watch: {}", e);
+                    warn!(log, "{}", tr!("bridge.watch_failed", err = e));
                     break;
                 }
             }
@@ -521,20 +527,20 @@ async fn connect_watch(cfg: &Config, key: &str, prefix: bool) -> Result<(Link, W
         let (req, req_rx) = mpsc::channel(4);
         let (tx, mut rx) = mpsc::channel(cfg.buffer.max(16));
         node.new_watcher(req_rx, tx, &Uuid::new_v4()).await;
-        req.send(create(key, prefix, 1)).await.map_err(|_| "the node took no watch".to_string())?;
+        req.send(create(key, prefix, 1)).await.map_err(|_| tr!("bridge.node_no_watch"))?;
         // its `created` frame - a change under a prefix may come before it, kept
         let deadline = tokio::time::Instant::now() + ETCD_TIMEOUT;
         let mut early = std::collections::VecDeque::new();
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(Ok(r))) if r.canceled => return Err(format!("the node refused the watch: {}", r.cancel_reason)),
+                Ok(Some(Ok(r))) if r.canceled => return Err(tr!("bridge.node_watch_refused", reason = r.cancel_reason)),
                 Ok(Some(Ok(r))) if r.created => {
                     return Ok((Link::Local(node.clone()), Watch::Local { req, rx, watch_id: 1, early }));
                 }
                 Ok(Some(Ok(r))) => early.push_back(local_frame(r)),
                 Ok(Some(Err(s))) => return Err(s.to_string()),
-                Ok(None) => return Err("the node closed the watch".into()),
-                Err(_) => return Err(format!("no answer in {:?}", ETCD_TIMEOUT)),
+                Ok(None) => return Err(tr!("bridge.node_watch_closed")),
+                Err(_) => return Err(tr!("bridge.no_answer", timeout = format!("{:?}", ETCD_TIMEOUT))),
             }
         }
     }
@@ -554,7 +560,7 @@ async fn connect_watch(cfg: &Config, key: &str, prefix: bool) -> Result<(Link, W
     };
     match tokio::time::timeout(ETCD_TIMEOUT, connect).await {
         Ok(r) => r.map(|(c, s)| (Link::Grpc(c), Watch::Grpc(s))).map_err(|e| e.to_string()),
-        Err(_) => Err(format!("no answer in {:?}", ETCD_TIMEOUT)),
+        Err(_) => Err(tr!("bridge.no_answer", timeout = format!("{:?}", ETCD_TIMEOUT))),
     }
 }
 
@@ -571,7 +577,7 @@ async fn forward_loop(
         loop {
             // a key's change is the watch's alone: no stream hands it out again
             if held.delivery.event.is_none() && held.stream != current.load(Ordering::SeqCst) {
-                debug!(log, "{} is from a closed stream, etcd hands it out again", held.delivery.delivery_key);
+                debug!(log, "{}", tr_lazy!("bridge.closed_stream", key = held.delivery.delivery_key));
                 break;
             }
             let dk = held.delivery.delivery_key.clone();
@@ -579,7 +585,10 @@ async fn forward_loop(
                 Some(t) => t,
                 None => match Target::connect(&cfg).await {
                     Ok(t) => {
-                        info!(log, "sending to {} at {}", cfg.address, redact(&cfg.target_url));
+                        match broker::kind(&cfg.target_url) {
+                            Ok(Kind::Http) => info!(log, "{}", tr!("bridge.sending_http", url = redact(&cfg.target_url))),
+                            _ => info!(log, "{}", tr!("bridge.sending_to", address = cfg.address, url = redact(&cfg.target_url))),
+                        }
                         target.insert(t)
                     }
                     Err(e) => {
@@ -601,9 +610,9 @@ async fn forward_loop(
                         break;
                     }
                 }
-                Ok(Ok(Sent::Retry(why))) => warn!(log, "{}: {}, retrying", dk, why),
+                Ok(Ok(Sent::Retry(why))) => warn!(log, "{}", tr!("bridge.retrying", key = dk, why = why)),
                 Ok(Err(e)) => {
-                    warn!(log, "send {}: {}", dk, e);
+                    warn!(log, "{}", tr!("bridge.send_failed", key = dk, err = e));
                     if let Some(t) = target.take() {
                         t.close(cfg.send_timeout).await;
                     }
@@ -611,7 +620,7 @@ async fn forward_loop(
                 Err(_) => {
                     // the broker may have it: sent again on a new connection,
                     // at least once, with the same message id
-                    warn!(log, "send {}: no answer in {:?}", dk, cfg.send_timeout);
+                    warn!(log, "{}", tr!("bridge.send_no_answer", key = dk, timeout = format!("{:?}", cfg.send_timeout)));
                     if let Some(t) = target.take() {
                         t.close(cfg.send_timeout).await;
                     }
@@ -645,7 +654,7 @@ async fn link_loop(cfg: Config, log: Logger, mut rx: mpsc::Receiver<Held>, curre
     loop {
         tokio::select! {
             e = sender.on_detach() => {
-                info!(log, "the client left: {}", e);
+                info!(log, "{}", tr!("bridge.client_left", err = e));
                 return;
             }
             Some((mut held, r)) = inflight.next(), if !inflight.is_empty() => {
@@ -657,12 +666,12 @@ async fn link_loop(cfg: Config, log: Logger, mut rx: mpsc::Receiver<Held>, curre
                             let _ = give_up(&cfg, &log, &mut held, &why).await;
                         }
                         Sent::Retry(why) => {
-                            warn!(log, "{}: {}, sending again", held.delivery.delivery_key, why);
+                            warn!(log, "{}", tr!("bridge.sending_again", key = held.delivery.delivery_key, why = why));
                             again.push_back(held);
                         }
                     },
                     Err(e) => {
-                        info!(log, "the link failed: {}", e);
+                        info!(log, "{}", tr!("bridge.link_failed", err = e));
                         return;
                     }
                 }
@@ -682,7 +691,7 @@ async fn link_loop(cfg: Config, log: Logger, mut rx: mpsc::Receiver<Held>, curre
                         let _ = give_up(&cfg, &log, &mut held, &why).await;
                     }
                     Ok(Err(e)) => {
-                        info!(log, "the link failed: {}", e);
+                        info!(log, "{}", tr!("bridge.link_failed", err = e));
                         return;
                     }
                     // no credit from the client yet: first in line again
@@ -699,7 +708,7 @@ async fn link_loop(cfg: Config, log: Logger, mut rx: mpsc::Receiver<Held>, curre
 async fn give_up(cfg: &Config, log: &Logger, held: &mut Held, why: &str) -> bool {
     let dk = held.delivery.delivery_key.clone();
     let Some(dlq) = &cfg.dead_letter else {
-        error!(log, "{}: {}, not acknowledged: retrying (no dead-letter queue)", dk, why);
+        error!(log, "{}", tr!("bridge.not_acked_no_dlq", key = dk, why = why));
         return false;
     };
     // one segment: a watched key's `/` would cut it short
@@ -707,16 +716,16 @@ async fn give_up(cfg: &Config, log: &Logger, held: &mut Held, why: &str) -> bool
     let put = held.client.put(key, held.delivery.value.clone());
     match tokio::time::timeout(ETCD_TIMEOUT, put).await {
         Ok(Ok(())) => {
-            warn!(log, "{}: {}, put on dead-letter queue {}", dk, why, dlq);
+            warn!(log, "{}", tr!("bridge.dead_lettered", key = dk, why = why, queue = dlq));
             acknowledge(log, held).await;
             true
         }
         Ok(Err(e)) => {
-            error!(log, "{}: {}, dead-letter queue {}: {}", dk, why, dlq, e);
+            error!(log, "{}", tr!("bridge.dlq_failed", key = dk, why = why, queue = dlq, err = e));
             false
         }
         Err(_) => {
-            error!(log, "{}: {}, dead-letter queue {}: no answer in {:?}", dk, why, dlq, ETCD_TIMEOUT);
+            error!(log, "{}", tr!("bridge.dlq_no_answer", key = dk, why = why, queue = dlq, timeout = format!("{:?}", ETCD_TIMEOUT)));
             false
         }
     }
@@ -729,23 +738,23 @@ async fn acknowledge(log: &Logger, held: &mut Held) {
     let dk = held.delivery.delivery_key.clone();
     if held.delivery.event.is_some() {
         // a watched key: deleting it would remove the key itself
-        debug!(log, "sent {}", dk);
+        debug!(log, "{}", tr_lazy!("bridge.sent", key = dk));
         return;
     }
     for attempt in 1..=ACK_TRIES {
         match tokio::time::timeout(ETCD_TIMEOUT, held.client.delete(held.delivery.raw_key.clone())).await {
             Ok(Ok(())) => {
-                debug!(log, "acknowledged {}", dk);
+                debug!(log, "{}", tr_lazy!("bridge.acknowledged", key = dk));
                 return;
             }
-            Ok(Err(e)) => warn!(log, "acknowledge {} ({}/{}): {}", dk, attempt, ACK_TRIES, e),
-            Err(_) => warn!(log, "acknowledge {} ({}/{}): no answer in {:?}", dk, attempt, ACK_TRIES, ETCD_TIMEOUT),
+            Ok(Err(e)) => warn!(log, "{}", tr!("bridge.ack_failed", key = dk, attempt = attempt, tries = ACK_TRIES, err = e)),
+            Err(_) => warn!(log, "{}", tr!("bridge.ack_no_answer", key = dk, attempt = attempt, tries = ACK_TRIES, timeout = format!("{:?}", ETCD_TIMEOUT))),
         }
         if attempt < ACK_TRIES {
             tokio::time::sleep(BACKOFF_MIN).await;
         }
     }
-    error!(log, "{} not acknowledged: it is sent again when the stream closes", dk);
+    error!(log, "{}", tr!("bridge.not_acked", key = dk));
 }
 
 fn now_ms() -> i64 {
@@ -763,6 +772,11 @@ impl<T> Drop for Aborting<T> {
 
 /// The URL without its password, for the log.
 pub fn redact(url: &str) -> String {
+    // [bridge-http] an endpoint's path and query can hold a secret, and an `@` in them is no
+    // login; and a URL no target takes, a mistyped scheme, may be one of those
+    if !["amqp://", "amqps://", "mqtt://", "mqtts://", "kafka://", "kafkas://"].iter().any(|s| url.starts_with(s)) {
+        return broker::http::shown(url);
+    }
     match (url.find("://"), url.rfind('@')) {
         (Some(s), Some(at)) if at > s => match url[s + 3..at].find(':') {
             Some(c) => format!("{}:***{}", &url[..s + 3 + c], &url[at..]),
@@ -907,6 +921,18 @@ mod tests {
         assert_eq!(done.load(Ordering::SeqCst), 0, "the task went on after its run was dropped");
     }
 
+    /// a base to set the fields over: refused as it is, and the binary's defaults
+    #[test]
+    fn the_default_is_a_base_to_build_on() {
+        let d = Config::default();
+        assert_eq!((d.buffer, d.send_timeout), (64, Duration::from_secs(30)));
+        assert!(d.validate().is_err(), "no endpoint, queue or target");
+        let c = Config { etcd: vec!["http://e:1".into()], queue: "q".into(), target_url: "https://bearer:s3cret@ci/s3cret".into(), ..Config::default() };
+        c.validate().unwrap();
+        let shown = format!("{:?}", c);
+        assert!(!shown.contains("s3cret") && shown.contains("bearer:***@ci"), "{}", shown);
+    }
+
     #[test]
     fn redacts_the_password() {
         assert_eq!(redact("amqp://app:s3cret@mq:5672"), "amqp://app:***@mq:5672");
@@ -932,7 +958,9 @@ mod tests {
             |c| c.dead_letter = Some("x/y".into()),
             |c| c.dead_letter = Some("jobs".into()),
             |c| c.address = "".into(),
-            |c| c.target_url = "http://mq".into(),
+            |c| c.target_url = "gopher://mq".into(),
+            |c| c.target_url = "http://u:p@ci.example.com/hook".into(), // a login in the clear
+            |c| c.target_url = "https://h/x?ca=/nonexistent/ca.pem".into(), // a CA that does not read
             |c| {
                 c.target_url = "mqtt://mq".into();
                 c.address = "etcd/+".into();

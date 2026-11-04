@@ -174,12 +174,13 @@ pub struct EtcdConfig {
     pub bridge_listen_password: String,
 
     /// [bridge] The broker: amqp://, amqps://, mqtt://, mqtts://, kafka:// or
-    /// kafkas://, then `[user:password@]host:port` (Kafka: `host:port,host:port`).
+    /// kafkas://, then `[user:password@]host:port` (Kafka: `host:port,host:port`); or an
+    /// endpoint to POST each message to: http:// or https://, the same, then a path and query.
     #[arg(long, required = false, default_value = "")]
     pub bridge_to: String,
 
     /// [bridge] The AMQP address (JMS queue), MQTT topic prefix or Kafka topic.
-    /// Empty: the queue's name, or the prefix's (`/a/b/` is `a.b`).
+    /// Empty: the queue's name, or the prefix's (`/a/b/` is `a.b`). Not with http(s)://.
     #[arg(long, required = false, default_value = "")]
     pub bridge_address: String,
 

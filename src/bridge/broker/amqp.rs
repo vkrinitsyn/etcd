@@ -107,9 +107,9 @@ impl Amqp {
 pub fn sent(outcome: Outcome) -> Sent {
     match outcome {
         Outcome::Accepted(_) => Sent::Accepted,
-        Outcome::Rejected(r) if permanent(&r) => Sent::Permanent(format!("rejected: {:?}", r.error)),
-        Outcome::Rejected(r) => Sent::Retry(format!("rejected for now: {:?}", r.error)),
-        other => Sent::Retry(format!("not taken: {:?}", other)),
+        Outcome::Rejected(r) if permanent(&r) => Sent::Permanent(tr!("bridge.rejected", err = format!("{:?}", r.error))),
+        Outcome::Rejected(r) => Sent::Retry(tr!("bridge.rejected_now", err = format!("{:?}", r.error))),
+        other => Sent::Retry(tr!("bridge.not_taken", err = format!("{:?}", other))),
     }
 }
 

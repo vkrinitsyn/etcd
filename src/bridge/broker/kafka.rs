@@ -64,20 +64,20 @@ impl KafkaUrl {
         let tls = url.starts_with("kafkas://");
         let (user, rest) = split_url(url);
         if user.is_some() {
-            return Err("a user in the Kafka URL: the bridge does not log in to Kafka".into());
+            return Err(tr!("bridge.kafka_user"));
         }
         let (hosts, query) = rest.split_once('?').unwrap_or((rest.as_str(), ""));
         let brokers: Vec<String> = hosts.split(',').filter(|h| !h.is_empty()).map(str::to_string).collect();
         if brokers.is_empty() {
-            return Err("no Kafka broker".into());
+            return Err(tr!("bridge.kafka_no_broker"));
         }
         for b in &brokers {
             if b.starts_with('[') {
-                return Err(format!("broker {}: an IPv6 literal, which rskafka cannot reach - a name for it", b));
+                return Err(tr!("bridge.kafka_literal", broker = b));
             }
             match b.rsplit_once(':') {
                 Some((h, p)) if !h.is_empty() && !h.contains(['/', ':']) && p.parse::<u16>().is_ok() => {}
-                _ => return Err(format!("broker {:?}: host:port", b)),
+                _ => return Err(tr!("bridge.kafka_hostport", broker = format!("{:?}", b))),
             }
         }
         let mut ca = None;
@@ -87,13 +87,13 @@ impl KafkaUrl {
                 Some(("ca", path)) if !path.is_empty() => ca = Some(path.to_string()),
                 Some(("metadata_max_age_ms", ms)) => match ms.parse::<u64>() {
                     Ok(ms) if ms > 0 => metadata_max_age = Duration::from_millis(ms),
-                    _ => return Err("metadata_max_age_ms=: milliseconds, above 0".into()),
+                    _ => return Err(tr!("bridge.kafka_max_age")),
                 },
-                _ => return Err(format!("Kafka option {:?}: ca= or metadata_max_age_ms=", kv)),
+                _ => return Err(tr!("bridge.kafka_option", option = format!("{:?}", kv))),
             }
         }
         if ca.is_some() && !tls {
-            return Err("ca= is for kafkas://".into());
+            return Err(tr!("bridge.kafka_ca_plain"));
         }
         Ok(KafkaUrl { tls, brokers, ca, metadata_max_age })
     }
@@ -111,24 +111,9 @@ impl KafkaUrl {
         Ok(b)
     }
 
-    /// TLS trusting `ca`, or the public roots - with AWS-LC named: the AMQP
-    /// client brings it and rskafka ring, and rustls takes no default then.
+    /// TLS trusting `ca`, or the public roots
     fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>, String> {
-        let roots = match &self.ca {
-            Some(path) => super::ca_roots(path)?,
-            None => {
-                let mut roots = rustls::RootCertStore::empty();
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                roots
-            }
-        };
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Ok(Arc::new(config))
+        Ok(Arc::new(super::rustls_client(self.ca.as_deref())?))
     }
 }
 
@@ -215,7 +200,7 @@ async fn partitions(client: &Client, topic: &str) -> Result<Vec<i32>, String> {
         .map(|t| t.partitions.into_iter().collect())
         .unwrap_or_default();
     if partitions.is_empty() {
-        return Err(format!("topic {} not found", topic));
+        return Err(tr!("bridge.topic_not_found", topic = topic));
     }
     Ok(partitions)
 }

@@ -39,9 +39,9 @@ pub struct Listen {
 /// Serves until `shutdown` completes. `template` gives every link its etcd,
 /// shape, dead-letter queue, buffer and timeout; the queue is the link's.
 pub async fn listen(template: Config, l: Listen, log: Logger, shutdown: impl Future<Output = ()>) -> Result<(), String> {
-    let listener = TcpListener::bind(&l.bind).await.map_err(|e| format!("listen {}: {}", l.bind, e))?;
+    let listener = TcpListener::bind(&l.bind).await.map_err(|e| tr!("bridge.listen_bind", bind = l.bind, err = e))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
-    info!(log, "listening for AMQP clients on {}", local);
+    info!(log, "{}", tr!("bridge.listening", addr = local));
     let (stop, stopping) = watch::channel(false);
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -68,12 +68,12 @@ pub async fn listen(template: Config, l: Listen, log: Logger, shutdown: impl Fut
                         }
                     }
                 }
-                Err(e) => warn!(log, "accept: {}", e),
+                Err(e) => warn!(log, "{}", tr!("bridge.accept", err = e)),
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    info!(log, "shutting down");
+    info!(log, "{}", tr!("bridge.shutting_down"));
     let _ = stop.send(true);
     // each link's run closes its etcd stream, so what it held goes back
     let _ = tokio::time::timeout(template.send_timeout, async { while connections.join_next().await.is_some() {} }).await;
@@ -97,7 +97,7 @@ async fn connection<S>(
             return;
         }
     };
-    debug!(log, "{} connected", peer);
+    debug!(log, "{}", tr_lazy!("bridge.peer_connected", peer = peer));
     let mut sessions = JoinSet::new();
     let mut stop = stopping.clone();
     let session_acceptor = SessionAcceptor::new();
@@ -131,8 +131,8 @@ async fn connection<S>(
                         links.spawn(consume(sender, t.clone(), log.clone(), stopping.clone()));
                     }
                     LinkEndpoint::Receiver(r) => {
-                        warn!(log, "{} wants to send: refused, put to etcd instead", peer);
-                        let e = AmqpErr::new(AmqpError::NotImplemented, Some("the bridge only delivers: put to etcd".to_string()), None);
+                        warn!(log, "{}", tr!("bridge.peer_sends", peer = peer));
+                        let e = AmqpErr::new(AmqpError::NotImplemented, Some(tr!("bridge.only_delivers")), None);
                         let _ = r.close_with_error(e).await;
                     }
                 }
@@ -142,7 +142,7 @@ async fn connection<S>(
     }
     while sessions.join_next().await.is_some() {}
     let _ = conn.close().await;
-    debug!(log, "{} gone", peer);
+    debug!(log, "{}", tr_lazy!("bridge.peer_gone", peer = peer));
 }
 
 /// One client link: an etcd consumer of the link's queue, until either ends.
@@ -161,17 +161,17 @@ async fn consume(sender: Sender, template: Config, log: Logger, mut stopping: wa
         Ok(()) => cfg.kept_in().await,
         e => e,
     } {
-        warn!(log, "link refused: {}", e);
+        warn!(log, "{}", tr!("bridge.link_refused", err = e));
         let _ = sender.close().await;
         return;
     }
-    info!(log, "a client consumes {}", queue);
+    info!(log, "{}", tr!("bridge.client_consumes", queue = queue));
     let stop = async move {
         let _ = stopping.wait_for(|s| *s).await;
     };
     match bridge::run_on(cfg, log.clone(), stop, Some(sender)).await {
-        Ok(()) => info!(log, "stopped"),
+        Ok(()) => info!(log, "{}", tr!("bridge.link_stopped")),
         // the link failed or closed: its run is over
-        Err(e) => info!(log, "link closed ({})", e),
+        Err(e) => info!(log, "{}", tr!("bridge.link_closed", err = e)),
     }
 }

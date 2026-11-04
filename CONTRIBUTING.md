@@ -35,7 +35,7 @@ cargo test                               # default features
 cargo test --features tracer             # OpenTelemetry
 cargo test --features clickhouse         # the ClickHouse queue consumer
 cargo test --features bridge             # the AMQP 1.0, MQTT 5 and Kafka bridge
-cargo llvm-cov --all-features --summary-only   # CI fails under 77% of lines
+cargo llvm-cov --all-features --summary-only   # CI fails under 90% of lines
 cargo test --features bridge --test bridge_live -- --ignored   # against real brokers
 ```
 

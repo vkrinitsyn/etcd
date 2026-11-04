@@ -993,7 +993,7 @@ mod event_tests {
 		assert!(ready(port).await);
 		let url = format!("http://127.0.0.1:{}", port);
 		let mut kv = KvClient::connect(url.clone()).await.unwrap();
-		kv.put(put("/shared", "port"), None).await.unwrap();
+		kv.put(put("/shared", "port")).await.unwrap();
 		assert_eq!(n.kv_get(b"/shared").await.as_deref(), Some(&b"port"[..]));
 		let e = AuthClient::connect(url).await.unwrap()
 			.auth_enable(AuthEnableRequest::default()).await.unwrap_err();

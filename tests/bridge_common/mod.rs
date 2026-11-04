@@ -29,6 +29,8 @@ pub fn free_port() -> u16 {
 
 /// An etcds node on `addr`, ready.
 pub async fn etcd_on(addr: &str) -> EtcdNode {
+    // these suites check the log's English lines, whatever LANG the run has
+    etcds::set_lang("en");
     let mut cfg = etcds::cli::EtcdConfig::with_defaults();
     cfg.listen_client_urls = addr.to_string();
     let node = EtcdNode::init(cfg, slog::Logger::root(slog::Discard, slog::o!()),

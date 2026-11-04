@@ -3,7 +3,7 @@ use opentelemetry::trace::Tracer;
 
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::kv_server::Kv;
-use crate::etcdpb::etcdserverpb::{CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse};
+use crate::etcdpb::etcdserverpb::{CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, RangeStreamResponse, TxnRequest, TxnResponse};
 use tonic::{async_trait, Request, Response, Status};
 
 
@@ -53,7 +53,16 @@ impl EtcdNode {
 
 #[async_trait]
 impl Kv for EtcdNode {
-    
+    type RangeStreamStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<RangeStreamResponse, Status>> + Send>>;
+
+    /// [proto] The range as `range` answers it, in one chunk: what a client merges from the
+    /// chunks is that same answer, and etcds holds its keys in memory, so chunks would save nothing
+    async fn range_stream(&self, request: Request<RangeRequest>) -> Result<Response<Self::RangeStreamStream>, Status> {
+        let range = Kv::range(self, request).await?.into_inner();
+        let chunk = RangeStreamResponse { range_response: Some(range) };
+        Ok(Response::new(Box::pin(tokio_stream::once(Ok(chunk)))))
+    }
+
     /// TODO implement all variation
     async fn range(&self, request: Request<RangeRequest>) -> Result<Response<RangeResponse>, Status> {
         let remote = request.remote_addr();

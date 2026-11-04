@@ -59,7 +59,7 @@ impl Mqtt {
         let (user, hostport) = split_url(&url);
         let tls = url.starts_with("mqtts://");
         let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| format!("port {:?}: {}", p, e))?),
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| tr!("bridge.bad_port", value = format!("{:?}", p), err = e))?),
             None => (hostport.clone(), if tls { 8883 } else { 1883 }),
         };
         let mut opts = MqttOptions::new(format!("etcds-bridge-{}", cfg.consumer), host, port);
@@ -87,7 +87,7 @@ impl Mqtt {
             loop {
                 let ev = match eventloop.poll().await {
                     Ok(ev @ Event::Incoming(Packet::ConnAck(_) | Packet::PubAck(_))) => Ok(ev),
-                    Ok(Event::Incoming(Packet::Disconnect(d))) => Err(format!("the broker disconnected: {:?}", d.reason_code)),
+                    Ok(Event::Incoming(Packet::Disconnect(d))) => Err(tr!("bridge.broker_disconnected", err = format!("{:?}", d.reason_code))),
                     Ok(_) => continue,
                     Err(e) => Err(e.to_string()),
                 };
@@ -105,7 +105,7 @@ impl Mqtt {
                     poll.abort();
                     return Err(e);
                 }
-                None => return Err("the connection closed".into()),
+                None => return Err(tr!("bridge.connection_closed")),
             }
         }
         Ok(Mqtt { client, events, poll, address: cfg.address.clone() })
@@ -134,7 +134,7 @@ impl Mqtt {
                 // on what it receives
                 Some(Err(e)) if e.contains("broker's maximum packet size") => return Ok(Sent::Permanent(e)),
                 Some(Err(e)) => return Err(e),
-                None => return Err("the connection closed".into()),
+                None => return Err(tr!("bridge.connection_closed")),
             }
         }
     }
@@ -167,10 +167,10 @@ fn puback(reason: PubAckReason) -> Sent {
 /// broker answers by dropping the connection rather than with a PUBACK.
 pub fn valid_topic(t: &str) -> Result<(), String> {
     if t.len() > u16::MAX as usize {
-        return Err(format!("topic of {} bytes: at most {}", t.len(), u16::MAX));
+        return Err(tr!("bridge.topic_long", size = t.len(), max = u16::MAX));
     }
     if t.contains('\0') {
-        return Err("a NUL in the topic".into());
+        return Err(tr!("bridge.topic_nul"));
     }
     Ok(())
 }

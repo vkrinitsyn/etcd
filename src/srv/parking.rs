@@ -4,7 +4,7 @@ use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status};
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::auth_server::Auth;
-use crate::etcdpb::etcdserverpb::{ AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse, AuthRoleAddRequest, AuthRoleAddResponse, AuthRoleDeleteRequest, AuthRoleDeleteResponse, AuthRoleGetRequest, AuthRoleGetResponse, AuthRoleGrantPermissionRequest, AuthRoleGrantPermissionResponse, AuthRoleListRequest, AuthRoleListResponse, AuthRoleRevokePermissionRequest, AuthRoleRevokePermissionResponse, AuthUserAddRequest, AuthUserAddResponse, AuthUserChangePasswordRequest, AuthUserChangePasswordResponse, AuthUserDeleteRequest, AuthUserDeleteResponse, AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse, AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest, AuthUserRevokeRoleResponse, AuthenticateRequest, AuthenticateResponse, Member, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
+use crate::etcdpb::etcdserverpb::{ AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse, AuthRoleAddRequest, AuthRoleAddResponse, AuthRoleDeleteRequest, AuthRoleDeleteResponse, AuthRoleGetRequest, AuthRoleGetResponse, AuthRoleGrantPermissionRequest, AuthRoleGrantPermissionResponse, AuthRoleListRequest, AuthRoleListResponse, AuthRoleRevokePermissionRequest, AuthRoleRevokePermissionResponse, AuthUserAddRequest, AuthUserAddResponse, AuthUserChangePasswordRequest, AuthUserChangePasswordResponse, AuthUserDeleteRequest, AuthUserDeleteResponse, AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse, AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest, AuthUserRevokeRoleResponse, AuthStatusRequest, AuthStatusResponse, AuthenticateRequest, AuthenticateResponse, Member, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
 use crate::etcdpb::etcdserverpb::cluster_server::Cluster;
 use crate::etcdpb::v3electionpb::{CampaignRequest, CampaignResponse, LeaderRequest, LeaderResponse, ProclaimRequest, ProclaimResponse, ResignRequest, ResignResponse};
 use crate::etcdpb::v3electionpb::election_server::Election;
@@ -59,6 +59,10 @@ impl Election for EtcdNode {
 }
 #[async_trait]
 impl Auth for EtcdNode {
+    async fn auth_status(&self, _request: Request<AuthStatusRequest>) -> Result<Response<AuthStatusResponse>, Status> {
+        Err(unimplemented())
+    }
+
     async fn auth_enable(&self, _request: Request<AuthEnableRequest>) -> Result<Response<AuthEnableResponse>, Status> {
         Err(unimplemented())
     }

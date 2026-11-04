@@ -176,6 +176,16 @@ fn zone_of(conn: &str, peer_zones: &str) -> String {
     fallback
 }
 
+/// A call to a peer, naming this node in its `x-peer` header (`etcdpb::XPEER`). Here and not in
+/// the generated client: src/etcdpb stays what `ETCDS_GEN_PROTO=1 cargo build` writes
+fn from_peer<T>(message: T, peer: Option<MetadataValue<tonic::metadata::Ascii>>) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(message);
+    if let Some(peer) = peer {
+        r.metadata_mut().insert(crate::etcdpb::XPEER, peer);
+    }
+    r
+}
+
 impl EtcdCluster {
     /// This node's zone, as last configured.
     pub(crate) fn my_zone(&self) -> &str { &self.my_zone }
@@ -464,9 +474,9 @@ impl EtcdCluster {
             match request {
                 BroadcastRequest::Kv(br) => {
                     match br {
-                        KvEvent::Put(kr) => kv.put(kr, peer_id).await.map(|_| ()),
-                        KvEvent::Delete(kr) => kv.delete_range(kr, peer_id).await.map(|_| ()),
-                        KvEvent::Txn(kr) => kv.txn(kr, peer_id).await.map(|_| ()),
+                        KvEvent::Put(kr) => kv.put(from_peer(kr, peer_id)).await.map(|_| ()),
+                        KvEvent::Delete(kr) => kv.delete_range(from_peer(kr, peer_id)).await.map(|_| ()),
+                        KvEvent::Txn(kr) => kv.txn(from_peer(kr, peer_id)).await.map(|_| ()),
                     }
                 }
             }

@@ -1,0 +1,28 @@
+name: proto
+
+# [proto] proto/etcd/ against the official etcd repo's newest release, byte for byte: pulls
+# that repo's proto files only, and any difference fails the run (.github/proto-compare.sh).
+# Weekly as well as on a push: a release on their side pushes nothing here.
+on:
+  push:
+    branches-ignore: ["dependabot/**"]   # their pull request runs it
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "etcd-io/etcd branch or tag to compare with (empty: its newest release)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: .github/proto-compare.sh "$REF"
+        env:
+          REF: ${{ inputs.ref }}

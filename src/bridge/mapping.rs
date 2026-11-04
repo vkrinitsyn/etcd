@@ -55,7 +55,7 @@ impl FromStr for BodyType {
             "auto" => Ok(BodyType::Auto),
             "text" => Ok(BodyType::Text),
             "bytes" => Ok(BodyType::Bytes),
-            _ => Err(format!("body type {:?}: auto, text or bytes", s)),
+            _ => Err(tr!("bridge.body_type", value = format!("{:?}", s))),
         }
     }
 }
@@ -94,7 +94,7 @@ pub fn body_text(d: &Delivery, body: BodyType) -> Result<Option<&str>, String> {
     match body {
         BodyType::Bytes => Ok(None),
         BodyType::Auto => Ok(std::str::from_utf8(&d.value).ok()),
-        BodyType::Text => std::str::from_utf8(&d.value).map(Some).map_err(|e| format!("not text: {}", e)),
+        BodyType::Text => std::str::from_utf8(&d.value).map(Some).map_err(|e| tr!("bridge.not_text", err = e)),
     }
 }
 

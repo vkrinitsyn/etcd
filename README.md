@@ -14,6 +14,9 @@ Server implementation of a [etcd](https://github.com/etcd-io/etcd) v3 API client
 It provides asynchronous client backed by [tokio](https://github.com/tokio-rs/tokio)
 and [tonic](https://github.com/hyperium/tonic).
 
+Main idea is to get a memory only distributed KeyValue storage with queue capability
+by utilizing a steaming API of notification of KV changes.
+
 
 > [!NOTE]
 > Provided by [DBinvent](https://www.dbinvent.com), and an essential part of
@@ -27,8 +30,8 @@ and [tonic](https://github.com/hyperium/tonic).
   requested process
 - a queue named `ch:<table>` writes its messages straight into a ClickHouse table
   ([clickhouse.md](clickhouse.md), feature `clickhouse`)
-- a bridge from a queue or key prefix to a JMS queue (AMQP 1.0), an MQTT 5 topic
-  or a Kafka topic, or JMS clients served as an AMQP peer
+- a bridge from a queue or key prefix to a JMS queue (AMQP 1.0), an MQTT 5 topic,
+  a Kafka topic or an HTTP(S) endpoint, or JMS clients served as an AMQP peer
   ([bridge.md](bridge.md), feature `bridge`)
 - no message storage, cluster election, as use another cluster implementation
 - messages, errors and `--help` in English, Russian, French, German, Chinese and
@@ -52,12 +55,14 @@ and [tonic](https://github.com/hyperium/tonic).
 - [ ] Lock
 - [ ] Namespace
 - [ ] Lease
-
-### Lowest priority:
 - [ ] Auth
 - [ ] Maintenance
+
+### Won't do:
+*this cluster relay on YT Cluster RAFT and storage (Postrges) implementation*
 - [ ] Cluster
 - [ ] Election
+- [ ] Storage
 
 
 ## Usage

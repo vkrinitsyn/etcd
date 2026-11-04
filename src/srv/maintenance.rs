@@ -5,7 +5,7 @@ use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status};
 use crate::cluster::EtcdNode;
 use crate::etcdpb::etcdserverpb::maintenance_server::Maintenance;
-use crate::etcdpb::etcdserverpb::{AlarmRequest, AlarmResponse, DefragmentRequest, DefragmentResponse, HashKvRequest, HashKvResponse, HashRequest, HashResponse, MoveLeaderRequest, MoveLeaderResponse, SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse};
+use crate::etcdpb::etcdserverpb::{DowngradeRequest, DowngradeResponse, AlarmRequest, AlarmResponse, DefragmentRequest, DefragmentResponse, HashKvRequest, HashKvResponse, HashRequest, HashResponse, MoveLeaderRequest, MoveLeaderResponse, SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse};
 use crate::etcdpb::mvccpb::KeyValue;
 
 type SnapshotResultStream = Pin<Box<dyn Stream<Item = Result<SnapshotResponse, Status>> + Send>>;
@@ -33,7 +33,15 @@ impl Maintenance for EtcdNode {
             errors: vec![],
             db_size_in_use: vault_size,
             is_learner: false,
+            // etcds has neither a storage version nor a quota, and nothing to downgrade
+            storage_version: String::new(),
+            db_size_quota: 0,
+            downgrade_info: None,
         }))
+    }
+
+    async fn downgrade(&self, _request: Request<DowngradeRequest>) -> Result<Response<DowngradeResponse>, Status> {
+        Err(Status::unimplemented(tr!("srv.unimplemented")))
     }
 
     async fn defragment(&self, _request: Request<DefragmentRequest>) -> Result<Response<DefragmentResponse>, Status> {
@@ -76,6 +84,8 @@ impl Maintenance for EtcdNode {
             header: Some(self.response_header()),
             hash: hasher.finish() as u32,
             compact_revision: 0,
+            // etcds has no revisions: the hash is of the store as it is now
+            hash_revision: 0,
         }))
     }
 
@@ -100,6 +110,8 @@ impl Maintenance for EtcdNode {
             header: Some(self.response_header()),
             remaining_bytes: 0,
             blob,
+            // no etcd server's version: this is not an etcd snapshot to restore with one
+            version: String::new(),
         };
 
         let stream = tokio_stream::once(Ok(response));

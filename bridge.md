@@ -1,7 +1,7 @@
 # The bridge (feature `bridge`)
 
-A bridge from an etcds queue to the systems JVM applications read:
-a JMS queue over AMQP 1.0, an MQTT 5 topic, or a Kafka topic. It consumes
+A bridge from an etcds queue to the systems JVM applications read - a JMS queue
+over AMQP 1.0, an MQTT 5 topic, a Kafka topic - or to any HTTP(S) endpoint. It consumes
 `/q/{queue}` like any etcd queue consumer, sends each message on, and
 acknowledges it in etcd - deletes its delivery key - only after the other side
 took it. It can also be the AMQP peer itself, so JMS clients connect to it with
@@ -23,6 +23,8 @@ etcds --bridge-queue jobs --bridge-to amqp://app:secret@artemis:5672 --bridge-de
 etcds --bridge-queue jobs --bridge-to mqtt://mosquitto:1883 --bridge-address jobs
 # to Kafka: the topic jobs, one record per message
 etcds --bridge-queue jobs --bridge-to kafka://kafka1:9092,kafka2:9092 --bridge-cloudevents
+# to an HTTP(S) endpoint: one POST per message, the value its body
+etcds --bridge-queue deploys --bridge-to https://bearer:TOKEN@ci.example.com/hook --bridge-dead-letter deploys-dlq
 # a key prefix's puts and deletes, a delete a tombstone
 etcds --bridge-prefix /config/ --bridge-to kafka://kafka1:9092 --bridge-address config
 # JMS clients connect here; a consumer of queue X consumes /q/X
@@ -35,8 +37,8 @@ etcds --bridge-listen 0.0.0.0:5672 --bridge-listen-user app --bridge-listen-pass
 | `bridge_prefix` | | instead of a queue, a key prefix to watch: below |
 | `bridge_listen` | | be the AMQP peer on `host:port`, instead of a queue and `bridge_to` |
 | `bridge_listen_user`, `bridge_listen_password` | | the user a client logs in as (SASL PLAIN); anonymous without |
-| `bridge_to` | | the broker: `amqp://`, `amqps://`, `mqtt://`, `mqtts://`, `kafka://`, `kafkas://`, then `[user:password@]host:port` (Kafka: `host:port,host:port[?options]`, below) |
-| `bridge_address` | the queue's name (`bridge_prefix /a/b/`: `a.b`) | the AMQP address (JMS queue), the MQTT topic prefix, or the Kafka topic |
+| `bridge_to` | | the broker: `amqp://`, `amqps://`, `mqtt://`, `mqtts://`, `kafka://`, `kafkas://`, then `[user:password@]host:port` (Kafka: `host:port,host:port[?options]`, below); or an endpoint: `http://`, `https://`, the same, then a path and query |
+| `bridge_address` | the queue's name (`bridge_prefix /a/b/`: `a.b`) | the AMQP address (JMS queue), the MQTT topic prefix, or the Kafka topic; refused with `http(s)://`, the URL says where |
 | `bridge_consumer` | random | this consumer's UUID in the queue registry |
 | `bridge_body` | `auto` | `auto`, `text` or `bytes`: below |
 | `bridge_group_by_key` | off | AMQP: `JMSXGroupID` = the message key |
@@ -126,6 +128,7 @@ What counts as refused for good, per target:
 | AMQP | rejected `decode-error`, `invalid-field`, `not-implemented`, `message-size-exceeded` | other rejections (`resource-limit-exceeded`, none given), `released`, `modified` |
 | MQTT | PUBACK `topic name invalid`, `payload format invalid`; over the broker's maximum packet size | other PUBACK reasons (`quota exceeded`, `not authorized`, ...) |
 | Kafka | `MESSAGE_TOO_LARGE`, `CORRUPT_MESSAGE`, `INVALID_RECORD`, `RECORD_LIST_TOO_LARGE` | other broker errors |
+| HTTP | 400, 413, 415, 422, 431 | every other answer that is not 2xx: 401, 403, 404, 408, 429, 3xx, 5xx |
 
 ## A key prefix
 
@@ -264,6 +267,58 @@ supported: a client certificate (mTLS), compression, and the idempotent
 producer - a resend after a timeout can be a second record (at least once, as
 everywhere here; `message_id` is the same on both).
 
+## HTTP and HTTPS
+
+`http://` and `https://` POST each message to the URL, one at a time, and the message
+is taken when the endpoint answers 2xx.
+
+```text
+https://ci.example.com/hook?a=1                  the public roots trusted
+https://bearer:TOKEN@ci.example.com/hook         Authorization: Bearer TOKEN
+https://app:secret@ci.example.com/hook           Authorization: Basic
+https://ci.local/hook?ca=/etc/bridge/ca.pem      a private CA, the only one then trusted
+```
+
+- **The body** is the value as it is: the producer writes what the endpoint wants, as
+  GitHub's `{"event_type": ...}`, and the bridge has no template. A delete under a watched
+  prefix has an empty body.
+- **`Content-Type`**, with `bridge_body auto`: `application/json` for a JSON object or
+  array, `text/plain; charset=utf-8` for other text, `application/octet-stream` for the
+  rest. `text` and `bytes` take the type asked for.
+- **Headers:** `etcd-queue`, `etcd-key`, `etcd-index`, `etcd-delivery-key` and `message-id`
+  (a watched prefix: `etcd-prefix`, `etcd-event`), each `_` of the other targets a `-`,
+  since nginx drops a header with an underscore; and `User-Agent: etcds/<version>`. A value
+  is percent-encoded but for printable ASCII less `"` and `%`, so a key holding a CR or LF
+  makes no header of its own.
+- **What it retries, and what it does not.** Only an answer saying the message itself
+  will never do goes to the dead-letter queue (the table above). An expired token (401,
+  403) or an endpoint being deployed (404) is fixed there, and the message then lands, so
+  it holds the line: nothing is dropped because a token ran out. Without a dead-letter
+  queue even those are retried.
+- **A redirect is not followed:** the POST, with its login, would go to whoever the answer
+  names. It is retried like any other answer that took nothing, and logged.
+- **The login** is the URL's `user:password@`, percent-decoded: Basic auth, or a bearer
+  token when the user is `bearer`. Refused at start: a login over plain `http://`, unless
+  to this host's loopback, and a token no header can hold, as a stored secret's trailing
+  newline.
+- **The URL's path and query** are the endpoint's, sent as they are, `?ca=` on `https://`
+  aside; a `/`, `?`, `#` or `@` in a password is percent-encoded. An `@` anywhere after the
+  host is refused, since it reads as a password cut short: write it `%40`. They can hold a secret, as a Slack hook's path does, so the log shows only
+  `https://host/...`, and a user with no password is masked as well: it may be the token.
+  Such a secret in `bridge_to` is in the setting itself, wherever that is kept: prefer a login.
+- **One connection, kept alive.** One the endpoint closed while idle is made again before
+  the send, with no wait. An answer's body is read to its end, up to 64 KiB and 1 s, then
+  the connection is dropped, not the answer, and the wait stops short of the send timeout, so
+  a slow body never sends a taken message again; it is neither kept nor logged, since it
+  can echo a token.
+- **Duplicates:** at least once, as everywhere here. `message-id` is the same on every
+  resend of one delivery and new when etcd hands the message out again, so a receiver that
+  must not act twice keeps an id of its own in the body.
+
+One URL per bridge, one message at a time: an endpoint that is down holds its queue, as a
+broker does. Not built: custom headers, an HMAC signature of the body, `Retry-After` (the
+backoff is the bridge's, up to 60 s), HTTP/2, mTLS.
+
 ## CloudEvents
 
 `bridge_cloudevents` makes each message a CloudEvent 1.0 in binary content mode,
@@ -287,6 +342,7 @@ each written as its protocol binding says:
 | AMQP | application properties `cloudEvents_{name}` (the binding's spelling for JMS) | `content-type` |
 | MQTT 5 | user properties `{name}` | content type |
 | Kafka | headers `ce_{name}` | header `content-type` |
+| HTTP | headers `ce-{name}` | header `Content-Type` |
 
 On AMQP the `etcd_*` properties stay; on MQTT and Kafka the extensions replace
 them. CloudEvents SDKs (Java, Python, Spring Cloud Function) read these as
@@ -341,9 +397,19 @@ etcds node:
   AMQP client: a client's accept acknowledges; a client that leaves, holding a
   message or idle, gives it back at once; a producer refused; release, reject,
   no credit, a wrong login;
+- `tests/bridge_http.rs`, with a small HTTP server of its own: in order on one kept
+  connection, with the acknowledgement; each kind of answer - refused for good, for now, a
+  redirect, none at all, a body too long or that never ends - with what is sent again and
+  what is acknowledged; an endpoint away, and one that closed its connection; Basic and
+  bearer logins with no secret in the log; a CloudEvent; a prefix's puts and deletes;
+  in-process; and TLS with a private CA, for a name and an IP, and refused for another CA
+  or the public roots alone (certificates by the `openssl` tool, not run without it);
+- `tests/bridge_mqtt.rs`, with a small MQTT 5 broker of its own: QoS 1 in order with the
+  acknowledgement; a CloudEvent; a PUBACK refused for good, and for now; a connection refused;
 - `tests/bridge.rs`: the binary with `bridge_*` flags and a config file - a
-  queue, a prefix and the listener, stopped by SIGTERM and SIGINT - and the
-  settings it refuses (exit code 14; without the feature, E105).
+  queue, a prefix and the listener, stopped by SIGTERM and SIGINT, and a queue to an HTTP
+  endpoint - and the settings it refuses (exit code 14; without the feature, E105), in
+  the language asked for.
 
 `tests/bridge_live.rs` runs against real brokers - `cargo test --features
 bridge --test bridge_live -- --ignored`, with `ETCDS_BRIDGE_LIVE_AMQP`,
@@ -395,7 +461,10 @@ listener with Qpid JMS 2.7.
   (SASL), on purpose. Not built: mTLS, compression, the idempotent producer,
   batching. Not possible: an offset from the etcd revision or index - Kafka
   gives the offset; the index is the `etcd_index` header.
-- **Log lines are English only**, not through `tr!` like the node's messages.
+- **HTTP and HTTPS** - hyper's low-level client over rustls (HTTP/1.1, no new crates). Not
+  built: custom headers, an HMAC signature, `Retry-After`, HTTP/2, mTLS.
+- **Messages** go through `tr!` like the node's, in all six languages: an error starts with
+  its code (`ETCD-E110` on), a log line has none.
 
 Consumers named in the first notes - Spring `@JmsListener`, Spring Integration
 MQTT, Spring Kafka, `python-qpid-proton`, `paho-mqtt`, `confluent-kafka`,

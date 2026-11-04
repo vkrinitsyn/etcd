@@ -4,7 +4,7 @@
 //! answers and does nothing.
 mod testing;
 
-use crate::testing::{start_server, Result};
+use crate::testing::{start_server, start_server_at, Result};
 use etcd_client::{
     AlarmAction, AlarmType, Compare, CompareOp, DeleteOptions, Error, GetOptions, Permission,
     PutOptions, Txn, TxnOp, TxnOpResponse,
@@ -23,6 +23,194 @@ fn unimplemented<T: std::fmt::Debug>(r: std::result::Result<T, Error>, what: &st
         Ok(v) => panic!("{} answered {:?}, but the table says unimplemented", what, v),
         Err(e) => assert_eq!(code(e), tonic::Code::Unimplemented, "{}", what),
     }
+}
+
+/// [proto] What the official API added over this crate's old copy, seen by a client of the
+/// generated code: RangeStream is the range in one chunk, under the same limit and the same
+/// refusal as Range; Downgrade and AuthStatus are there and answer `unimplemented`; a member
+/// list may ask to be linearizable; HashKV has no revision to say.
+#[tokio::test]
+async fn what_the_official_api_added() -> Result<()> {
+    use etcds::etcdpb::etcdserverpb::auth_client::AuthClient;
+    use etcds::etcdpb::etcdserverpb::cluster_client::ClusterClient;
+    use etcds::etcdpb::etcdserverpb::kv_client::KvClient;
+    use etcds::etcdpb::etcdserverpb::maintenance_client::MaintenanceClient;
+    use etcds::etcdpb::etcdserverpb::{AuthStatusRequest, DowngradeRequest, HashKvRequest, MemberListRequest, RangeRequest};
+
+    let (_node, mut client, url) = start_server_at().await;
+    client.put("/s/a", "1", None).await?;
+    client.put("/s/b", "2", None).await?;
+    client.put("/s/c", "3", None).await?;
+
+    let mut kv = KvClient::connect(url.clone()).await.unwrap();
+    let req = RangeRequest { key: b"/s/".to_vec(), range_end: b"/s0".to_vec(), limit: 2, ..Default::default() };
+    let whole = kv.range(req.clone()).await.unwrap().into_inner();
+    assert_eq!(whole.kvs.len(), 2);
+    let mut stream = kv.range_stream(req).await.unwrap().into_inner();
+    let chunk = stream.message().await.unwrap().unwrap().range_response.unwrap();
+    assert_eq!(chunk.kvs, whole.kvs, "what a client merges is the same answer");
+    assert_eq!(chunk.count, whole.count);
+    assert!(stream.message().await.unwrap().is_none(), "one chunk");
+
+    let down = MaintenanceClient::connect(url.clone()).await.unwrap().downgrade(DowngradeRequest::default()).await.unwrap_err();
+    assert_eq!(down.code(), tonic::Code::Unimplemented);
+    let auth = AuthClient::connect(url.clone()).await.unwrap().auth_status(AuthStatusRequest::default()).await.unwrap_err();
+    assert_eq!(auth.code(), tonic::Code::Unimplemented);
+
+    let members = ClusterClient::connect(url.clone()).await.unwrap()
+        .member_list(MemberListRequest { linearizable: true }).await.unwrap().into_inner();
+    assert!(members.members.is_empty(), "a node alone lists no members, asked either way");
+    let hash = MaintenanceClient::connect(url).await.unwrap().hash_kv(HashKvRequest::default()).await.unwrap().into_inner();
+    assert_eq!(hash.hash_revision, 0, "etcds has no revisions");
+    Ok(())
+}
+
+/// [proto] Every call of every service of the official API, through the generated clients: an
+/// answer for each, as the table says, on one connection - nothing missing from a service
+/// a client of the official files calls, and the node still serving after them all.
+#[tokio::test]
+async fn every_call_of_every_service_is_answered() -> Result<()> {
+    use etcds::etcdpb::etcdserverpb as pb;
+    use etcds::etcdpb::etcdserverpb::auth_client::AuthClient;
+    use etcds::etcdpb::etcdserverpb::cluster_client::ClusterClient;
+    use etcds::etcdpb::etcdserverpb::kv_client::KvClient;
+    use etcds::etcdpb::etcdserverpb::lease_client::LeaseClient;
+    use etcds::etcdpb::etcdserverpb::maintenance_client::MaintenanceClient;
+    use etcds::etcdpb::etcdserverpb::watch_client::WatchClient;
+    use etcds::etcdpb::v3electionpb as el;
+    use etcds::etcdpb::v3electionpb::election_client::ElectionClient;
+    use etcds::etcdpb::v3lockpb as lk;
+    use etcds::etcdpb::v3lockpb::lock_client::LockClient;
+    use tonic::Code::{Ok as Answered, Unimplemented};
+
+    let (_node, _client, url) = start_server_at().await;
+    let conn = tonic::transport::Channel::from_shared(url).unwrap().connect().await.unwrap();
+    fn got<T>(r: std::result::Result<tonic::Response<T>, tonic::Status>) -> tonic::Code {
+        r.map_or_else(|s| s.code(), |_| tonic::Code::Ok)
+    }
+
+    // each client as an embedder may build it: the limits set, and over a channel of its own
+    let mut kv = KvClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    let key = |k: &str| k.as_bytes().to_vec();
+    assert_eq!(got(kv.put(pb::PutRequest { key: key("/all/a"), value: key("1"), ..Default::default() }).await), Answered);
+    assert_eq!(got(kv.range(pb::RangeRequest { key: key("/all/a"), ..Default::default() }).await), Answered);
+    let mut chunks = kv.range_stream(pb::RangeRequest { key: key("/all/a"), ..Default::default() }).await.unwrap().into_inner();
+    assert_eq!(chunks.message().await.unwrap().unwrap().range_response.unwrap().kvs.len(), 1);
+    assert_eq!(got(kv.txn(pb::TxnRequest::default()).await), Answered);
+    assert_eq!(got(kv.compact(pb::CompactionRequest::default()).await), Answered);
+    assert_eq!(got(kv.delete_range(pb::DeleteRangeRequest { key: key("/all/a"), ..Default::default() }).await), Answered);
+
+    let mut watch = WatchClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    let create = pb::WatchRequest { request_union: Some(pb::watch_request::RequestUnion::CreateRequest(
+        pb::WatchCreateRequest { key: key("/all/w"), ..Default::default() })) };
+    let mut events = watch.watch(tokio_stream::iter(vec![create])).await.unwrap().into_inner();
+    assert!(events.message().await.unwrap().unwrap().created);
+
+    let mut lease = LeaseClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(lease.lease_grant(pb::LeaseGrantRequest::default()).await), Unimplemented);
+    assert_eq!(got(lease.lease_revoke(pb::LeaseRevokeRequest::default()).await), Unimplemented);
+    assert_eq!(got(lease.lease_time_to_live(pb::LeaseTimeToLiveRequest::default()).await), Unimplemented);
+    assert_eq!(got(lease.lease_leases(pb::LeaseLeasesRequest::default()).await), Unimplemented);
+    assert_eq!(got(lease.lease_keep_alive(tokio_stream::iter(vec![pb::LeaseKeepAliveRequest::default()])).await), Unimplemented);
+
+    let mut cluster = ClusterClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(cluster.member_list(pb::MemberListRequest::default()).await), Answered);
+    assert_eq!(got(cluster.member_remove(pb::MemberRemoveRequest::default()).await), Unimplemented);
+    assert_eq!(got(cluster.member_update(pb::MemberUpdateRequest::default()).await), Unimplemented);
+    assert_eq!(got(cluster.member_add(pb::MemberAddRequest::default()).await), Answered);
+    assert_eq!(got(cluster.member_promote(pb::MemberPromoteRequest::default()).await), tonic::Code::NotFound, "no such peer");
+
+    let mut m = MaintenanceClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(m.status(pb::StatusRequest::default()).await), Answered);
+    assert_eq!(got(m.defragment(pb::DefragmentRequest::default()).await), Answered);
+    assert_eq!(got(m.hash(pb::HashRequest::default()).await), Answered);
+    assert_eq!(got(m.hash_kv(pb::HashKvRequest::default()).await), Answered);
+    assert_eq!(got(m.move_leader(pb::MoveLeaderRequest::default()).await), Answered);
+    assert_eq!(got(m.alarm(pb::AlarmRequest::default()).await), Unimplemented);
+    assert_eq!(got(m.downgrade(pb::DowngradeRequest::default()).await), Unimplemented);
+    let mut snap = m.snapshot(pb::SnapshotRequest::default()).await.unwrap().into_inner();
+    assert!(snap.message().await.unwrap().is_some());
+
+    let mut a = AuthClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(a.auth_enable(pb::AuthEnableRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.auth_disable(pb::AuthDisableRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.auth_status(pb::AuthStatusRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.authenticate(pb::AuthenticateRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_add(pb::AuthUserAddRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_get(pb::AuthUserGetRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_list(pb::AuthUserListRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_delete(pb::AuthUserDeleteRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_change_password(pb::AuthUserChangePasswordRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_grant_role(pb::AuthUserGrantRoleRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.user_revoke_role(pb::AuthUserRevokeRoleRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_add(pb::AuthRoleAddRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_get(pb::AuthRoleGetRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_list(pb::AuthRoleListRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_delete(pb::AuthRoleDeleteRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_grant_permission(pb::AuthRoleGrantPermissionRequest::default()).await), Unimplemented);
+    assert_eq!(got(a.role_revoke_permission(pb::AuthRoleRevokePermissionRequest::default()).await), Unimplemented);
+
+    let mut e = ElectionClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(e.campaign(el::CampaignRequest::default()).await), Unimplemented);
+    assert_eq!(got(e.proclaim(el::ProclaimRequest::default()).await), Unimplemented);
+    assert_eq!(got(e.leader(el::LeaderRequest::default()).await), Unimplemented);
+    assert_eq!(got(e.observe(el::LeaderRequest::default()).await), Unimplemented);
+    assert_eq!(got(e.resign(el::ResignRequest::default()).await), Unimplemented);
+
+    let mut l = LockClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
+    assert_eq!(got(l.lock(lk::LockRequest::default()).await), Unimplemented);
+    assert_eq!(got(l.unlock(lk::UnlockRequest::default()).await), Unimplemented);
+
+    // still serving, over the connection all of that used
+    assert_eq!(got(kv.range(pb::RangeRequest { key: key("/all/a"), ..Default::default() }).await), Answered);
+    Ok(())
+}
+
+/// [proto] Each generated client as an embedder may build it - connecting itself, over a channel
+/// with an origin, with an interceptor that sets a header - answered the same each way.
+#[tokio::test]
+async fn each_client_however_it_is_built() -> Result<()> {
+    use etcds::etcdpb::etcdserverpb as pb;
+    use etcds::etcdpb::etcdserverpb::auth_client::AuthClient;
+    use etcds::etcdpb::etcdserverpb::cluster_client::ClusterClient;
+    use etcds::etcdpb::etcdserverpb::kv_client::KvClient;
+    use etcds::etcdpb::etcdserverpb::lease_client::LeaseClient;
+    use etcds::etcdpb::etcdserverpb::maintenance_client::MaintenanceClient;
+    use etcds::etcdpb::etcdserverpb::watch_client::WatchClient;
+    use etcds::etcdpb::v3electionpb as el;
+    use etcds::etcdpb::v3electionpb::election_client::ElectionClient;
+    use etcds::etcdpb::v3lockpb as lk;
+    use etcds::etcdpb::v3lockpb::lock_client::LockClient;
+
+    let (_node, _client, url) = start_server_at().await;
+    let conn = tonic::transport::Channel::from_shared(url.clone()).unwrap().connect().await.unwrap();
+    let origin: tonic::codegen::http::Uri = url.parse().unwrap();
+    let header = |mut r: tonic::Request<()>| {
+        r.metadata_mut().insert("x-test", "1".parse().unwrap());
+        Ok(r)
+    };
+    macro_rules! built {
+        ($client:ident, $call:ident, $req:expr, $want:expr) => {
+            let got = |c: tonic::Code| assert_eq!(c, $want, "{}", stringify!($client));
+            got($client::connect(url.clone()).await.unwrap().$call($req).await.map_or_else(|s| s.code(), |_| tonic::Code::Ok));
+            got($client::with_origin(conn.clone(), origin.clone()).$call($req).await.map_or_else(|s| s.code(), |_| tonic::Code::Ok));
+            got($client::with_interceptor(conn.clone(), header).$call($req).await.map_or_else(|s| s.code(), |_| tonic::Code::Ok));
+        };
+    }
+    built!(KvClient, range, pb::RangeRequest { key: b"k".to_vec(), ..Default::default() }, tonic::Code::Ok);
+    built!(MaintenanceClient, status, pb::StatusRequest::default(), tonic::Code::Ok);
+    built!(ClusterClient, member_list, pb::MemberListRequest::default(), tonic::Code::Ok);
+    built!(AuthClient, auth_status, pb::AuthStatusRequest::default(), tonic::Code::Unimplemented);
+    built!(LeaseClient, lease_grant, pb::LeaseGrantRequest::default(), tonic::Code::Unimplemented);
+    built!(ElectionClient, leader, el::LeaderRequest::default(), tonic::Code::Unimplemented);
+    built!(LockClient, unlock, lk::UnlockRequest::default(), tonic::Code::Unimplemented);
+    let create = || pb::WatchRequest { request_union: Some(pb::watch_request::RequestUnion::CreateRequest(
+        pb::WatchCreateRequest { key: b"/w".to_vec(), ..Default::default() })) };
+    let created = WatchClient::connect(url.clone()).await.unwrap().watch(tokio_stream::iter(vec![create()])).await;
+    assert!(created.is_ok());
+    assert!(WatchClient::with_origin(conn.clone(), origin.clone()).watch(tokio_stream::iter(vec![create()])).await.is_ok());
+    assert!(WatchClient::with_interceptor(conn.clone(), header).watch(tokio_stream::iter(vec![create()])).await.is_ok());
+    Ok(())
 }
 
 /// Lease, Lock, Election and Auth are registered - a client gets an answer,

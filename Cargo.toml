@@ -1,6 +1,6 @@
 [package]
 name = "etcds"
-version = "0.23.0"
+version = "0.24.0"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "support@dbinvent.com"]
 edition = "2024"
 readme = "README.md"
@@ -64,8 +64,8 @@ default = []
 tracer = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # /q/ch:<table>/ and /queue/clickhouse:<table>/ queues write straight to ClickHouse
 clickhouse = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
-# bridge_queue, bridge_prefix or bridge_listen to a broker, started by the binary
-bridge = ["dep:etcd-client", "dep:fe2o3-amqp", "dep:futures-util", "dep:rskafka", "dep:rumqttc", "dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
+# bridge_queue, bridge_prefix or bridge_listen to a broker or an HTTP(S) endpoint, started by the binary
+bridge = ["dep:bytes", "dep:etcd-client", "dep:fe2o3-amqp", "dep:futures-util", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:rskafka", "dep:rumqttc", "dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 tokio = { version = "^1.44", features = ["full"] }

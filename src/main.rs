@@ -74,7 +74,7 @@ async fn main() -> ExitCode {
                 Ok(Ok(Ok(()))) => None,
                 Ok(Ok(Err(e))) => Some(e),
                 Ok(Err(e)) => Some(e.to_string()),
-                Err(_) => Some(format!("not stopped in {:?}", within)),
+                Err(_) => Some(message("main.bridge_not_stopped", &[("within", &format!("{:?}", within))])),
             };
             match err {
                 // what it held may not be back on etcd's line: not an orderly stop

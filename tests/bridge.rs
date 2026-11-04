@@ -27,6 +27,7 @@ struct Run {
 
 fn spawn(config: &str, port: u16, args: &[&str]) -> Run {
     let mut child = Command::new(BIN)
+        .env("LANG", "en") // these tests check its English lines, whatever LANG the run has
         .args(["--config", config, "--cluster", CLUSTER, "--listen-client-urls", &format!("127.0.0.1:{}", port)])
         .args(args)
         .stdout(Stdio::piped())
@@ -235,11 +236,64 @@ mod with_the_feature {
             &["--bridge-queue", "q", "--bridge-prefix", "/a/", "--bridge-to", "amqp://h"][..],
             &["--bridge-listen", "127.0.0.1:1", "--bridge-to", "amqp://h"][..],
             &["--bridge-queue", "q", "--bridge-to", "amqp://h", "--bridge-body", "blob"][..],
+            &["--bridge-queue", "q", "--bridge-to", "http://h/", "--bridge-address", "a"][..],   // an endpoint has its URL
+            &["--bridge-queue", "q", "--bridge-to", "http://u:s3cret@ci.example.com/"][..],      // a login in the clear
         ] {
             let (code, out) = exits(spawn(&absent(), free_port(), args)).await;
             assert_eq!(code, 14, "{:?}: {}", args, out);
             assert!(out.contains("ETCD-E104"), "{:?}: {}", args, out);
+            assert!(!out.contains("s3cret"), "{:?}: {}", args, out);
         }
+    }
+
+    /// A refusal in the language asked for, with its code: the bridge's messages are
+    /// translated as the node's are
+    #[tokio::test]
+    async fn a_refusal_in_the_language_asked_for() {
+        let args = ["--config", &absent(), "--cluster", CLUSTER, "--listen-client-urls", &format!("127.0.0.1:{}", free_port()),
+            "--bridge-queue", "a/b", "--bridge-to", "http://h/"].map(str::to_string);
+        for (lang, text) in [("ru_RU.UTF-8", "один сегмент пути"), ("de", "ein Pfadsegment"), ("en", "one path segment")] {
+            let o = Command::new(BIN).env("LANG", lang).args(&args).output().unwrap();
+            let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert_eq!(o.status.code(), Some(14), "{}", all);
+            assert!(all.contains("ETCD-E104") && all.contains("ETCD-E110") && all.contains(text), "{}: {}", lang, all);
+        }
+    }
+
+    /// A queue to an HTTP endpoint, from flags: POSTed, acknowledged, and the URL's path
+    /// and the token in no line of its log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_to_an_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut got = vec![0; 4096];
+            let mut n = 0;
+            while !String::from_utf8_lossy(&got[..n]).ends_with("from the node") {
+                n += s.read(&mut got[n..]).await.unwrap();
+            }
+            tx.send(String::from_utf8_lossy(&got[..n]).into_owned()).unwrap();
+            s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+            let _ = s.read(&mut got).await; // held until the node stops
+        });
+        let port = free_port();
+        let url = format!("http://bearer:s3cret@127.0.0.1:{}/hook/s3cretpath?a=1", at);
+        let child = spawn(&absent(), port, &["--bridge-queue", "web", "--bridge-to", &url, "--log-level", "debug"]);
+        let mut c = connect(port).await;
+        c.put("/q/web/p/a", "from the node", None).await.unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+        assert!(req.starts_with("POST /hook/s3cretpath?a=1 HTTP/1.1\r\n"), "{}", req);
+        assert!(req.contains("authorization: Bearer s3cret\r\n"), "{}", req);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(drain(&mut c, "web", Duration::from_secs(2)).await.is_empty(), "acknowledged");
+        signal(&child, "TERM");
+        let (code, out) = exits(child).await;
+        assert_eq!(code, 0, "{}", out);
+        assert!(out.contains("bridge: queue web") && out.contains("bearer:***@127.0.0.1"), "{}", out);
+        assert!(!out.contains("s3cret"), "{}", out);
     }
 }
 

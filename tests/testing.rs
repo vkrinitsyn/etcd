@@ -16,6 +16,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 static PORT: AtomicU16 = AtomicU16::new(22379);
 
 pub async fn start_server() -> (EtcdNode, Client) {
+    let (node, client, _) = start_server_at().await;
+    (node, client)
+}
+
+/// `start_server`, and its URL for a client of the generated code
+pub async fn start_server_at() -> (EtcdNode, Client, String) {
     let port = PORT.fetch_add(1, Ordering::Relaxed);
     let addr = format!("localhost:{}", port);
 
@@ -33,7 +39,7 @@ pub async fn start_server() -> (EtcdNode, Client) {
     let mut client = Client::connect([endpoint.as_str()], None).await.unwrap();
     for _ in 0..50 {
         if client.status().await.is_ok() {
-            return (node, client);
+            return (node, client, endpoint);
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }

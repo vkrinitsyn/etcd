@@ -29,17 +29,17 @@ pub fn settings(cfg: &EtcdConfig) -> Result<Option<Bridge>, String> {
     let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
     let (queue, prefix, listen, to) = (some(&cfg.bridge_queue), some(&cfg.bridge_prefix), some(&cfg.bridge_listen), some(&cfg.bridge_to));
     if [&queue, &prefix, &listen].iter().filter(|s| s.is_some()).count() != 1 {
-        return Err("one of bridge_queue, bridge_prefix and bridge_listen".into());
+        return Err(tr!("bridge.one_source"));
     }
     match (&listen, &to) {
-        (Some(_), Some(_)) => return Err("bridge_listen is the AMQP peer itself: no bridge_to".into()),
-        (None, None) => return Err("no bridge_to, the broker to send to".into()),
+        (Some(_), Some(_)) => return Err(tr!("bridge.listen_no_to")),
+        (None, None) => return Err(tr!("bridge.no_to")),
         _ => {}
     }
     let user = match (some(&cfg.bridge_listen_user), some(&cfg.bridge_listen_password)) {
         (Some(u), Some(p)) => Some((u, p)),
         (None, None) => None,
-        _ => return Err("bridge_listen_user and bridge_listen_password: both or neither".into()),
+        _ => return Err(tr!("bridge.listen_user_both")),
     };
     // [bridge] a setting the mode would leave unused is refused, not dropped
     let unused: &[(&str, &str)] = if listen.is_some() {
@@ -48,12 +48,16 @@ pub fn settings(cfg: &EtcdConfig) -> Result<Option<Bridge>, String> {
         &[("bridge_listen_user", &cfg.bridge_listen_user), ("bridge_listen_password", &cfg.bridge_listen_password)]
     };
     if let Some((name, _)) = unused.iter().find(|(_, v)| !v.trim().is_empty()) {
-        return Err(format!("{}: not used by {}", name, if listen.is_some() { "bridge_listen" } else { "a queue or a prefix" }));
+        return Err(if listen.is_some() { tr!("bridge.not_used_listen", name = name) } else { tr!("bridge.not_used_send", name = name) });
     }
     let consumer = match some(&cfg.bridge_consumer) {
-        Some(c) => Uuid::parse_str(&c).map_err(|e| format!("bridge_consumer {:?}: {}", c, e))?,
+        Some(c) => Uuid::parse_str(&c).map_err(|e| tr!("bridge.bad_consumer", value = format!("{:?}", c), err = e))?,
         None => Uuid::new_v4(),
     };
+    // [bridge-http] an endpoint is its URL: an address would be dropped, so it is refused
+    if to.as_deref().is_some_and(|t| super::broker::kind(t) == Ok(super::broker::Kind::Http)) && some(&cfg.bridge_address).is_some() {
+        return Err(tr!("bridge.address_http"));
+    }
     // empty: an embedder's `EtcdConfig::default()`, clap's auto
     let body: BodyType = some(&cfg.bridge_body).as_deref().unwrap_or("auto").parse().map_err(|e| format!("bridge_body: {}", e))?;
     let queue = queue.unwrap_or_default();
@@ -95,8 +99,8 @@ pub fn settings(cfg: &EtcdConfig) -> Result<Option<Bridge>, String> {
         // client's link - checked here with stand-ins, so a bad setting stops the
         // node at start rather than refusing every link after
         Some(bind) => {
-            let (_, port) = bind.rsplit_once(':').ok_or_else(|| format!("bridge_listen {:?}: host:port", bind))?;
-            port.parse::<u16>().map_err(|e| format!("bridge_listen {:?}: {}", bind, e))?;
+            let (_, port) = bind.rsplit_once(':').ok_or_else(|| tr!("bridge.listen_addr", value = format!("{:?}", bind)))?;
+            port.parse::<u16>().map_err(|e| tr!("bridge.listen_port", value = format!("{:?}", bind), err = e))?;
             Config { queue: "q".into(), address: "q".into(), target_url: "amqp://listener".into(), ..c.clone() }.validate()?;
             Ok(Some(Bridge::Listen(c, Listen { bind, user })))
         }
@@ -119,7 +123,7 @@ fn endpoint(listen_client_urls: &str) -> Result<String, String> {
     let first = listen_client_urls.split(',').next().unwrap_or_default().trim();
     let host = first.split_once("://").map_or(first, |(_, h)| h);
     if host.is_empty() {
-        return Err("no listen_client_urls: the bridge connects to the node there".into());
+        return Err(tr!("bridge.no_client_urls"));
     }
     Ok(format!("http://{}", host.replacen("0.0.0.0", "127.0.0.1", 1).replacen("[::]", "[::1]", 1)))
 }
@@ -128,12 +132,18 @@ fn endpoint(listen_client_urls: &str) -> Result<String, String> {
 pub async fn run(b: Bridge, log: Logger, stop: impl Future<Output = ()>) -> Result<(), String> {
     match b {
         Bridge::Send(c) => {
-            let source = c.prefix.as_ref().map_or(format!("queue {}", c.queue), |p| format!("prefix {}", p));
-            info!(log, "bridge: {} -> {} address {}", source, super::redact(&c.target_url), c.address; "consumer" => %c.consumer);
+            let source = c.prefix.as_ref().map_or(tr!("bridge.source_queue", name = c.queue), |p| tr!("bridge.source_prefix", name = p));
+            let url = super::redact(&c.target_url);
+            // an endpoint's address is its URL
+            let line = match super::broker::kind(&c.target_url) {
+                Ok(super::broker::Kind::Http) => tr!("bridge.info_send_http", source = source, url = url),
+                _ => tr!("bridge.info_send", source = source, url = url, address = c.address),
+            };
+            info!(log, "{}", line; "consumer" => %c.consumer);
             super::run(c, log, stop).await
         }
         Bridge::Listen(c, l) => {
-            info!(log, "bridge: AMQP clients on {}", l.bind);
+            info!(log, "{}", tr!("bridge.info_listen", bind = l.bind));
             listener::listen(c, l, log, stop).await
         }
     }
@@ -266,9 +276,22 @@ mod tests {
         assert_eq!(l.user, Some(("app".to_string(), "pw".to_string())));
     }
 
+    /// [bridge-http] an endpoint needs no address: the queue's name stands in, unused
+    #[test]
+    fn a_queue_to_an_endpoint() {
+        let c = cfg(|c| {
+            c.listen_client_urls = "127.0.0.1:2379".into();
+            c.bridge_queue = "jobs".into();
+            c.bridge_to = "https://bearer:t@ci.example.com/hook?a=1".into();
+        });
+        let Some(Bridge::Send(b)) = settings(&c).unwrap() else { panic!("a sender") };
+        assert_eq!(b.target_url, "https://bearer:t@ci.example.com/hook?a=1");
+        assert_eq!(b.address, "jobs");
+    }
+
     #[test]
     fn what_it_refuses() {
-        let refused: [fn(&mut EtcdConfig); 14] = [
+        let refused: [fn(&mut EtcdConfig); 16] = [
             |c| { c.bridge_listen = "nohostport".into() },
             |c| { c.bridge_listen = "127.0.0.1:x".into() },
             |c| { c.bridge_listen = "127.0.0.1:1".into(); c.bridge_dead_letter = "a/b".into() }, // the template checked
@@ -282,7 +305,9 @@ mod tests {
             |c| { c.bridge_queue = "q".into(); c.bridge_to = "amqp://h".into(); c.bridge_consumer = "nope".into() },
             |c| { c.bridge_queue = "q".into(); c.bridge_to = "amqp://h".into(); c.bridge_body = "blob".into() },
             |c| { c.bridge_queue = "a/b".into(); c.bridge_to = "amqp://h".into() },        // Config::validate
-            |c| { c.bridge_queue = "q".into(); c.bridge_to = "http://h".into() },
+            |c| { c.bridge_queue = "q".into(); c.bridge_to = "gopher://h".into() },
+            |c| { c.bridge_queue = "q".into(); c.bridge_to = "http://h".into(); c.bridge_address = "a".into() }, // unused
+            |c| { c.bridge_queue = "q".into(); c.bridge_to = "http://u:p@ci.example.com/".into() }, // a login in the clear
         ];
         for (i, f) in refused.into_iter().enumerate() {
             assert!(settings(&cfg(f)).is_err(), "case {}", i);

@@ -1,9 +1,10 @@
-//! Where the bridge sends: an AMQP 1.0 broker (JMS), an MQTT 5 broker or Kafka,
-//! by the scheme of the target URL. Each tells the bridge, per message, whether
+//! Where the bridge sends: an AMQP 1.0 broker (JMS), an MQTT 5 broker, Kafka or an
+//! HTTP(S) endpoint, by the scheme of the target URL. Each tells the bridge, per message, whether
 //! the broker took it ([`Sent`]); an `Err` is a connection that no longer
 //! works, and is made again.
 
 pub mod amqp;
+pub mod http;
 pub mod kafka;
 pub mod mqtt;
 
@@ -28,6 +29,7 @@ pub enum Kind {
     Amqp,
     Mqtt,
     Kafka,
+    Http,
 }
 
 /// The target's kind, by the URL's scheme.
@@ -36,7 +38,8 @@ pub fn kind(url: &str) -> Result<Kind, String> {
         Some("amqp" | "amqps") => Ok(Kind::Amqp),
         Some("mqtt" | "mqtts") => Ok(Kind::Mqtt),
         Some("kafka" | "kafkas") => Ok(Kind::Kafka),
-        _ => Err(format!("{}: amqp://, amqps://, mqtt://, mqtts://, kafka:// or kafkas://", crate::bridge::redact(url))),
+        Some("http" | "https") => Ok(Kind::Http),
+        _ => Err(tr!("bridge.bad_scheme", url = crate::bridge::redact(url))),
     }
 }
 
@@ -53,8 +56,7 @@ pub fn tls_ca(url: &str) -> Result<(String, Option<String>), String> {
     let host = url[start..].rfind('@').map_or(start, |a| start + a + 1);
     let Some(q) = url[host..].find('?').map(|q| host + q) else {
         if url[start..].contains("?ca=") || url[start..].contains("&ca=") {
-            return Err(format!("{}: a ca= that cannot be read - an '@' in its path is written %40, \
-                a '?' in a password %3F", crate::bridge::redact(url)));
+            return Err(tr!("bridge.ca_unreadable", url = crate::bridge::redact(url)));
         }
         return Ok((url.to_string(), None));
     };
@@ -65,13 +67,13 @@ pub fn tls_ca(url: &str) -> Result<(String, Option<String>), String> {
         match opt.split_once('=') {
             Some(("ca", path)) if !path.is_empty() => {
                 if !tls {
-                    return Err(format!("{}: ca on a plain connection - amqps:// or mqtts://", crate::bridge::redact(base)));
+                    return Err(tr!("bridge.ca_plain", url = crate::bridge::redact(base)));
                 }
                 ca = Some(percent_decode(path));
             }
             // the option's name only: what follows the `=` is the caller's
-            _ => return Err(format!("{}: option {:?} - only ca=<PEM file>", crate::bridge::redact(base),
-                opt.split('=').next().unwrap_or_default())),
+            _ => return Err(tr!("bridge.ca_option", url = crate::bridge::redact(base),
+                option = format!("{:?}", opt.split('=').next().unwrap_or_default()))),
         }
     }
     Ok((base.to_string(), ca))
@@ -85,7 +87,7 @@ pub fn ca_certs(path: &str) -> Result<Vec<rustls_pki_types::CertificateDer<'stat
     let certs = CertificateDer::pem_file_iter(path).map_err(|e| format!("ca {}: {}", path, e))?
         .collect::<Result<Vec<_>, _>>().map_err(|e| format!("ca {}: {}", path, e))?;
     if certs.is_empty() {
-        return Err(format!("ca {}: no certificate in it", path));
+        return Err(tr!("bridge.ca_no_cert", path = path));
     }
     Ok(certs)
 }
@@ -99,11 +101,31 @@ pub fn ca_roots(path: &str) -> Result<rustls::RootCertStore, String> {
     Ok(roots)
 }
 
+/// TLS trusting the CAs in `ca`, or the public (webpki) roots - with AWS-LC named: the
+/// AMQP client brings it and rskafka ring, and rustls takes no default then (Kafka, HTTP)
+pub(crate) fn rustls_client(ca: Option<&str>) -> Result<rustls::ClientConfig, String> {
+    let roots = match ca {
+        Some(path) => ca_roots(path)?,
+        None => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            roots
+        }
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 pub enum Target {
     /// boxed: a connection, session and link are large beside the others
     Amqp(Box<amqp::Amqp>),
     Mqtt(mqtt::Mqtt),
     Kafka(kafka::Kafka),
+    Http(http::Http),
 }
 
 impl Target {
@@ -114,11 +136,12 @@ impl Target {
                 Kind::Amqp => Target::Amqp(Box::new(amqp::Amqp::connect(cfg).await?)),
                 Kind::Mqtt => Target::Mqtt(mqtt::Mqtt::connect(cfg).await?),
                 Kind::Kafka => Target::Kafka(kafka::Kafka::connect(cfg).await?),
+                Kind::Http => Target::Http(http::Http::connect(cfg).await?),
             })
         };
         match tokio::time::timeout(cfg.send_timeout, connect).await {
             Ok(r) => r,
-            Err(_) => Err(format!("no answer in {:?}", cfg.send_timeout)),
+            Err(_) => Err(tr!("bridge.no_answer", timeout = format!("{:?}", cfg.send_timeout))),
         }
     }
 
@@ -127,6 +150,7 @@ impl Target {
             Target::Amqp(t) => t.send(d, &cfg.shape, now_ms).await,
             Target::Mqtt(t) => t.send(d, &cfg.shape, now_ms).await,
             Target::Kafka(t) => t.send(d, &cfg.shape, now_ms).await,
+            Target::Http(t) => t.send(d, &cfg.shape, now_ms).await,
         }
     }
 
@@ -136,7 +160,7 @@ impl Target {
             match self {
                 Target::Amqp(t) => t.close().await,
                 Target::Mqtt(t) => t.close().await,
-                Target::Kafka(_) => {}
+                Target::Kafka(_) | Target::Http(_) => {}
             }
         })
         .await;
@@ -231,7 +255,9 @@ mod tests {
         assert_eq!(kind("amqps://h:5671"), Ok(Kind::Amqp));
         assert_eq!(kind("mqtt://h"), Ok(Kind::Mqtt));
         assert_eq!(kind("kafka://h:9092,g:9092"), Ok(Kind::Kafka));
-        assert!(kind("http://h").is_err());
+        assert_eq!(kind("http://h"), Ok(Kind::Http));
+        assert_eq!(kind("https://h/x"), Ok(Kind::Http));
+        assert!(kind("gopher://h").is_err());
         assert!(!kind("ftp://u:pw@h").unwrap_err().contains("pw"), "no password in the error");
 
         assert_eq!(split_url("kafka://u:p@h:1,g:2/"), (Some(("u".into(), "p".into())), "h:1,g:2".into()));

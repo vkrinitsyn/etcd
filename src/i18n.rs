@@ -13,12 +13,15 @@
 //!
 //! The language is the process's, not a call's: one node, one language.
 
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 /// set_lang's
 static LANG: RwLock<Option<String>> = RwLock::new(None);
 /// the logger's, read by EtcdNode::init
 static LOGGER_LANG: RwLock<Option<String>> = RwLock::new(None);
+/// LANG, read once: this runs for every message, and an embedder's other threads may be
+/// writing the environment
+static ENV: OnceLock<Option<String>> = OnceLock::new();
 
 /// The language of the messages from here on: `en`, `ru`, `fr`, `de`, `zh`, `ja`, or a
 /// locale of one (`ru_RU.UTF-8`). Wins over the logger's and LANG; an empty one is
@@ -41,8 +44,28 @@ pub fn lang() -> String {
     choose(
         LANG.read().ok().and_then(|l| l.clone()),
         LOGGER_LANG.read().ok().and_then(|l| l.clone()),
-        std::env::var("LANG").ok(),
+        // a unit test checks English texts, whatever LANG the run has
+        ENV.get_or_init(|| if cfg!(test) { None } else { std::env::var("LANG").ok() }).clone(),
     )
+}
+
+/// [i18n] tr! made when it is displayed: a debug line's message, not built while debug is off
+#[cfg(feature = "bridge")]
+macro_rules! tr_lazy {
+    ($key:expr $(, $name:ident = $value:expr)* $(,)?) => {
+        $crate::i18n::Lazy(|| tr!($key $(, $name = $value)*))
+    };
+}
+
+/// tr_lazy!'s: a message made when it is displayed
+#[cfg(feature = "bridge")]
+pub(crate) struct Lazy<F: Fn() -> String>(pub F);
+
+#[cfg(feature = "bridge")]
+impl<F: Fn() -> String> std::fmt::Display for Lazy<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&(self.0)())
+    }
 }
 
 /// the first language given - an empty one is not given
@@ -95,6 +118,12 @@ macro_rules! tr {
     };
 }
 
+/// [i18n] A gRPC client's call refused before it was sent: the connection is not ready. What
+/// the generated clients (src/etcdpb) say in tonic's "Service was not ready" place
+pub fn not_ready(err: tonic::codegen::StdError) -> String {
+    tr!("grpc.not_ready", err = err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +150,33 @@ mod tests {
         assert!(en.starts_with("ETCD-E"), "{}", en);
         assert_eq!(rust_i18n::t!("peer.half", locale = "xx", connected = 1, total = 3).into_owned(), en);
         assert_ne!(rust_i18n::t!("peer.half", locale = "ru", connected = 1, total = 3).into_owned(), en);
+    }
+
+    /// [i18n] the generated clients say not_ready, not tonic's English
+    #[test]
+    fn the_generated_clients_say_not_ready() {
+        for f in ["etcdserverpb.rs", "v3electionpb.rs", "v3lockpb.rs"] {
+            let src = std::fs::read_to_string(format!("{}/src/etcdpb/{}", env!("CARGO_MANIFEST_DIR"), f)).unwrap();
+            assert!(!src.contains("Service was not ready"), "{}", f);
+            assert!(src.contains("crate::i18n::not_ready(e.into())"), "{}", f);
+        }
+        let en = rust_i18n::t!("grpc.not_ready", locale = "en", err = "x").into_owned();
+        assert!(en.starts_with("ETCD-E") && en.ends_with('x'), "{}", en);
+        assert_ne!(rust_i18n::t!("grpc.not_ready", locale = "ru", err = "x").into_owned(), en);
+    }
+
+    /// [i18n] a debug line's message is made only when it is displayed
+    #[cfg(feature = "bridge")]
+    #[test]
+    fn a_lazy_message_is_made_when_displayed() {
+        let made = std::cell::Cell::new(0);
+        let lazy = Lazy(|| {
+            made.set(made.get() + 1);
+            "m".to_string()
+        });
+        assert_eq!(made.get(), 0);
+        assert_eq!(lazy.to_string(), "m");
+        assert_eq!(made.get(), 1);
     }
 
     #[test]
@@ -218,7 +274,7 @@ mod tests {
             }
             let src = std::fs::read_to_string(&f).unwrap();
             // each call - tr!, or message( in the binary - the key, a string literal, first
-            for call in src.split("tr!(").skip(1).chain(src.split("message(").skip(1)) {
+            for call in src.split("tr!(").skip(1).chain(src.split("tr_lazy!(").skip(1)).chain(src.split("message(").skip(1)) {
                 let Some(key) = call.trim_start().strip_prefix('"').and_then(|r| r.split('"').next())
                     .filter(|k| is_key(k)) else { continue };
                 assert!(all.contains_key(key), "{}: no message {}", f.display(), key);

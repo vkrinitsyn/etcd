@@ -3,7 +3,7 @@
 A guide for coding agents (and people) who use this crate or change it. Each
 statement below was checked against the source in `src/` for version 0.21.4.
 The client side of a queue is in [queue.md](queue.md), the ClickHouse queues in
-[clickhouse.md](clickhouse.md), the bridge to JMS, MQTT and Kafka in
+[clickhouse.md](clickhouse.md), the bridge to JMS, MQTT, Kafka and HTTP(S) endpoints in
 [bridge.md](bridge.md), and the routing between nodes in
 [queue-p2p-route.md](queue-p2p-route.md).
 
@@ -42,7 +42,7 @@ port.
 
 | service | state |
 |---|---|
-| KV | put, range (one key, or a range or prefix, with limit and count only), delete (one key or a range), txn; `compact` is a no-op |
+| KV | put, range (one key, or a range or prefix, with limit and count only), delete (one key or a range), txn; `range_stream` is the same range in one chunk; `compact` is a no-op |
 | Watch | create (one key or a range), cancel, progress. A put is a PUT event; a delete - by key, range or txn - a DELETE event with the key and no value, except under `/q/` and `/queue/` (the registry is the server's). No start revision, no filters, no fragments. Every frame carries the response header (cluster, member, term; revision 0) - etcd's Go client reads it unchecked, and etcdctl crashed on a frame with none [watch-header]. A stream whose requests end is served on while its watches hold it (half-closed, as etcd does); its key watches are taken off once no one reads it either [watch-gone] |
 | Cluster | `member_add` (how peers join); the rest is minimal |
 | Maintenance | `status` (a reachability probe) |
@@ -90,7 +90,7 @@ The settings that do something:
 | `readonly_prefix` | | prefixes no API call may write: only the embedder writes them, in-process |
 | `zone`, `zone_prefix`, `peer_zones` | | this node's zone, prefixes replicated only within a zone, and each peer's zone as `host:port=zone` |
 | `clickhouse_url`, `clickhouse_db` | | the ClickHouse queues' endpoint and default database ([clickhouse.md](clickhouse.md)) |
-| `bridge_queue`, `bridge_prefix`, `bridge_listen`, `bridge_to`, ... | | feature `bridge` ([bridge.md](bridge.md), `src/bridge/`): the node's queue or key prefix to a broker (JMS over AMQP 1.0, MQTT 5, Kafka), or JMS clients served as an AMQP peer; Started once the node serves, over its first client URL; stopped with it. A `bridge_prefix` holding a key the node serves to no remote caller (`local_only_prefix`, its exceptions aside), or a `bridge_queue` it serves to no remote consumer, is refused at start, exit code 14 - the bridge would carry it out of the node; a listener's link to such a queue is refused as it attaches. `amqps://`, `mqtts://` and `kafkas://` take `?ca=<PEM file>`, the only CAs then trusted (else the public roots); `amqps://` is TLS from its first byte (bridge.md "TLS and logins"). An embedder running `etcds::bridge::run` itself may set `Config::node` to its `EtcdNode`: watched and written in-process, no client listener to dial (bridge.md "Embedding"). Settings that make no bridge: exit code 14 (E104, E105 without the feature); a bridge that fails for good stops the node: exit code 15 (E106); one not stopped within `bridge_send_timeout` + 10 s of the signal: exit code 16 (E107). The binary's only: an embedder calling `EtcdNode::init` gets no bridge from these settings |
+| `bridge_queue`, `bridge_prefix`, `bridge_listen`, `bridge_to`, ... | | feature `bridge` ([bridge.md](bridge.md), `src/bridge/`): the node's queue or key prefix to a broker (JMS over AMQP 1.0, MQTT 5, Kafka) or an HTTP(S) endpoint (one POST per message), or JMS clients served as an AMQP peer; Started once the node serves, over its first client URL; stopped with it. A `bridge_prefix` holding a key the node serves to no remote caller (`local_only_prefix`, its exceptions aside), or a `bridge_queue` it serves to no remote consumer, is refused at start, exit code 14 - the bridge would carry it out of the node; a listener's link to such a queue is refused as it attaches. `amqps://`, `mqtts://` and `kafkas://` take `?ca=<PEM file>`, the only CAs then trusted (else the public roots); `amqps://` is TLS from its first byte (bridge.md "TLS and logins"). An embedder running `etcds::bridge::run` itself may set `Config::node` to its `EtcdNode`: watched and written in-process, no client listener to dial (bridge.md "Embedding"). Settings that make no bridge: exit code 14 (E104, E105 without the feature); a bridge that fails for good stops the node: exit code 15 (E106); one not stopped within `bridge_send_timeout` + 10 s of the signal: exit code 16 (E107). The binary's only: an embedder calling `EtcdNode::init` gets no bridge from these settings |
 | `queue_down_timeout` | 300 | seconds a queue consumer's node may be down before its consumers count as gone (`Queues`); 0 never. An `Option`: unset is 300, also from `Default` |
 | `log_level` | `info` | `error`, `warning`, `info`, `debug` or `trace`. Anything else - `warn` included - logs critical messages only |
 | `max_txn_ops`, `max_request_bytes` | 128, 1.5 MiB | stored, not enforced |
@@ -362,8 +362,14 @@ Read from the source; each is a place where the obvious assumption is wrong.
   (`#![forbid(unsafe_code)]` in `lib.rs` and `main.rs`). `cargo make audit` and
   `cargo make geiger` (`Makefile.toml`) run the dependency checks; CI runs both on
   every push and weekly (`.github/workflows/audit.yml`).
-- **The protocol is generated** from `proto/` by `build.rs` (tonic-prost-build)
-  into `src/etcdpb/`.
+- **The protocol is generated** from `proto/` by `build.rs` (tonic-prost-build), only with
+  `ETCDS_GEN_PROTO=1 cargo build` (protoc 3.12 or newer), into `src/etcdpb/`, committed and not
+  edited by hand: a normal build runs no protoc for it. `proto/etcd/` is the official repo's
+  tree, unchanged; what it imports from elsewhere is in `proto/third_party/`.
+- **`proto/etcd/` is compared with etcd's own** by `.github/workflows/proto.yml`
+  (`.github/proto-compare.sh [ref]`): the official repo's proto files at its newest release,
+  byte for byte, any difference a failed run. To follow a release: copy its files in, and
+  generate `src/etcdpb` again.
 - **Locks:** never hold `peers.read()` across a network wait (the `[lockup]`
   comments), and never hold a `queues` guard while creating a queue - both have
   wedged a node before.
@@ -386,5 +392,5 @@ Read from the source; each is a place where the obvious assumption is wrong.
   binary's through `etcds::message`; each key in all six `locales/<language>.yml`,
   on the same line in each, grouped by module. An error's message starts with a
   new `ETCD-Ennn` code (E001-E009 cli, E010 cluster, E030 peer, E050 queue, E070 clickhouse, E080 srv, E100
-  main, E104-E107 the bridge; the bridge's own log lines are English, bridge.md). The i18n tests fail on a key missing in a language, a placeholder that
+  main, E099 the generated gRPC clients, E104-E107 and E110 on the bridge). The i18n tests fail on a key missing in a language, a placeholder that
   differs, a reused code, or a message nothing uses.
