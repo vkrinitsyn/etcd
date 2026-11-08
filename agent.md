@@ -284,9 +284,23 @@ there to how it uses etcd is a change here.
     batch size, no timer and no limit;
   - turning `serve_clickhouse` off does not stop a `ch:` queue until the node
     restarts (an empty URL in a reconfigure keeps the old one).
-- **etcd into Postgres, `etcd_upsert`** (cluster level; ytserv's
-  `state/etcd_upsert.rs`, nothing in this crate). Entries
-  `<event>=<schema.table>:<column>[,<column>]`, separated by `;` or new lines: the
+- **A peer etcd stopped sending to is brought back** (ytserv's
+  `state/etcd_peers.rs`, nothing in this crate). Every 5 s each node reads
+  `member_list`, and promotes each peer not online whose node answers its pings:
+  this crate leaves that to the embedder (see "A peer demoted to Spare stays
+  Spare"). What the peer missed stays missed. `yt_info('E') etcd_peers` counts
+  them, each said in a warning. End to end: `topology/93_etcd.sh` freezes a node
+  for one put.
+- **S3 tickets** (ytserv's `state/s3.rs`, nothing in this crate). With the row `tickets` =
+  `on` in module `B`, ytserv puts a JSON ticket per blob on `/q/s3:<db.schema.table>/p/`,
+  on the node that uploaded it: `received`, then `complete`. A plain queue: memory
+  only and at least once, as every queue here, so a missing ticket proves nothing,
+  and one nobody reads stays in memory.
+- **sge's checks** (ytserv's `state/sge_worker.rs`). Beside a roll's end, a `yt:plan`
+  or `yt:snapshot` row's outcome goes on the `sge_notify_queue` queue as well.
+- **etcd into Postgres, module `F` rows `feed.<event>`** (cluster level; ytserv's
+  `state/etcd_upsert.rs`, nothing in this crate). A row each, its value
+  `<schema.table>:<column>[,<column>]`: the
   messages of a queue, or the puts under a key prefix, are JSON objects (or arrays
   of them) upserted into the table through `jsonb_to_recordset ... on conflict
   (<columns>) do update`, one transaction per value, on a connection of its own.
@@ -314,6 +328,10 @@ there to how it uses etcd is a change here.
   - The forwarded-message gap below is the common case here: a message put
     through any node but the dispatcher's is acknowledged and applied, but stays
     in the dispatcher's memory.
+- **A rolled migration's end** (ytserv's `state/sge_worker.rs`): the worker puts one
+  JSON message on the `sge_notify_queue` queue with `kv_put` to `/q/<queue>/p/<key>`,
+  and the bridge can send it on to Kafka or a CI over HTTPS. Its fields are in
+  yt-cluster's `sge_worker.md` §5, and a change of `kv_put` or the `/q/` keys reaches it.
 - **The bridge** (ytserv-all; ytserv's `state/bridge.rs`). The `bridge_*` settings
   are node level and named as this crate's, with two differences:
   - **the broker's password is no setting:** `bridge_to_secret` (the password of

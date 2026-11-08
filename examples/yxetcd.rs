@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
 
-const USAGE: &str = "yxetcd <endpoint> put|get|range|del|watch|status [args]";
+const USAGE: &str = "yxetcd <endpoint> put|get|range|del|watch|status|members [args]";
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -60,6 +60,16 @@ async fn main() -> std::process::ExitCode {
         "status" => match client.status().await {
             Ok(s) => { println!("version={} dbsize={}", s.version(), s.db_size()); 0 }
             Err(e) => { eprintln!("status: {}", e); 1 }
+        },
+        // what this node holds of each peer: `learner` is not online, it is not sent queue messages
+        "members" => match client.member_list().await {
+            Ok(r) => {
+                for m in r.members() {
+                    println!("{}\t{}\t{}", m.id(), m.peer_urls().join(","), if m.is_learner() { "learner" } else { "online" });
+                }
+                0
+            }
+            Err(e) => { eprintln!("members: {}", e); 1 }
         },
         "put" if a.len() >= 4 => match client.put(a[2].as_str(), a[3].as_str(), None).await {
             Ok(_) => 0,
