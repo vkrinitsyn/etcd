@@ -152,8 +152,10 @@ async fn wait_for_signal() -> Result<String, String> {
 }
 
 pub fn exit_with_msg(log: Logger, msg: String, code: u8) -> ExitCode {
-    #[cfg(test)]
-    assert!(false, "\n{}", msg);
+    // a test sees the message as its failure
+    if cfg!(test) {
+        panic!("\n{}", msg);
+    }
 
     crit!(log, "\n{}", msg);
     // std::io::stdout().flush().unwrap();
@@ -177,7 +179,7 @@ pub fn logger(cfg: &EtcdConfig) -> Logger {
     builder.build().unwrap()
 }
 #[inline]
-fn severity_from_string(severity: &String) -> Severity {
+fn severity_from_string(severity: &str) -> Severity {
     match severity.to_lowercase().as_str() {
         "error" => Severity::Error,
         "warning" => Severity::Warning,

@@ -102,6 +102,9 @@ The rules a client can rely on (`src/queue.rs`):
   the registry again when it is promoted, so it does not dispatch on what it
   missed.
 
+A queue may ask for approvals: a message put to it then waits until enough different
+accounts approved it - [approval.md](approval.md).
+
 Request/reply pairs, and how few network hops a message takes between nodes, are
 in [queue-p2p-route.md](queue-p2p-route.md). A queue named `ch:<table>` writes its
 messages into ClickHouse instead of handing them to a consumer:

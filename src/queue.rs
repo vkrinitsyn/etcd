@@ -73,14 +73,14 @@ pub struct Queue {
     /// drops the sender, and the task, with its clone of the watch's sender,
     /// ends. Without it a cancelled watch's stream stayed open for the client,
     /// whose reader waits for that stream to end.
-    closers: Arc<RwLock<HashMap<(ClientId, WatcherId), oneshot::Sender<()>>>>,
+    closers: Closers,
 
     /// [q-dead] Streams here that receive no more - their consumer stalled, or
     /// cancelled - and are still open: they keep what they were handed until
     /// they close (`drain`). By client and stream generation, with the stream,
     /// held weak: a watch made again on it makes it receiving again. And the
     /// token of the one `drain` task watching it.
-    draining: Arc<RwLock<HashMap<(ClientId, u64), (WeakSender<Result<WatchResponse, Status>>, u64)>>>,
+    draining: Draining,
 
     /// [q-dead] Streams here that closed lately, for `QUEUE_IDLE`: their
     /// tombstones are written again when a peer joins, for one that was not
@@ -97,6 +97,12 @@ pub struct Queue {
 }
 
 type MsgNotifyType = u64;
+/// [q-close] By client and watcher: the sender that ends its stream
+type Closers = Arc<RwLock<HashMap<(ClientId, WatcherId), oneshot::Sender<()>>>>;
+/// [q-dead] By client and stream generation: the stream, held weak, and its `drain` task's token
+type Draining = Arc<RwLock<HashMap<(ClientId, u64), (WeakSender<Result<WatchResponse, Status>>, u64)>>>;
+/// A consumer a message may go to: its client, its watcher, its order and its stream
+type Candidate = (ClientId, WatcherId, u64, Sender<Result<WatchResponse, Status>>);
 
 /// How long a consumer gets to accept one dispatched message before it is
 /// treated as dead. Bounded on purpose: an unbounded `send().await` on a watcher
@@ -247,11 +253,11 @@ impl QueueNameKey {
     pub fn new(value: String) -> Self {
         let names: Vec<&str> = value.split("/").collect();
         let queue = names.len() > 2 && names.get(1)
-            .map(|v| v.trim().len() > 0 && *v == Self::Q1 || *v == Self::Q).unwrap_or(false);
+            .map(|v| !v.trim().is_empty() && *v == Self::Q1 || *v == Self::Q).unwrap_or(false);
         let consumer = queue && names.get(3)
-            .map(|v| v.trim().len() > 0 && (*v== Self::C1 || *v == Self::C)).unwrap_or(false);
+            .map(|v| !v.trim().is_empty() && (*v== Self::C1 || *v == Self::C)).unwrap_or(false);
         let producer = queue && names.get(3)
-            .map(|v| v.trim().len() > 0 && (*v== Self::P1 || *v == Self::P
+            .map(|v| !v.trim().is_empty() && (*v== Self::P1 || *v == Self::P
                 || *v== Self::I1 || *v == Self::I) ).unwrap_or(false);
         let client_id = if consumer {
             Uuid::parse_str(names.get(4).unwrap_or(&"")).ok()
@@ -318,11 +324,10 @@ impl Queue {
                         w.generation = generation;
                     }
                 }
-                if let Some((old, _)) = &replaced {
-                    if watchers.watchers.values().any(|w| w.generation == *old) {
+                if let Some((old, _)) = &replaced
+                    && watchers.watchers.values().any(|w| w.generation == *old) {
                         replaced = None; // the old stream still has a watch here
                     }
-                }
             }
         }
         // receiving again, if it was draining - under the clients' lock, as
@@ -383,13 +388,12 @@ impl Queue {
     /// watch of the client already has on it, or a draining stream's that it
     /// is, or a new one.
     async fn gen_for(&self, client: &ClientId, ch: &Sender<Result<WatchResponse, Status>>) -> u64 {
-        if let Some(c) = self.clients.read().await.get(client).cloned() {
-            if let Some(w) = c.read().await.watchers.values().find(|w| w.client.same_channel(ch)) {
+        if let Some(c) = self.clients.read().await.get(client).cloned()
+            && let Some(w) = c.read().await.watchers.values().find(|w| w.client.same_channel(ch)) {
                 return w.generation;
             }
-        }
         for ((cid, generation), (weak, _)) in self.draining.read().await.iter() {
-            if cid == client && weak.upgrade().map_or(false, |s| s.same_channel(ch)) {
+            if cid == client && weak.upgrade().is_some_and(|s| s.same_channel(ch)) {
                 return *generation;
             }
         }
@@ -464,11 +468,10 @@ impl Queue {
         let Some(c) = clients.get(client_id).cloned() else { return };
         let (w, still_on_stream, empty) = {
             let mut c = c.write().await;
-            if let (Some(ch), Some(w)) = (on, c.watchers.get(&watcher_id)) {
-                if !w.client.same_channel(ch) {
+            if let (Some(ch), Some(w)) = (on, c.watchers.get(&watcher_id))
+                && !w.client.same_channel(ch) {
                     return;
                 }
-            }
             // [q-dead] its closed-stream task ends with it: a stream left with
             // only a cancelled watch must be able to end
             self.closers.write().await.remove(&(*client_id, watcher_id));
@@ -562,7 +565,7 @@ impl Queue {
                     return;
                 }
                 // no sender left - the stream ended here - or no reader there
-                if ch.upgrade().map_or(true, |s| s.is_closed()) {
+                if ch.upgrade().is_none_or(|s| s.is_closed()) {
                     info!(log, "{}{}", LP, tr!("queue.drained", consumer = cid, queue = queue.fq_name));
                     queue.stream_closed(&cid, generation).await;
                     return;
@@ -599,11 +602,10 @@ impl Queue {
     /// receiving stream, else its newest draining one, else none.
     async fn registration_here(&self, client: &ClientId, me: crate::cluster::NodeId) -> Option<crate::route::Registration> {
         use crate::route::{Registration, StreamState};
-        if let Some(c) = self.clients.read().await.get(client).cloned() {
-            if let Some(generation) = c.read().await.watchers.values().map(|w| w.generation).max() {
+        if let Some(c) = self.clients.read().await.get(client).cloned()
+            && let Some(generation) = c.read().await.watchers.values().map(|w| w.generation).max() {
                 return Some(Registration::new(me, generation, StreamState::Receiving).since(incarnation()));
             }
-        }
         self.draining.read().await.keys().filter(|(cid, _)| cid == client).map(|(_, g)| *g).max()
             .map(|generation| Registration::new(me, generation, StreamState::Draining).since(incarnation()))
     }
@@ -641,14 +643,13 @@ impl Queue {
             let render = |r: &Registration| if legacy { r.render_legacy() } else { r.render() };
             let stored = etcd.kv_get(key.as_bytes()).await
                 .and_then(|v| Registration::parse(&String::from_utf8_lossy(&v)));
-            if let Some(s) = stored {
-                if s.node != me && want.map_or(true, |w| s.generation > w.generation) {
+            if let Some(s) = stored
+                && s.node != me && want.is_none_or(|w| s.generation > w.generation) {
                     return writes; // the client is there now
                 }
-            }
-            let stale = stored.filter(|s| s.node == me && want.map_or(true, |w| w.generation != s.generation));
+            let stale = stored.filter(|s| s.node == me && want.is_none_or(|w| w.generation != s.generation));
             let write = match (want, stored) {
-                _ if !legacy && stale.map_or(false, |s| s.generation > 0) => {
+                _ if !legacy && stale.is_some_and(|s| s.generation > 0) => {
                     let s = stale.unwrap();
                     if self.stream_here(client, s.generation).await {
                         // held here after all - a draining stream behind a
@@ -693,7 +694,7 @@ impl Queue {
     async fn drop_closed(&self, client: &ClientId, watcher: WatcherId, ch: &Sender<Result<WatchResponse, Status>>) {
         let same = match self.clients.read().await.get(client) {
             None => false,
-            Some(c) => c.read().await.watchers.get(&watcher).map_or(false, |w| w.client.same_channel(ch)),
+            Some(c) => c.read().await.watchers.get(&watcher).is_some_and(|w| w.client.same_channel(ch)),
         };
         if same {
             let etcd = self.etcd.read().await.clone();
@@ -744,12 +745,11 @@ impl Queue {
     /// [q-dead] Take that mark back after a send that failed - only if it is
     /// still this one: the stream's release may have taken it already.
     async fn unmark(&self, idx: u64, client: ClientId, stream: (crate::cluster::NodeId, u64)) {
-        if let Some(m) = self.queue.write().await.iter_mut().find(|m| m.idx == idx) {
-            if m.handled_by == Some(client) && m.stream == Some(stream) {
+        if let Some(m) = self.queue.write().await.iter_mut().find(|m| m.idx == idx)
+            && m.handled_by == Some(client) && m.stream == Some(stream) {
                 m.handled_by = None;
                 m.stream = None;
             }
-        }
     }
 
     /// [q-dead] What was handed to `client`'s streams on `node` from before
@@ -757,7 +757,7 @@ impl Queue {
     pub(crate) async fn release_older(&self, client: &ClientId, node: crate::cluster::NodeId, since: u64, log: &Logger) -> usize {
         // generation 0, marked while an older member was here: unknown, not older
         self.release_where(|m| m.handled_by.as_ref() == Some(client)
-            && m.stream.map_or(false, |(n, g)| n == node && g > 0 && g < since), client, log).await
+            && m.stream.is_some_and(|(n, g)| n == node && g > 0 && g < since), client, log).await
     }
 
     /// [q-dead] What was handed to `client`'s stream `generation` on `node`.
@@ -769,17 +769,16 @@ impl Queue {
     /// the queue's down timeout (`queue_down_timeout`)?
     async fn down_past(&self, etcd: &EtcdNode, node: crate::cluster::NodeId) -> bool {
         let Some(limit) = etcd.cfg.read().await.down_timeout() else { return false };
-        etcd.peers.read().await.down_for(node).await.map_or(false, |d| d >= limit)
+        etcd.peers.read().await.down_for(node).await.is_some_and(|d| d >= limit)
     }
 
     /// [q-dead] Is `client`'s stream `generation` on this node alive - receiving, or
     /// draining?
     async fn stream_here(&self, client: &ClientId, generation: u64) -> bool {
-        if let Some(c) = self.clients.read().await.get(client).cloned() {
-            if c.read().await.watchers.values().any(|w| w.generation == generation) {
+        if let Some(c) = self.clients.read().await.get(client).cloned()
+            && c.read().await.watchers.values().any(|w| w.generation == generation) {
                 return true;
             }
-        }
         self.draining.read().await.contains_key(&(*client, generation))
     }
 
@@ -814,12 +813,12 @@ impl Queue {
                 Some((node, generation)) if node == me => self.stream_here(&cid, generation).await,
                 // [q-dead] ...and from this incarnation of it: one from before
                 // a restart has nobody left to write its tombstone
-                Some((node, generation)) => reg.map_or(false, |r| r.node == node && !r.outlives(node, generation)),
+                Some((node, generation)) => reg.is_some_and(|r| r.node == node && !r.outlives(node, generation)),
                 // marked before streams had generations: alive here, or
                 // registered on another node
                 None => self.clients.read().await.contains_key(&cid)
                     || self.draining.read().await.keys().any(|(c, _)| *c == cid)
-                    || reg.map_or(false, |r| r.node != me),
+                    || reg.is_some_and(|r| r.node != me),
             };
             if !alive {
                 n += self.release_where(|m| m.handled_by == Some(cid) && m.stream == stream, &cid, log).await;
@@ -828,14 +827,13 @@ impl Queue {
             // [q-dead] alive on a node down past the down timeout: gone, as its
             // node cannot say - withdrawn on its behalf, and what it held to the
             // next consumer (at least once: a node only slow may run it too)
-            if let Some((node, generation)) = stream.filter(|(node, _)| *node != me) {
-                if self.down_past(&etcd, node).await {
+            if let Some((node, generation)) = stream.filter(|(node, _)| *node != me)
+                && self.down_past(&etcd, node).await {
                     info!(log, "{}[q-route] {}", LP, tr!("queue.node_down", node = node, consumer = cid, queue = self.fq_name));
                     let key = crate::route::consumer_key(&self.fq_name, &cid);
                     withdraw_gone(&etcd, &key, node, generation).await;
                     n += self.release_stream(&cid, node, generation, log).await;
                 }
-            }
         }
         n
     }
@@ -883,8 +881,8 @@ impl Queue {
         // node being told to hand one to a consumer it hosts. Enqueuing it
         // would put a second copy in a second queue, and the ack - which
         // deletes by idx on the DISPATCHER - would never reach it.
-        if from_peer.is_some() && qn.consumer {
-            if let Some(cid) = qn.client_id {
+        if from_peer.is_some() && qn.consumer
+            && let Some(cid) = qn.client_id {
                 let kv = KeyValue { key: qn.input.clone().into_bytes(), value: x.value.clone(),
                     ..Default::default() };
                 // [q-dead] the stream it is for rides in `lease` (see the
@@ -904,7 +902,6 @@ impl Queue {
                 }
                 return Ok(Response::new(PutResponse::default()));
             }
-        }
 
         self.touched().await;
         let dispatch = self.dispatch().await;
@@ -982,14 +979,14 @@ impl Queue {
                         // stops it being permanent.
                         warn!(_log, "{}[q-route] {}", LP, tr!("queue.dispatcher_unreachable", node = node, queue = self.fq_name));
                         *self.dispatch.write().await = crate::route::Dispatch::Unknown;
-                        let _ = etcd
+                        etcd
                             .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
                                 zone.as_deref()).await?;
                     }
                 }
                 crate::route::Dispatch::Unknown => {
                     debug!(_log, "{}[q-route] {}", LP, tr!("queue.no_dispatcher", queue = self.fq_name));
-                    let _ = etcd
+                    etcd
                         .broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(r)),
                             zone.as_deref()).await?;
                 }
@@ -1057,7 +1054,7 @@ impl Queue {
                     let Some((idx, key, kv, depth)) = next else { break };
 
                     // TODO queue: implement picking best consumer strategy
-                    let candidates: Vec<(ClientId, WatcherId, u64, Sender<Result<WatchResponse, Status>>)> = {
+                    let candidates: Vec<Candidate> = {
                         let clients = queue.clients.read().await;
                         let mut v = Vec::new();
                         for (cid, c) in clients.iter() {
@@ -1107,7 +1104,7 @@ impl Queue {
                     let header = Some(queue.etcd.read().await.response_header());
                     for (cid, wid, generation, client) in candidates {
                         let resp = WatchResponse {
-                            header: header.clone(),
+                            header,
                             watch_id: wid,
                             created: false,
                             canceled: false,
@@ -1337,7 +1334,7 @@ impl Queue {
             }
             // [q-dead] a receiving consumer there - a draining one takes nothing
             if crate::route::Registration::parse(&String::from_utf8_lossy(&v))
-                .map_or(false, |r| r.node == node && r.state == crate::route::StreamState::Receiving) {
+                .is_some_and(|r| r.node == node && r.state == crate::route::StreamState::Receiving) {
                 return true;
             }
         }
@@ -1366,7 +1363,7 @@ impl Queue {
         let header = Some(self.etcd.read().await.response_header()); // [watch-header]
         for (wid, ch) in watchers {
             let resp = WatchResponse {
-                header: header.clone(),
+                header,
                 watch_id: wid,
                 created: false,
                 canceled: false,
@@ -1452,11 +1449,10 @@ impl Queue {
             self.set_dispatch(d).await;
             return d;
         }
-        if take_over {
-            if let Some(r) = &found {
+        if take_over
+            && let Some(r) = &found {
                 info!(log, "{}[q-route] {}", LP, tr!("queue.take_over", key = key, from = r.node, to = me));
             }
-        }
 
         // Claim it. A record naming a peer that has gone Spare is REPLACED, not
         // kept: `queue-p2p-route.md` is explicit that a pinned dispatcher on a
@@ -1686,7 +1682,7 @@ impl Queue {
         cids.extend(self.draining.read().await.keys().map(|(c, _)| *c));
         for (k, v) in etcd.kv_prefix(format!("{}/c/", self.fq_name).as_bytes()).await {
             let Some(cid) = crate::route::consumer_of(&String::from_utf8_lossy(&k)) else { continue };
-            if Registration::parse(&String::from_utf8_lossy(&v)).map_or(false, |r| r.node == me) {
+            if Registration::parse(&String::from_utf8_lossy(&v)).is_some_and(|r| r.node == me) {
                 cids.insert(cid);
             }
         }
@@ -1847,7 +1843,7 @@ async fn withdraw_gone(etcd: &EtcdNode, key: &str, node: crate::cluster::NodeId,
         let mut vault = etcd.vault.write().await;
         let ours = vault.get(key.as_bytes())
             .and_then(|kv| Registration::parse(&String::from_utf8_lossy(&kv.value)))
-            .map_or(false, |s| s.removed_by(&Registration::gone(node, generation)));
+            .is_some_and(|s| s.removed_by(&Registration::gone(node, generation)));
         if ours {
             vault.remove(key.as_bytes());
         }
@@ -1935,7 +1931,7 @@ impl EtcdNode {
             if let Some(q) = existing {
                 return Ok((q, qn));
             }
-            let q = Queue::new(&self, &qn).await;
+            let q = Queue::new(self, &qn).await;
             let mut queues = self.queues.write().await;
             // re-check: another put may have created it while we had no lock
             let q = queues.entry(qn.queue_name.clone()).or_insert(q).clone();
@@ -2032,7 +2028,7 @@ impl EtcdNode {
             let mut queue_map = self.queues.write().await;
             match queue_map.get_mut(&qn.queue_name) {
                 None => { // no queue exists
-                    let mut queue = Queue::new(&self, &qn).await;
+                    let mut queue = Queue::new(self, &qn).await;
                     let queue_name = qn.queue_name.clone();
                     let queue_consumer_key = queue.make_consumer(qn, cid, r.watch_id, &sender).await;
                     queue_map.insert(queue_name, queue);
@@ -2055,8 +2051,8 @@ impl EtcdNode {
         let me = self.peers.read().await.me();
         let mut kv = {
             let node = peer.lock().await;
-            let c = node.kv_client.lock().await.clone();
-            c
+            
+            node.kv_client.lock().await.clone()
         };
         let mut found = Vec::new();
         for (from, to) in [(&b"/q/"[..], &b"/q0"[..]), (&b"/queue/"[..], &b"/queue0"[..])] {
@@ -2112,11 +2108,10 @@ impl EtcdNode {
         trace!(self.log, "{}{}", LP, tr!("queue.cancel_request", client = cid, count = c.read().await.watchers.len()));
         let w = {
             let mut c = c.write().await;
-            if let (Some(ch), Some(w)) = (on, c.watchers.get(&watch_id)) {
-                if !w.client.same_channel(ch) {
+            if let (Some(ch), Some(w)) = (on, c.watchers.get(&watch_id))
+                && !w.client.same_channel(ch) {
                     return None;
                 }
-            }
             c.watchers.remove(&watch_id)?
         };
         // [range] ...and drop the key's entry and its range with the last watcher
@@ -2140,11 +2135,10 @@ impl EtcdNode {
         // map's, as `create_watcher` takes them, so no watch is made into it meanwhile
         {
             let mut all = self.watchers.write().await;
-            if let Some(e) = all.get(cid) {
-                if Arc::ptr_eq(e, &c) && e.read().await.watchers.is_empty() {
+            if let Some(e) = all.get(cid)
+                && Arc::ptr_eq(e, &c) && e.read().await.watchers.is_empty() {
                     all.remove(cid);
                 }
-            }
         }
         Some(w)
     }
@@ -2162,7 +2156,7 @@ impl EtcdNode {
                 .map(|(id, w)| (*id, w.key.clone()))
                 .collect();
             for (wid, key) in on {
-                let observer = self.observers.read().await.get(&key).map_or(false, |o| o.contains(&(*cid, wid)));
+                let observer = self.observers.read().await.get(&key).is_some_and(|o| o.contains(&(*cid, wid)));
                 if observer {
                     self.forget_watch(cid, wid, Some(ch)).await;
                 }
@@ -3297,11 +3291,10 @@ pub(crate) mod node_tests {
         req2.send(create()).await.unwrap(); // the same client and id, another stream
         let got = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Ok(r) = rx2.recv().await.unwrap() {
-                    if let Some(kv) = r.events.first().and_then(|e| e.kv.clone()) {
+                if let Ok(r) = rx2.recv().await.unwrap()
+                    && let Some(kv) = r.events.first().and_then(|e| e.kv.clone()) {
                         return kv.key;
                     }
-                }
             }
         }).await.expect("the new stream receives");
         assert_eq!(got, b"/q/l6/3/m3");
@@ -3321,14 +3314,14 @@ pub(crate) mod node_tests {
         let q = queue(&n, "back2").await;
         assert!(until(|| async { q.clients.read().await.is_empty() }).await);
         assert!(until(|| async { n.watchers.read().await.get(&cid)
-            .map_or(true, |c| c.try_read().map_or(false, |c| !c.watchers.contains_key(&1))) }).await, "the watch is gone");
+            .is_none_or(|c| c.try_read().is_ok_and(|c| !c.watchers.contains_key(&1))) }).await, "the watch is gone");
         let (req, req_rx) = mpsc::channel(10);
         let (tx, mut rx) = mpsc::channel(10);
         n.new_watcher(req_rx, tx, &cid).await;
         req.send(WatchRequest { request_union: Some(watch_request::RequestUnion::CreateRequest(
             WatchCreateRequest { key: key.into_bytes(), watch_id: 1, ..Default::default() })) }).await.unwrap();
         let first = rx.recv().await.unwrap();
-        assert!(first.as_ref().map_or(false, |r| r.created), "created, not refused: {:?}", first.err());
+        assert!(first.as_ref().is_ok_and(|r| r.created), "created, not refused: {:?}", first.err());
     }
 
     /// [q-dead] The registry written again when a peer joins goes to the
@@ -3428,7 +3421,7 @@ pub(crate) mod node_tests {
 
         reads_registry(&n, 987654321, crate::peer::REGISTRY).await; // upgraded
         n.republish_registry().await;
-        assert!(registration(&n, &reg).await.map_or(false, |r| r.generation > 0), "in full once none is older");
+        assert!(registration(&n, &reg).await.is_some_and(|r| r.generation > 0), "in full once none is older");
         reads_registry(&n, 987654321, 1).await;
         n.republish_registry().await;
         assert_eq!(n.kv_get(reg.as_bytes()).await, Some(n.node_id.to_string().into_bytes()), "and back");
@@ -3556,12 +3549,12 @@ pub(crate) mod node_tests {
         let all = tokio::time::timeout(Duration::from_secs(8), async { for p in puts { p.await.unwrap().unwrap(); } }).await;
         assert!(all.is_ok(), "no write waits on a watcher that does not read");
         assert!(until(|| async { n.watchers.read().await.get(&cid)
-            .map_or(true, |c| c.try_read().map_or(false, |c| !c.watchers.contains_key(&1))) }).await, "its watch is gone");
+            .is_none_or(|c| c.try_read().is_ok_and(|c| !c.watchers.contains_key(&1))) }).await, "its watch is gone");
         let mut told = None;
         while let Ok(Some(Ok(r))) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
             if r.canceled { told = Some(r.cancel_reason); break; }
         }
-        assert!(told.map_or(false, |r| r.starts_with("ETCD-E085 ")), "told, with the reason");
+        assert!(told.is_some_and(|r| r.starts_with("ETCD-E085 ")), "told, with the reason");
         drop(req);
     }
 
@@ -3628,7 +3621,7 @@ pub(crate) mod node_tests {
             WatchCreateRequest { key: key.clone().into_bytes(), range_end: format!("{}0", key).into_bytes(),
                 watch_id: 1, ..Default::default() })) }).await.unwrap();
         assert!(rx.recv().await.unwrap().unwrap().created);
-        assert!(n.observers.read().await.get(key.as_bytes()).map_or(false, |o| o.contains(&(slow, 1))));
+        assert!(n.observers.read().await.get(key.as_bytes()).is_some_and(|o| o.contains(&(slow, 1))));
         // its own registration write is an event in its range: the stream fills
         for i in 0..3 {
             produce(&n, &format!("/q/rng/p/m{}", i), "v").await;
@@ -3636,7 +3629,7 @@ pub(crate) mod node_tests {
         tokio::time::sleep(DISPATCH_TIMEOUT + Duration::from_millis(500)).await;
         // it reads on - the cancel waits for the notify task, which waits on it
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        assert!(until(|| async { !n.observers.read().await.get(key.as_bytes()).map_or(false, |o| o.contains(&(slow, 1))) }).await,
+        assert!(until(|| async { !n.observers.read().await.get(key.as_bytes()).is_some_and(|o| o.contains(&(slow, 1))) }).await,
             "its observer is gone");
         assert!(until(|| async { n.observer_ranges.read().await.get(key.as_bytes()).is_none() }).await, "and its range");
         drop(req);
@@ -3698,9 +3691,11 @@ mod routing_tests {
     async fn peer_up(a: &EtcdNode, b: &EtcdNode, urls: &[String]) {
         // what an embedder sends once it knows the roster
         for (i, n) in [a, b].iter().enumerate() {
-            let mut c = crate::cli::EtcdConfig::default();
-            c.listen_client_urls = urls[i].clone();
-            c.initial_advertise_peer_urls = urls.join(",");
+            let c = crate::cli::EtcdConfig {
+                listen_client_urls: urls[i].clone(),
+                initial_advertise_peer_urls: urls.join(","),
+                ..Default::default()
+            };
             n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
         }
         for n in [a, b] {
@@ -4070,7 +4065,7 @@ mod routing_tests {
         assert_eq!(m1, Some((Some(cid), Some((b.node_id, g)))), "held for that stream");
 
         drop(c); // the stream closes
-        assert!(until(|| async { on_a.queue.read().await.iter().find(|m| m.idx == 7).map_or(false, |m| m.handled_by.is_none()) }).await,
+        assert!(until(|| async { on_a.queue.read().await.iter().find(|m| m.idx == 7).is_some_and(|m| m.handled_by.is_none()) }).await,
             "and back when it closes");
     }
 

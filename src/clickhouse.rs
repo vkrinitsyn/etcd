@@ -418,11 +418,9 @@ mod queue_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(held(&n, "/q/ch:events/1/1").await);
 
-        let mut c = crate::cli::EtcdConfig::default();
-        c.clickhouse_url = ch.url.clone();
+        let c = crate::cli::EtcdConfig { clickhouse_url: ch.url.clone(), ..Default::default() };
         n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
-        let mut c = crate::cli::EtcdConfig::default();
-        c.clickhouse_url = String::new();
+        let c = crate::cli::EtcdConfig { clickhouse_url: String::new(), ..Default::default() };
         n.event.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
         for _ in 0..100 {
             if n.cfg.read().await.clickhouse_url == ch.url { break; }

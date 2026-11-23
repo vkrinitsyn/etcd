@@ -3,6 +3,10 @@ use tonic::metadata::MetadataMap;
 pub mod parking;
 mod kv;
 mod lease;
+// [coord] the Lock service, on the leader
+mod lock;
+// [auth] the Auth service
+mod auth;
 pub(crate) mod watch;
 mod maintenance;
 

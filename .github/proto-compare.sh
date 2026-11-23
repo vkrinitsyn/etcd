@@ -31,4 +31,19 @@ for f in "${FILES[@]}"; do
         bad=1
     fi
 done
+# [proto] the hard lock (owner, 2026-11-21): etcd's v3 API and nothing of etcds' own beside it -
+# no proto file outside proto/etcd/ but the third-party imports, and no generated package in
+# src/etcdpb/ but etcd's (build.rs PACKAGES)
+TOP="$(cd "$ROOT/../.." && pwd)"
+while IFS= read -r extra; do
+    echo "::error file=$extra::a proto file outside proto/etcd/: etcds serves etcd's v3 API only"
+    bad=1
+done < <(cd "$TOP" && find proto -name '*.proto' -not -path 'proto/etcd/*' -not -path 'proto/third_party/*' | sort)
+for gen in "$TOP"/src/etcdpb/*.rs; do
+    name="$(basename "$gen" .rs)"
+    case "$name" in
+        mod|authpb|mvccpb|etcdserverpb|v3electionpb|v3lockpb) ;;
+        *) echo "::error file=src/etcdpb/$name.rs::a generated package that is not etcd's"; bad=1 ;;
+    esac
+done
 exit "$bad"

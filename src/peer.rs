@@ -50,6 +50,8 @@ pub struct EtcdCluster {
     /// consumer registers or a dispatcher is claimed, and a peer that was not
     /// receiving then never learns it - see `EtcdNode::republish_registry`.
     joined: Arc<Notify>,
+    /// [auth] the cluster's `peer_token`, sent on each call to a peer
+    peer_token: String,
 }
 
 /// Lifecycle state of a peer node in the cluster.
@@ -68,13 +70,19 @@ pub enum PeerState {
 
 #[allow(dead_code)]
 pub(crate) struct EtcdPeerNode {
-    peer_id: NodeId,
+    pub(crate) peer_id: NodeId,
     pub(crate) conn: String,
     /// This peer's zone, from `peer_zones`. Empty means unzoned.
     pub(crate) zone: String,
     pub(crate) state: PeerState,
     added_at: Instant,
     pub(crate) kv_client: Arc<Mutex<KvClient<Channel>>>,
+    /// [coord] the peer's channel, for the calls sent on to the leader and the leases
+    /// it replicates
+    pub(crate) channel: Channel,
+    /// [auth] this node's id and the cluster's `peer_token`, on each call to the peer
+    me: NodeId,
+    pub(crate) token: String,
     mt_client: Arc<Mutex<MaintenanceClient<Channel>>>,
     cluster_client: Arc<Mutex<ClusterClient<Channel>>>,
     /// [q-dead] since when this peer has not answered - a call or a probe
@@ -178,17 +186,37 @@ fn zone_of(conn: &str, peer_zones: &str) -> String {
 
 /// A call to a peer, naming this node in its `x-peer` header (`etcdpb::XPEER`). Here and not in
 /// the generated client: src/etcdpb stays what `ETCDS_GEN_PROTO=1 cargo build` writes
-fn from_peer<T>(message: T, peer: Option<MetadataValue<tonic::metadata::Ascii>>) -> tonic::Request<T> {
+fn from_peer<T>(message: T, peer: Option<MetadataValue<tonic::metadata::Ascii>>, token: &str) -> tonic::Request<T> {
     let mut r = tonic::Request::new(message);
     if let Some(peer) = peer {
         r.metadata_mut().insert(crate::etcdpb::XPEER, peer);
     }
+    // [auth] the cluster's token: a call naming a peer without it is refused
+    if !token.is_empty()
+        && let Ok(v) = MetadataValue::try_from(token) {
+            r.metadata_mut().insert(crate::coord::XPEER_TOKEN, v);
+        }
     r
+}
+
+impl EtcdPeerNode {
+    /// [auth] `message` as a call from this node, with the cluster's token
+    pub(crate) fn as_peer<T>(&self, message: T) -> tonic::Request<T> {
+        from_peer(message, MetadataValue::try_from(self.me.to_string()).ok(), &self.token)
+    }
 }
 
 impl EtcdCluster {
     /// This node's zone, as last configured.
     pub(crate) fn my_zone(&self) -> &str { &self.my_zone }
+
+    /// [auth] A reconfigure's `peer_token`, from now on on each call to each peer
+    pub(crate) async fn set_peer_token(&mut self, token: &str) {
+        self.peer_token = token.to_string();
+        for p in &self.peers {
+            p.lock().await.token = token.to_string();
+        }
+    }
 
     /// Re-label every peer from configuration.
     ///
@@ -218,6 +246,7 @@ impl EtcdCluster {
             cluster_id,
             log: log.clone(),
             joined: Arc::new(Notify::new()),
+            peer_token: cfg.peer_token.clone(),
         };
         
         let peers = cfg.peers();
@@ -333,12 +362,11 @@ impl EtcdCluster {
                 }
             }
             if exists { continue; }
-            if let Some(t) = self.recently_added.get(&member_id) {
-                if t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS) {
+            if let Some(t) = self.recently_added.get(&member_id)
+                && t.elapsed() < Duration::from_secs(RECENT_WINDOW_SECS) {
                     info!(self.log, "{}{}", LP, tr!("peer.recent", id = member_id, ago = format!("{:?}", t.elapsed()), url = url));
                     continue;
                 }
-            }
             self.recently_added.insert(member_id, Instant::now());
             let peer = Arc::new(Mutex::new(EtcdPeerNode {
                 peer_id: member_id,
@@ -379,6 +407,9 @@ impl EtcdCluster {
                 state: PeerState::InProgress,
                 added_at: Instant::now(),
                 kv_client: Arc::new(Mutex::new(KvClient::new(conn.clone()))),
+                channel: conn.clone(),
+                me: self.node_id,
+                token: self.peer_token.clone(),
                 mt_client: Arc::new(Mutex::new(mt)),
                 cluster_client: Arc::new(Mutex::new(ClusterClient::new(conn))),
                 down_since: None,
@@ -423,11 +454,10 @@ impl EtcdCluster {
         let mut targets = Vec::new();
         for p in self.peers.iter() {
             let n = p.lock().await;
-            if let Some(my_zone) = zone_scoped {
-                if n.zone.trim() != my_zone.trim() {
+            if let Some(my_zone) = zone_scoped
+                && n.zone.trim() != my_zone.trim() {
                     continue;
                 }
-            }
             match n.state {
                 PeerState::Online => targets.push((p.clone(), true)),
                 PeerState::InProgress => targets.push((p.clone(), false)),
@@ -464,19 +494,19 @@ impl EtcdCluster {
     pub(crate) async fn peer_request_outcome(request: BroadcastRequest, peer: EtcdPeerNodeType,
         peer_id: Option<MetadataValue<tonic::metadata::Ascii>>) -> Sent
     {
-        let mut kv = {
+        let (mut kv, token) = {
             let node = peer.lock().await;
-            let c = node.kv_client.lock().await.clone();
-            c
+            
+            (node.kv_client.lock().await.clone(), node.token.clone())
         };
         // Ok(answered), Err(status) for a call that failed
         let call = async move {
             match request {
                 BroadcastRequest::Kv(br) => {
                     match br {
-                        KvEvent::Put(kr) => kv.put(from_peer(kr, peer_id)).await.map(|_| ()),
-                        KvEvent::Delete(kr) => kv.delete_range(from_peer(kr, peer_id)).await.map(|_| ()),
-                        KvEvent::Txn(kr) => kv.txn(from_peer(kr, peer_id)).await.map(|_| ()),
+                        KvEvent::Put(kr) => kv.put(from_peer(kr, peer_id, &token)).await.map(|_| ()),
+                        KvEvent::Delete(kr) => kv.delete_range(from_peer(kr, peer_id, &token)).await.map(|_| ()),
+                        KvEvent::Txn(kr) => kv.txn(from_peer(kr, peer_id, &token)).await.map(|_| ()),
                     }
                 }
             }
@@ -692,8 +722,8 @@ impl EtcdCluster {
     /// zone" is the leak zoning exists to prevent. Being targeted rather than
     /// broadcast changes nothing about that.
     ///
-    /// `None` when the peer is not held, not Online, or excluded by the zone test
-    /// - the caller falls back to a broadcast and says so, rather than silently
+    /// `None` when the peer is not held, not Online, or excluded by the zone test:
+    /// the caller falls back to a broadcast and says so, rather than silently
     /// dropping the message.
     pub(crate) async fn unicast_target(&self, peer_id: NodeId, zone_scoped: Option<&str>) -> Option<EtcdPeerNodeType> {
         for p in &self.peers {
@@ -704,11 +734,10 @@ impl EtcdCluster {
             if n.state != PeerState::Online {
                 return None;
             }
-            if let Some(my_zone) = zone_scoped {
-                if n.zone.trim() != my_zone.trim() {
+            if let Some(my_zone) = zone_scoped
+                && n.zone.trim() != my_zone.trim() {
                     return None;
                 }
-            }
             return Some(p.clone());
         }
         None
@@ -734,7 +763,7 @@ impl EtcdCluster {
         for p in &self.peers {
             let node = p.lock().await;
             let mut cc = node.cluster_client.lock().await;
-            match cc.member_add(add_req.clone()).await {
+            match cc.member_add(node.as_peer(add_req.clone())).await {
                 Ok(_) => info!(log, "{}{}", LP, tr!("peer.announced", peer = node.conn)),
                 Err(e) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = node.conn, err = e)),
             }
@@ -785,7 +814,7 @@ impl EtcdCluster {
         let resp = {
             let node = peer.lock().await;
             let mut kv = node.kv_client.lock().await;
-            kv.range(range_req).await
+            kv.range(node.as_peer(range_req)).await
                 .map_err(|e| tr!("peer.range", peer = peer_conn, err = e))?
         };
         // [E2] only what propagates: a peer's `local` keys are its own, and copying
@@ -820,12 +849,12 @@ impl EtcdCluster {
             is_learner: true,
         };
         for p in peers {
-            let (mut cc, conn) = {
+            let (mut cc, conn, req) = {
                 let node = p.lock().await;
                 let cc = node.cluster_client.lock().await.clone();
-                (cc, node.conn.clone())
+                (cc, node.conn.clone(), node.as_peer(add_req.clone()))
             };
-            match tokio::time::timeout(PEER_RPC_TIMEOUT, cc.member_add(add_req.clone())).await {
+            match tokio::time::timeout(PEER_RPC_TIMEOUT, cc.member_add(req)).await {
                 Ok(Ok(_)) => info!(log, "{}{}", LP, tr!("peer.announced", peer = conn)),
                 Ok(Err(e)) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = conn, err = e)),
                 Err(e) => error!(log, "{}{}", LP, tr!("peer.announce_failed", peer = conn, err = e)),

@@ -30,6 +30,9 @@ by utilizing a steaming API of notification of KV changes.
   requested process
 - a queue named `ch:<table>` writes its messages straight into a ClickHouse table
   ([clickhouse.md](clickhouse.md), feature `clickhouse`)
+- approvals: a message put to a gated queue waits until enough different accounts
+  approved it, each by its level - approve, veto, override
+  ([approval.md](approval.md), feature `approvals`)
 - a bridge from a queue or key prefix to a JMS queue (AMQP 1.0), an MQTT 5 topic,
   a Kafka topic or an HTTP(S) endpoint, or JMS clients served as an AMQP peer
   ([bridge.md](bridge.md), feature `bridge`)
@@ -43,6 +46,7 @@ by utilizing a steaming API of notification of KV changes.
 
 - [queue.md](queue.md) - using a queue: produce, consume, acknowledge, and what delivery guarantees
 - [clickhouse.md](clickhouse.md) - queues that insert into ClickHouse
+- [approval.md](approval.md) - approvals of a queue's messages: who may approve, veto and override
 - [queue-p2p-route.md](queue-p2p-route.md) - how a message is routed between nodes
 - [agent.md](agent.md) - for coding agents and embedders: the API, the configuration, YT Cluster's use of it, and the known gaps
 
@@ -51,12 +55,17 @@ by utilizing a steaming API of notification of KV changes.
 - [x] KV (wo: filter, range, version, pagination, linearizable read)
 - [x] Watch (wo: filter, fragment, ranges, revision)
  
-### Low priority:
-- [ ] Lock
-- [ ] Namespace
-- [ ] Lease
-- [ ] Auth
-- [ ] Maintenance
+- [x] Lease - granted, kept alive and expired on the leader, replicated to every peer; a key put with one goes with it
+- [x] Lock - queued on the leader, first come first served, freed by `Unlock` or its lease ending
+- [x] Namespace - the client's (`KvClientPrefix`, `LeaseClientPrefix`): ranges, deletes and txns hold under a prefix
+- [x] Maintenance - status (with the leader), alarms, hash, snapshot; defragment and downgrade have nothing to do
+- [x] Sequences (a queue pair, etcd's own API) - cluster sequences, a block per node or every number from the leader; never a number twice, a leader switch included
+- [x] Embedding (in process): leases and locks as the node's own calls, a lock's try, the leader the embedder names, and a per-node keep of the system records that brings them back after the whole cluster stopped
+- [x] Auth - feature `auth`: signon's accounts, roles and key-range permissions (an optional dependency on [signon](https://crates.io/crates/signon), its PostgreSQL database in `auth_db_url`)
+
+The leader decides leases and locks for the cluster: an embedder names it (`leader`, YT
+Cluster its Raft leader), or it is the lowest node id among a node and its peers. See
+[agent.md](agent.md), "Leader, leases and locks" and "Auth".
 
 ### Won't do:
 *this cluster relay on YT Cluster RAFT and storage (Postrges) implementation*

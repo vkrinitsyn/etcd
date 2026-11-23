@@ -45,8 +45,13 @@ port.
 | KV | put, range (one key, or a range or prefix, with limit and count only), delete (one key or a range), txn; `range_stream` is the same range in one chunk; `compact` is a no-op |
 | Watch | create (one key or a range), cancel, progress. A put is a PUT event; a delete - by key, range or txn - a DELETE event with the key and no value, except under `/q/` and `/queue/` (the registry is the server's). No start revision, no filters, no fragments. Every frame carries the response header (cluster, member, term; revision 0) - etcd's Go client reads it unchecked, and etcdctl crashed on a frame with none [watch-header]. A stream whose requests end is served on while its watches hold it (half-closed, as etcd does); its key watches are taken off once no one reads it either [watch-gone] |
 | Cluster | `member_add` (how peers join); the rest is minimal |
-| Maintenance | `status` (a reachability probe) |
-| Lease, Lock, Election, Auth | registered, answer `unimplemented` |
+| Maintenance | `status` (a reachability probe, open to any caller; `leader` filled, raised alarms in `errors`), `alarm` (kept on this node: GET, ACTIVATE, DEACTIVATE), `hash`, `hash_kv`, `snapshot`; `defragment` and `move_leader` answer and do nothing; `downgrade` answers the version (VALIDATE, CANCEL) and refuses ENABLE - nothing on disk to downgrade |
+| Lease | grant (the minimum TTL 5 s), revoke, keep-alive, time-to-live (with its keys), leases - on the leader ("Leader, leases and locks") |
+| Lock | lock, unlock - on the leader |
+| Auth | feature `auth` with `auth_db_url`: signon's accounts ("Auth"); otherwise `unimplemented` |
+| Approvals | no service of their own: puts and deletes on `/approval/` and on a gated queue's producer key (feature `approvals`, "Approvals") |
+| Election | registered, answers `unimplemented` |
+| Sequences | no service of their own: a queue pair (`etcds-seq`, a reply queue of the asker's), "System records and sequences". etcds serves etcd's v3 API only: `.github/proto-compare.sh` fails on any difference from etcd's files and on any proto or generated package of etcds' own |
 
 ## Keys
 
@@ -91,11 +96,159 @@ The settings that do something:
 | `zone`, `zone_prefix`, `peer_zones` | | this node's zone, prefixes replicated only within a zone, and each peer's zone as `host:port=zone` |
 | `clickhouse_url`, `clickhouse_db` | | the ClickHouse queues' endpoint and default database ([clickhouse.md](clickhouse.md)) |
 | `bridge_queue`, `bridge_prefix`, `bridge_listen`, `bridge_to`, ... | | feature `bridge` ([bridge.md](bridge.md), `src/bridge/`): the node's queue or key prefix to a broker (JMS over AMQP 1.0, MQTT 5, Kafka) or an HTTP(S) endpoint (one POST per message), or JMS clients served as an AMQP peer; Started once the node serves, over its first client URL; stopped with it. A `bridge_prefix` holding a key the node serves to no remote caller (`local_only_prefix`, its exceptions aside), or a `bridge_queue` it serves to no remote consumer, is refused at start, exit code 14 - the bridge would carry it out of the node; a listener's link to such a queue is refused as it attaches. `amqps://`, `mqtts://` and `kafkas://` take `?ca=<PEM file>`, the only CAs then trusted (else the public roots); `amqps://` is TLS from its first byte (bridge.md "TLS and logins"). An embedder running `etcds::bridge::run` itself may set `Config::node` to its `EtcdNode`: watched and written in-process, no client listener to dial (bridge.md "Embedding"). Settings that make no bridge: exit code 14 (E104, E105 without the feature); a bridge that fails for good stops the node: exit code 15 (E106); one not stopped within `bridge_send_timeout` + 10 s of the signal: exit code 16 (E107). The binary's only: an embedder calling `EtcdNode::init` gets no bridge from these settings |
+| `leader` | | [coord] the leader's node uuid, set by an embedder with a leader of its own; a reconfigure moves it. Empty: the lowest node id among this node and the peers it writes to (not Spare) |
+| `lock_ttl` | 60 | [sys] the global lock timeout, seconds: the lease a lock asked with none holds (the hex after its key's last `/`), and what an embedder keeps its locks' leases at. 0 (an embedder's `..Default::default()`) is 60 |
+| `peer_token` | | [auth] a secret every node shares, on each call one node makes to another; a call with `x-peer` and without it is refused. Without auth, unchecked while empty - a client can then pass for a peer, as before |
+| `auth_db_url`, `auth` | | [auth] feature `auth`: signon's PostgreSQL database, and authentication on from the start. `auth_db_url` without `peer_token` is refused at start (ETCD-E173), `auth` without `auth_db_url` too (E172), either without the feature (E174) |
 | `queue_down_timeout` | 300 | seconds a queue consumer's node may be down before its consumers count as gone (`Queues`); 0 never. An `Option`: unset is 300, also from `Default` |
 | `log_level` | `info` | `error`, `warning`, `info`, `debug` or `trace`. Anything else - `warn` included - logs critical messages only |
 | `max_txn_ops`, `max_request_bytes` | 128, 1.5 MiB | stored, not enforced |
 
 Every other field is etcd's, accepted for compatibility and unused.
+
+## Leader, leases and locks
+
+[coord] One node decides leases and locks for the cluster (`coord.rs`, `srv/lease.rs`,
+`srv/lock.rs`); the KV stays a broadcast.
+
+- **The leader** is `leader` when set, else the lowest node id among this node and the
+  peers it writes to (not Spare). Nodes that see the same peers agree on it; without an
+  embedder's leader, a network split may have one on each side. `status` says it.
+- **A call on another node is sent on to the leader** (header `x-etcds-fwd`, with the
+  client's token). A node that is not the leader any more answers `unavailable` (ETCD-E165),
+  as does one whose leader it holds no peer for (E166): the client asks again.
+- **Leases.** Granted, kept alive and expired on the leader alone, one clock; the id is
+  random and positive unless asked for. A grant and a revoke are replicated to every peer
+  (`x-etcds-rep`) before they answer, so a put with the lease right after works on any node,
+  and a new leader holds them all - it gives each a full TTL as it takes over, as etcd's
+  does. A put with a lease no node granted is refused (`not_found`, E167); `ignore_lease`
+  keeps the key's own. A revoked or expired lease's keys are deleted through the ordinary
+  delete.
+- **Locks.** Queued per name on the leader, first come first served. The holder's key is
+  `name/<lease hex>`, etcd's layout, put with the lease when the lock is granted, its
+  system record written before the answer - a new leader takes the holders over from there. `Unlock`
+  or the lease ending frees it; a waiter whose lease ends is told (`not_found`), one whose
+  client goes leaves the queue.
+- **Kept as system records** ("System records and sequences"): memory only unless the
+  embedder sets a durable store - then a cluster that stops entirely keeps its leases and
+  lock holders.
+
+## System records and sequences
+
+[sys] What the leader decides is kept as system records (`sys.rs`), so a leader switch
+carries it: `lease/<id>`, `lock/<name hex>` (the holder's key and lease), `seq/<name>`
+(the cache size and the next number to hand out).
+
+- **Written before the answer.** A lease granted or revoked, a lock granted or freed, a
+  sequence's block handed out: the record first, then the answer. A store that fails the
+  write fails the call (`unavailable`, ETCD-E199) - nothing is handed out unrecorded.
+- **Where.** Each node holds them in a map, each record with a version (the leader's
+  counter) and a delete kept as a tombstone; a node keeps the newest version it is sent,
+  so a late put of an older one is no put. The leader replicates each record to every
+  peer as a peer's KV put on `/.etcds/sys/<record>` (marked `x-etcds-rep`), and a node
+  joining or taking over reads them with a peer's range over that prefix: memory only.
+- **A majority, or no answer.** Without an embedder's store, a record counts once a
+  majority of the nodes hold it - else the call fails (`unavailable`, E205) - and a new
+  leader takes the newest version of each record among a majority that answers it, or
+  does not take over yet (E207, tried again each tick). So a number handed out or a lock
+  granted is never lost by a leader switch. Two nodes need both: one down, sequences,
+  leases and locks wait for it. The majority is of every node this one holds or is
+  configured with (`initial_advertise_peer_urls`), not of the peers that answer.
+- **A ballot per takeover.** A takeover goes under a ballot of its own - a round above
+  every one seen, then the node id - sent with its range (`x-etcds-ballot`). Each node
+  that answers promises it and from then on refuses a record of a lower ballot, naming
+  the promised one; records order by ballot, then version. A leader superseded while its
+  write was on the way is refused by the majority the new one read, so it cannot answer
+  for a block the new leader hands out again: it answers `unavailable` (E213), its lock
+  waiters and its queue consumer end, and it takes over again on its next call. With an
+  embedder's store, the store keeps the writers' order (YT Cluster's: its Boss).
+- **An embedder's store** (`set_coord_store`, the `CoordStore` trait: load, put, delete) -
+  YT Cluster's, committed through the cluster: the leader writes there first, a new leader
+  loads from there, and the records survive the whole cluster stopping. The records a node
+  holds when it is set are written there first.
+- **No client's.** Outside the KV: in no range, watch or snapshot; a call on `/.etcds/sys/`
+  answer a peer only.
+- **A new leader** loads the records: each lease a full TTL, each lock held by its record's
+  holder while that lease lives, each sequence going on from its mark.
+- **Sequences, by a queue pair.** A definition (`seq_define(SeqDefine { .. })`: `create`,
+  `start`, `cache`; `at_least` - past what a local sequence gave; `drop`, its mark kept and
+  answered - again for one dropped already - so one made again under its name starts above it) and a block (`seq_take(name, count)`: the
+  count asked, or the cache size) are decided on the leader: on the leader itself in
+  process, from another node by a request on queue `etcds-seq` (`etcds-seqdef` for a
+  definition) answered on the asker's reply queue, `etcds-seq-node-<node id hex>`. The leader's
+  consumer of the request queues starts on demand - woken by a peer's put of
+  `/.etcds/sys/!seq-wake` before a request - so a node that uses no sequence keeps no queue
+  of them. No answer within 5 s: `unavailable` (E211), ask again; a request the leader took
+  late is a gap. `seq_next(name)` serves the node's block and takes the next when it runs
+  out. Cache 1: each number from the leader, in order across the cluster; cache N: unique,
+  in order within a node. A restart or a leader switch loses a block's unused numbers - a
+  gap, never a repeat.
+- **Any etcd client** takes numbers the same way: a put on `/q/etcds-seq/p/<id>` of
+  `{"op":"next","name":"<seq>","count":<n or 0>,"reply":"etcds-seq-<its name>","req":"<id>"}`, and a
+  consumer's watch on its reply queue gets `{"req":"<id>","ok":true,"block":{"first":..,"count":..}}`
+  (or `"ok":false` with `code` and `msg`). [auth] Taking numbers needs write on
+  `/q/etcds-seq/`; a definition is an embedder's or a peer's only - a client's put on
+  `etcds-seqdef` is refused.
+- **The sequences' own queues are no client's** but for a request's put: no consumer of
+  `etcds-seq`, `etcds-seqdef` or a node's `etcds-seq-node-*` (a watch there is canceled at
+  once), no put of a definition or of an answer on a node's reply queue, no delete in
+  them. Each queue takes its own op: a `define` put on `etcds-seq` is answered refused
+  (E212). The leader answers on `etcds-seq-<name>` queues only. A peer's call there is
+  proved as on `/.etcds/sys/`: the `peer_token`, or without one a peer's address.
+- **Locks.** A lock asked with no lease gets one of `lock_ttl`, kept alive while its call
+  waits; the same lease locking the same name again is the one acquisition, answered at
+  once (etcd's rule). An unlock removes the holder's record first: not removed, nothing is
+  freed and the caller is told.
+- **A record's put without a `peer_token`** is taken only from the address of a peer the
+  node holds; with one, the token is the proof.
+
+## Auth
+
+[auth] Feature `auth`, with `auth_db_url` (`auth.rs`, `srv/auth.rs`, `guard.rs`): signon's
+accounts, roles and permissions, through signon's `api` and `permissions` modules.
+
+- **Accounts are signon's,** an etcd user an account named by its address. `Authenticate`
+  is signon's sign-in - its limits and SSO rules hold - and its token a signon session
+  (`via` `etcd`). Accounts are made, deleted and given passwords in signon: `UserAdd`,
+  `UserDelete`, `UserChangePassword` answer `failed_precondition` (E186);
+  `signon::api::add_account` makes one from a tool.
+- **Roles and permissions** are signon's roles and `role_permissions` in the key space
+  `etcd`; the role `root` (made at start) may do anything, and is needed for every
+  management call and to turn authentication on or off. `AuthEnable` needs an account
+  with `root` (E181); it and `AuthDisable` are sent to every peer.
+- **The checks** (`guard.rs`): a range read or written needs a permission covering it,
+  adjacent grants together; a txn each range it compares, reads or writes; a watch reads
+  what it watches (refused: created and cancelled at once); leases need a signed-in
+  account, a lock write on its key. A token's account and permissions are cached 5 s
+  per node: a revoked role or session stops working within that.
+- **Peers.** A call with `x-peer` must carry `peer_token` (`x-etcds-peer-token`) - always,
+  with `auth_db_url`, which needs it set: `x-peer` alone is a header any client can send.
+  Each node's calls to another carry it.
+
+## Approvals
+
+[approve] Feature `approvals` (`approve.rs`; needs `auth` and signon's `labac`). What a client
+does is in [approval.md](approval.md). What a change has to keep in mind:
+
+- **The rules are plain functions** (`approve::vote`, `Action`, `Definition`, `target`,
+  `produced`, `reaches`), tested in `approve_test.rs`; the node's side (`approve_put`,
+  `approve_delete`, `approve_txn`) only finds the account, asks labac and writes the records.
+- **Three hooks in `srv/kv.rs`**: `put` asks `approve_put(.., true)` before the key's own
+  permission (a definition or a vote: root's and labac's to allow) and `approve_put(.., false)`
+  after it, before `put_impl` (a message put to a gated queue); `delete_range` asks
+  `approve_delete`; `txn` asks `approve_txn`. A peer's own put (`x-peer` without `x-etcds-fwd`:
+  a state key replicated, a released message on its way) passes all of them.
+- **The leader decides** (`route_to_leader`, the call sent on with the client's token, as a
+  lock's): the account is read from signon on the leader, at each vote, not from the 5 s cache.
+- **System records** (`sys.rs`): `apv/def/<queue>` the definition, `apv/msg/<queue>/<key hex>`
+  the waiting message (its producer key and value in hex, its votes). The state key
+  `/approval/<queue>/<key>` is an ordinary replicated key written after the record: it shows,
+  it decides nothing.
+- **A release** is `put_impl` of the producer's own put on the leader, then the record's
+  delete: at least once.
+- **The account's groups** are its labac subject's (`signon::labac::subject`) and its signon
+  roles; its level is `Acl::allowed(subject, alias, queue, action)` on signon's approval scale
+  (`labac::APPROVAL_ACTIONS`, signon 1.1).
 
 ## Embedding it
 
@@ -109,6 +262,11 @@ Every other field is etcd's, accepted for compatibility and unused.
 | `queue_link(request_q, reply_q)` | declares a request/reply pair, so the reply queue's dispatcher is placed on the requester's node |
 | `queue_dispatcher(q)` | the node dispatching `q`, from the registry |
 | `reap_idle_queues()` | drops queues that are empty, consumerless and idle for 10 minutes. **Nothing in the crate calls it:** an embedder that creates queues calls it on a timer |
+| `set_coord_store(store)`, `seq_define(SeqDefine)`, `seq_take(name, count)`, `seq_next(name)`, `seq_forget_block(name)` | [sys] the embedder's durable store of the system records (one for the cluster, the leader writes it first), and the cluster sequences in-process; `seq_forget_block` drops this node's block, its next number from the leader |
+| `set_sys_keep(keep, prefixes)` | [sys] a per-node keep (`SysKeep`: load, keep): the records it kept read back first, then each record of `prefixes` this node takes written there before it counts or acknowledges it - after the whole cluster stopped, a takeover reads a majority of the copies. YT Cluster keeps the sequences' (`seq/`) in its config table |
+| `embed_lease_grant(ttl)`, `embed_lease_keep(id)`, `embed_lease_revoke(id)`, `embed_lock(name, lease, try_only)`, `embed_unlock(key)`, `lock_holder_key(name, lease)`, `lock_ttl()` | [embed] leases and locks as this node's own calls, sent on to the leader with the `peer_token`, none of a client's checks. `try_only`: granted at once or `None` - refused while the lock is held or waited for (the header `x-etcds-try` on a Lock call, `aborted`, E214). The same lease locking a name again is the one acquisition: an embedder whose callers share a lease keeps them apart itself |
+| `set_leader(uuid)` | [embed] the leader the embedder names - YT Cluster's Boss - over the configured `leader`, kept across a reconfigure; `""` the configured one again |
+| `member_id()`, `config().await` | [coord] this node's member id, and the settings it runs with now - for a `Config` that changes one of them (a reconfigure carries a whole config) |
 | `node.event` | a `Sender<EtcdEvents>`: `Data` applies a put, delete or txn; `Mgmt` reconfigures (`Config`), sets the tracer or meter, `Restart`s (term + 1 and a fresh sync), `Pause(secs)`, `Stop` |
 
 ### Language
@@ -352,6 +510,56 @@ there to how it uses etcd is a change here.
   `topology/36b_skv_bridge.sh` in yt-cluster-tests.
 - **rppd** (in ytserv-all) consumes queues for Python functions through the same
   in-process watch API.
+- **The schema map** (ytserv's `state/labac_sync.rs`, nothing in this crate; owner 2026-11-21). With
+  `schema_map` on (cluster level), every 30 s each node puts each participating database's tables
+  into the plain KV with `kv_put`: `schema/cluster:<cluster>/<db>/<schema>/<table>` is the
+  leader's, `.../<table>/<node uuid>` a node's whose table differs (deleted with `kv_delete` once it
+  no longer does). The value is schema_guard's table structure as JSON, keys in order, with
+  labac's declaration beside it (`security`: `schemaPath`, `alias`, `softDelete`, `rls`, and - since
+  2026-11-22 - a table with levels has `schemaPath` as the map of its named paths, `dml` and each level's by its name - no `dml` and an empty `alias` for a table of levels alone); a key is put only when its value changed (`kv_prefix` reads
+  them back). ytproxy reads the map. Its state is in `yt_info('E')` `labac`.
+
+### Leader, leases, locks and sequences - adopted (arch1_22.md part 2)
+
+ytserv builds etcds 0.25 from the sibling checkout (the workspace's `[patch.crates-io]`,
+until it is published); rppd asks ^0.25.0 with it.
+
+- **The leader is YT's Boss:** `state/etcd_peers.rs` calls `set_leader(<Boss uuid>)` each
+  5 s tick (none while an election runs: the one before goes on leading). The Boss's
+  switch takes the locks and the sequences over with one load of the records; a
+  superseded etcds leader is fenced by the takeover's ballot.
+- **SQL locks and sequences** (`state/ycoord.rs`): the extension's `yt_advisory_lock`,
+  `yt_try_advisory_lock`, `yt_advisory_unlock`, `yt_advisory_xact_lock`, `yt_nextval`,
+  `yt_create_sequence` and `yt_cluster_sequences` ask ytserv by `yt_info` prefixes over the
+  unix socket (`lk+:` `lk-:` `lkc:` `lk*:` `sq:` `sq+:` `sq=:` `sq?:`). One lease per
+  PostgreSQL (`lock_ttl`), kept alive while ytserv reaches it and its postmaster start time
+  stays; the backends take turns on a name in ytserv, the head asking the leader
+  (`embed_lock`). Locks as `/.yt/advisory/<db>/<key>`, sequences as `<db>.<schema>.<name>`.
+  `<fs_dir>/ycoord.json` carries the lease and its holders across a ytserv restart.
+- **The sequences' records are kept** in each node's own `yt_config` rows, module `Q`
+  (`set_sys_keep`, prefix `seq/`): the cluster stops whole only with PostgreSQL, and its
+  sequences come back with it. Leases and lock holders are not kept: they end with
+  PostgreSQL.
+
+### Approvals - not adopted yet
+
+ytserv does not build etcds with `approvals`: it needs `auth` adopted first (below), and
+signon's labac tables in the cluster's database.
+
+### Auth - not adopted yet
+
+Adopting it (owner, 2026-11-21) means, in ytserv and rppd:
+
+- **`peer_token`**: one secret for the cluster, from its secret store, the same on every
+  node - before any node turns auth on.
+- **`auth_db_url`**: the cluster's database with signon's tables, synced like any other
+  table, so a token signed in on one node is known on every node. signon writes a session's
+  `last_seen_at` at most once a minute (`signon::api::TOUCH_EVERY`), not per call.
+- **ytserv's own etcd calls** (`state/etcd_peers.rs`: `member_list`, `member_promote`) are
+  in-process trait calls with no metadata: with auth on they are refused unless sent as a
+  peer's - `x-peer` and the token - or made before auth is on.
+- **rppd** embeds etcds the same way (`etcd-provided` in ytserv-all): it gets the same
+  settings from ytserv.
 
 ## Known gaps
 
@@ -373,6 +581,18 @@ Read from the source; each is a place where the obvious assumption is wrong.
 - **No messages survive a restart** of their dispatcher's node.
 - **A ClickHouse queue retries only on the next put,** and one row ClickHouse
   refuses makes every later batch fail with it ([clickhouse.md](clickhouse.md)).
+- **[coord] Without `peer_token`, a client can pass for a peer:** `x-peer` alone is
+  a header, and a peer's lease replica or forward is then taken from anyone. Set it on
+  a network a client shares with the nodes.
+- **[coord] Without an embedder's `leader`, nothing fences two leaders:** a split may
+  have one each side, each granting leases and locks; healed, both lists stand.
+- **[coord] Alarms are each node's own,** not raised cluster-wide.
+- **[approve] A leader lost between a message's release and its record's delete** leaves the
+  message waiting with its count complete: its next approval releases it again (at least once).
+- **[approve] Nothing bounds how many messages wait**, nor their size: each is a system record.
+- **[auth] A revoked role or session works on for up to 5 s** on a node that checked
+  it just before (the cache), and the user and role calls change signon's database,
+  not each node's cache - another node's ends within those seconds.
 
 ## Changing the crate
 

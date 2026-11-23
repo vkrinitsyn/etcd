@@ -3,13 +3,10 @@ use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{async_trait, Request, Response, Status};
 use crate::cluster::EtcdNode;
-use crate::etcdpb::etcdserverpb::auth_server::Auth;
-use crate::etcdpb::etcdserverpb::{ AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse, AuthRoleAddRequest, AuthRoleAddResponse, AuthRoleDeleteRequest, AuthRoleDeleteResponse, AuthRoleGetRequest, AuthRoleGetResponse, AuthRoleGrantPermissionRequest, AuthRoleGrantPermissionResponse, AuthRoleListRequest, AuthRoleListResponse, AuthRoleRevokePermissionRequest, AuthRoleRevokePermissionResponse, AuthUserAddRequest, AuthUserAddResponse, AuthUserChangePasswordRequest, AuthUserChangePasswordResponse, AuthUserDeleteRequest, AuthUserDeleteResponse, AuthUserGetRequest, AuthUserGetResponse, AuthUserGrantRoleRequest, AuthUserGrantRoleResponse, AuthUserListRequest, AuthUserListResponse, AuthUserRevokeRoleRequest, AuthUserRevokeRoleResponse, AuthStatusRequest, AuthStatusResponse, AuthenticateRequest, AuthenticateResponse, Member, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
+use crate::etcdpb::etcdserverpb::{ Member, MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse, MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse, MemberUpdateRequest, MemberUpdateResponse};
 use crate::etcdpb::etcdserverpb::cluster_server::Cluster;
 use crate::etcdpb::v3electionpb::{CampaignRequest, CampaignResponse, LeaderRequest, LeaderResponse, ProclaimRequest, ProclaimResponse, ResignRequest, ResignResponse};
 use crate::etcdpb::v3electionpb::election_server::Election;
-use crate::etcdpb::v3lockpb::lock_server::Lock;
-use crate::etcdpb::v3lockpb::*;
 use crate::peer::PeerState;
 
 /// what an API etcds does not implement answers, with its code
@@ -17,16 +14,7 @@ fn unimplemented() -> Status {
     Status::unimplemented(tr!("srv.unimplemented"))
 }
 
-#[async_trait]
-impl Lock for EtcdNode {
-    async fn lock(&self, _request: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn unlock(&self, _request: Request<UnlockRequest>) -> Result<Response<UnlockResponse>, Status> {
-        Err(unimplemented())
-    }
-}
+// [coord] Lock: srv/lock.rs
 
 type ObserveResult<T> = Result<Response<T>, Status>;
 
@@ -57,81 +45,13 @@ impl Election for EtcdNode {
     }
     //
 }
-#[async_trait]
-impl Auth for EtcdNode {
-    async fn auth_status(&self, _request: Request<AuthStatusRequest>) -> Result<Response<AuthStatusResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn auth_enable(&self, _request: Request<AuthEnableRequest>) -> Result<Response<AuthEnableResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn auth_disable(&self, _request: Request<AuthDisableRequest>) -> Result<Response<AuthDisableResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn authenticate(&self, _request: Request<AuthenticateRequest>) -> Result<Response<AuthenticateResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_add(&self, _request: Request<AuthUserAddRequest>) -> Result<Response<AuthUserAddResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_get(&self, _request: Request<AuthUserGetRequest>) -> Result<Response<AuthUserGetResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_list(&self, _request: Request<AuthUserListRequest>) -> Result<Response<AuthUserListResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_delete(&self, _request: Request<AuthUserDeleteRequest>) -> Result<Response<AuthUserDeleteResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_change_password(&self, _request: Request<AuthUserChangePasswordRequest>) -> Result<Response<AuthUserChangePasswordResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_grant_role(&self, _request: Request<AuthUserGrantRoleRequest>) -> Result<Response<AuthUserGrantRoleResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn user_revoke_role(&self, _request: Request<AuthUserRevokeRoleRequest>) -> Result<Response<AuthUserRevokeRoleResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_add(&self, _request: Request<AuthRoleAddRequest>) -> Result<Response<AuthRoleAddResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_get(&self, _request: Request<AuthRoleGetRequest>) -> Result<Response<AuthRoleGetResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_list(&self, _request: Request<AuthRoleListRequest>) -> Result<Response<AuthRoleListResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_delete(&self, _request: Request<AuthRoleDeleteRequest>) -> Result<Response<AuthRoleDeleteResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_grant_permission(&self, _request: Request<AuthRoleGrantPermissionRequest>) -> Result<Response<AuthRoleGrantPermissionResponse>, Status> {
-        Err(unimplemented())
-    }
-
-    async fn role_revoke_permission(&self, _request: Request<AuthRoleRevokePermissionRequest>) -> Result<Response<AuthRoleRevokePermissionResponse>, Status> {
-        Err(unimplemented())
-    }
-    //
-}
+// [auth] Auth: srv/auth.rs
 
 #[async_trait]
 impl Cluster for EtcdNode {
     async fn member_add(&self, request: Request<MemberAddRequest>) -> Result<Response<MemberAddResponse>, Status> {
+        // [auth] a node announcing itself is a peer, with the cluster's token
+        self.check_root(request.metadata()).await?;
         let ma = request.into_inner();
         let peers: HashSet<&str> = HashSet::from_iter(ma.peer_ur_ls.iter().map(|p| p.as_str()));
         // [lockup] dialled with the peer lock released - it dials back the caller
@@ -152,7 +72,8 @@ impl Cluster for EtcdNode {
         Err(unimplemented())
     }
 
-    async fn member_list(&self, _request: Request<MemberListRequest>) -> Result<Response<MemberListResponse>, Status> {
+    async fn member_list(&self, request: Request<MemberListRequest>) -> Result<Response<MemberListResponse>, Status> {
+        self.check_call(request.metadata(), None).await?;
         let peers = self.peers.read().await;
         let peer_info = peers.peer_info().await;
         let members: Vec<Member> = peer_info.into_iter().map(|(id, conn, state)| {
@@ -171,6 +92,7 @@ impl Cluster for EtcdNode {
     }
 
     async fn member_promote(&self, request: Request<MemberPromoteRequest>) -> Result<Response<MemberPromoteResponse>, Status> {
+        self.check_root(request.metadata()).await?;
         let peer_id = request.into_inner().id;
         let peers = self.peers.read().await;
         let current = peers.peer_state(peer_id).await;

@@ -17,6 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+/// What the fake server answers to the n-th request
+type Policy = Arc<dyn Fn(usize, &Req) -> Reply + Send + Sync>;
+
 /// A request as the endpoint saw it
 #[derive(Debug, Clone)]
 struct Req {
@@ -74,7 +77,7 @@ async fn answer<S: AsyncWrite + Unpin>(s: &mut S, reply: Reply) -> bool {
 }
 
 /// One connection: requests read, and answered, until it ends
-async fn serve<S>(stream: S, conn: usize, n: Arc<AtomicUsize>, policy: Arc<dyn Fn(usize, &Req) -> Reply + Send + Sync>, tx: mpsc::UnboundedSender<Req>)
+async fn serve<S>(stream: S, conn: usize, n: Arc<AtomicUsize>, policy: Policy, tx: mpsc::UnboundedSender<Req>)
 where S: AsyncRead + AsyncWrite + Unpin {
     let mut s = BufReader::new(stream);
     loop {
@@ -132,7 +135,7 @@ async fn endpoint(policy: impl Fn(usize, &Req) -> Reply + Send + Sync + 'static)
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::unbounded_channel();
-    let (policy, n, c): (Arc<dyn Fn(usize, &Req) -> Reply + Send + Sync>, _, _) = (Arc::new(policy), Arc::new(AtomicUsize::new(0)), AtomicUsize::new(0));
+    let (policy, n, c): (Policy, _, _) = (Arc::new(policy), Arc::new(AtomicUsize::new(0)), AtomicUsize::new(0));
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let conn = c.fetch_add(1, Ordering::SeqCst);
@@ -335,7 +338,7 @@ async fn an_endpoint_away_holds_the_message() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let n = Arc::new(AtomicUsize::new(0));
-        let policy: Arc<dyn Fn(usize, &Req) -> Reply + Send + Sync> = Arc::new(|_, _| Reply::Status(200));
+        let policy: Policy = Arc::new(|_, _| Reply::Status(200));
         let mut conn = 0;
         while let Ok((s, _)) = listener.accept().await {
             tokio::spawn(serve(s, conn, n.clone(), policy.clone(), tx.clone()));
@@ -480,7 +483,7 @@ async fn tls_endpoint(dir: &std::path::Path, name: &str, policy: impl Fn(usize, 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::unbounded_channel();
-    let (policy, n, c): (Arc<dyn Fn(usize, &Req) -> Reply + Send + Sync>, _, _) = (Arc::new(policy), Arc::new(AtomicUsize::new(0)), AtomicUsize::new(0));
+    let (policy, n, c): (Policy, _, _) = (Arc::new(policy), Arc::new(AtomicUsize::new(0)), AtomicUsize::new(0));
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let conn = c.fetch_add(1, Ordering::SeqCst);

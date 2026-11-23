@@ -4,7 +4,8 @@ name: ci
 # the run. The coverage badge is our own, no third party: drawn from lcov.info and kept
 # on the `badges` branch (the coverage job's last step). The tests start their own
 # servers (in-process, or the etcds binary) and the ClickHouse ones a fake HTTP
-# endpoint: no service containers.
+# endpoint. [auth] The one service container: PostgreSQL for the `auth` feature's tests
+# (signon's accounts, `SIGNON_TEST_DB`); without it they skip with a note.
 on:
   push:
     branches-ignore: ["dependabot/**"]   # their pull request runs it
@@ -26,8 +27,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # default; OpenTelemetry; the built-in ClickHouse queue consumer; the broker bridge
-        features: ["", "--features tracer", "--features clickhouse", "--features bridge"]
+        # default; OpenTelemetry; the built-in ClickHouse queue consumer; the broker bridge;
+        # [auth] the Auth API on signon
+        features: ["", "--features tracer", "--features clickhouse", "--features bridge", "--features auth", "--features approvals"]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: signon_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SIGNON_TEST_DB: postgres://postgres:postgres@localhost:5432/signon_test
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +52,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # the coverage badge's push, to the badges branch
+    # [auth] signon's database, so the auth feature's code is measured, not skipped
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: signon_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SIGNON_TEST_DB: postgres://postgres:postgres@localhost:5432/signon_test
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

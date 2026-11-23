@@ -54,6 +54,10 @@ impl EtcdNode {
         // [i18n] the logger's `lang`, o!("lang" => "ru"), is the messages' language
         crate::i18n::set_logger_lang(crate::i18n::lang_of(&log));
         let node_id = parse_uuid(&cfg.node)?;
+        // [review 2026-11-21] a leader that is no uuid is refused, not read as no leader
+        if !cfg.leader.trim().is_empty() {
+            parse_uuid(&cfg.leader)?;
+        }
         // [peering] An EMPTY cluster uuid is not "unconfigured", it is "a
         // cluster of one that nobody else can join".
         //
@@ -70,6 +74,24 @@ impl EtcdNode {
         } else {
             parse_uuid(&cfg.cluster)?
         };
+        // [auth] signon's database, and a peer token: without one any client could pass
+        // for a peer and skip the checks
+        #[cfg(feature = "auth")]
+        let auth = if cfg.auth_db_url.trim().is_empty() {
+            if cfg.auth {
+                return Err(tr!("auth.no_db"));
+            }
+            None
+        } else {
+            if cfg.peer_token.is_empty() {
+                return Err(tr!("auth.no_peer_token"));
+            }
+            Some(crate::auth::Auth::open(&cfg.auth_db_url, cfg.auth).await?)
+        };
+        #[cfg(not(feature = "auth"))]
+        if cfg.auth || !cfg.auth_db_url.trim().is_empty() {
+            return Err(tr!("auth.no_feature"));
+        }
         let cluster = EtcdCluster::connect(&cfg, node_id, cluster_id, &log).await?;
 
         let (event, mut rsvr) = mpsc::channel(10);
@@ -92,6 +114,10 @@ impl EtcdNode {
             watch_notify: watcher,
             peers: Arc::new(RwLock::new(cluster)),
             policy: Arc::new(RwLock::new(policy)),
+            coord: crate::coord::Coord::new(),
+            sys: crate::sys::Sys::new(),
+            #[cfg(feature = "auth")]
+            auth,
             node_id,
             cluster_id,
             term,
@@ -113,6 +139,8 @@ impl EtcdNode {
             }
         }
 
+        // [sys] the records the cluster holds, before this node may lead
+        c.sys_sync_from_peers().await;
         c.watch_notify(watcher_rv).await;
         // [peer-retry] From `init`, NOT from `serve()`: the embedded path -
         // ytserv - never calls `serve()`. It mounts these services on its own
@@ -120,6 +148,8 @@ impl EtcdNode {
         // is dead code for every real cluster node.
         c.spawn_peer_retry();
         c.spawn_registry_republish();
+        // [coord] the leader's clock: lease expiry, and a leader's takeover
+        c.spawn_coord_tick();
         let grpc_client = c.clone();
 
         tokio::spawn(async move {
@@ -226,7 +256,7 @@ impl EtcdNode {
                 // rather than `continue`, but not every tick.
                 if urls.is_empty() {
                     quiet = quiet.saturating_add(1);
-                    if quiet == 1 || quiet % EMPTY_PEERS_EVERY == 0 {
+                    if quiet == 1 || quiet.is_multiple_of(EMPTY_PEERS_EVERY) {
                         let cfg = node.cfg.read().await;
                         warn!(node.log, "{}{}", LP, tr!("cluster.no_peers",
                             advertised = cfg.initial_advertise_peer_urls, listen = cfg.listen_client_urls));
@@ -389,6 +419,10 @@ impl EtcdNode {
             self.term.store(cfg.term, Ordering::Relaxed);
         }
 
+        // [auth] the peers' token first, with the config's lock not held
+        if !cfg.peer_token.is_empty() {
+            self.peers.write().await.set_peer_token(&cfg.peer_token).await;
+        }
         let mut current = self.cfg.write().await;
         current.initial_advertise_peer_urls = cfg.initial_advertise_peer_urls;
         current.listen_client_urls = cfg.listen_client_urls;
@@ -413,6 +447,20 @@ impl EtcdNode {
         current.local_only_prefix = cfg.local_only_prefix;
         current.local_only_prefix_except = cfg.local_only_prefix_except;
         current.readonly_prefix = cfg.readonly_prefix;
+        // [sys] the global lock timeout; an embedder's unset one (0) keeps it
+        if cfg.lock_ttl > 0 {
+            current.lock_ttl = cfg.lock_ttl;
+        }
+        // [coord] the leader moves with the embedder's; the next tick takes the change up.
+        // [review 2026-11-21] one that is no uuid keeps the leader there was, and is said
+        if cfg.leader.trim().is_empty() || parse_uuid(&cfg.leader).is_ok() {
+            current.leader = cfg.leader;
+        } else {
+            error!(self.log, "{}{}", LP, tr!("coord.bad_leader", leader = cfg.leader));
+        }
+        if !cfg.peer_token.is_empty() {
+            current.peer_token = cfg.peer_token;
+        }
         // Rebuilt here and only here, so the cache cannot drift from the config
         // it was built from.
         current.zone_prefix = cfg.zone_prefix;
@@ -510,7 +558,6 @@ impl EtcdNode {
         }
     }
 
-    /// return current cluster connections
     // ── embedder API ─────────────────────────────────────────────────────
     //
     // In-process access for a host application. These go through the same
@@ -532,6 +579,17 @@ impl EtcdNode {
     ///
     /// Reads the vault directly rather than going through `get_impl`: an
     /// embedder wants the value, not a `RangeResponse` to unwrap.
+    /// This node's member id, as `status` and `member_list` give it
+    pub fn member_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// The settings this node runs with now: for a reconfigure that changes one of them
+    /// (a `Config` event carries a whole config, not a change)
+    pub async fn config(&self) -> EtcdConfig {
+        self.cfg.read().await.clone()
+    }
+
     pub async fn kv_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.vault.read().await.get(key).map(|kv| kv.value.clone())
     }
@@ -626,7 +684,7 @@ pub struct EtcdNode {
     /// stream, or an older one, arriving after it - the two crossed on the way
     /// here - is not stored. Kept here, not with the queue: a node keeps
     /// registrations of queues it has no `Queue` for.
-    pub(crate) tombstones: Arc<RwLock<HashMap<(KvKey, NodeId), (u64, tokio::time::Instant)>>>,
+    pub(crate) tombstones: Tombstones,
 
     /// watchers links
     pub(crate) observers: Arc<RwLock<HashMap<KvKey, EtcdObserverType>>>,
@@ -660,6 +718,13 @@ pub struct EtcdNode {
     /// question whose answer changes only on reconfigure is a cost with no
     /// return. Rebuilt wherever the config is applied.
     pub(crate) policy: Arc<RwLock<crate::prefix::PrefixPolicy>>,
+    /// [coord] the leader's leases and locks, the alarms (`coord.rs`)
+    pub(crate) coord: Arc<crate::coord::Coord>,
+    /// [sys] the system records, the embedder's store, the sequences' blocks (`sys.rs`)
+    pub(crate) sys: Arc<crate::sys::Sys>,
+    /// [auth] signon's accounts, with `auth_db_url` (`auth.rs`)
+    #[cfg(feature = "auth")]
+    pub(crate) auth: Option<Arc<crate::auth::Auth>>,
     pub event: Sender<EtcdEvents>,
     pub(crate) log: Logger,
     #[cfg(feature = "tracer")] pub(crate) tracer: Arc<RwLock<Option<opentelemetry_sdk::trace::SdkTracer>>>,
@@ -672,8 +737,11 @@ pub(crate) type EtcdObserverType = Vec<(ClientId, WatcherId)>;
 pub(crate) type EtcdPeerNodeType = Arc<Mutex<EtcdPeerNode>>;
 
 pub(crate) type EtcdClientType = Arc<RwLock<EtcdClientNode>>;
-/// remote node info
 
+/// A queue registration's tombstone, by key and node: its revision and when it was made
+pub(crate) type Tombstones = Arc<RwLock<HashMap<(KvKey, NodeId), (u64, tokio::time::Instant)>>>;
+
+/// remote node info
 pub struct EtcdClientNode {
     /// TODO take from auth
     #[allow(dead_code)]
@@ -708,8 +776,8 @@ fn client_urls(listen: &str) -> Vec<String> {
 }
 
 #[inline]
-fn parse_uuid(value: &String) -> Result<u64, String> {
-    let (a, b) = if value.len() > 0 {
+pub(crate) fn parse_uuid(value: &String) -> Result<u64, String> {
+    let (a, b) = if !value.is_empty() {
         Uuid::from_str(value.as_str())
             .map_err(|e| tr!("cluster.uuid", value = value, err = e))?
     } else {
@@ -1199,10 +1267,12 @@ mod peering_tests {
 				let ev = n.event.clone();
 				let (me, all, urls) = (urls[i].clone(), all.clone(), urls.clone());
 				sends.push(tokio::spawn(async move {
-					let mut c = crate::cli::EtcdConfig::default();
-					c.listen_client_urls = me;
-					c.initial_advertise_peer_urls = all.clone();
-					c.listen_peer_urls = all;
+					let c = crate::cli::EtcdConfig {
+						listen_client_urls: me,
+						initial_advertise_peer_urls: all.clone(),
+						listen_peer_urls: all,
+						..Default::default()
+					};
 					ev.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
 					for (j, u) in urls.iter().enumerate() {
 						ev.send(EtcdEvents::Data(KvEvent::Put(PutRequest {
@@ -1288,10 +1358,12 @@ mod peering_tests {
 			let (me, all, urls) = (urls[i].clone(), all.clone(), urls.clone());
 			sends.push(tokio::spawn(async move {
 				for round in 0..2 {
-					let mut c = crate::cli::EtcdConfig::default();
-					c.listen_client_urls = me.clone();
-					c.initial_advertise_peer_urls = all.clone();
-					c.listen_peer_urls = all.clone();
+					let c = crate::cli::EtcdConfig {
+						listen_client_urls: me.clone(),
+						initial_advertise_peer_urls: all.clone(),
+						listen_peer_urls: all.clone(),
+						..Default::default()
+					};
 					ev.send(EtcdEvents::Mgmt(EtcdMgmtEvent::Config(c))).await.unwrap();
 					for (j, u) in urls.iter().enumerate() {
 						ev.send(EtcdEvents::Data(KvEvent::Put(PutRequest {

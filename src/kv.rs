@@ -56,7 +56,8 @@ impl From<PutRequest> for Kv {
      value: value.value,
      create_revision: 0,
      mod_revision: 0,
-     lease: 0,
+     // [coord] the key's lease: its keys are deleted with it
+     lease: value.lease,
      version: 0,
      created: Instant::now(),
      lut: Instant::now(),
@@ -116,7 +117,7 @@ impl EtcdNode {
     ///
     /// * empty       - one key, exactly
     /// * `[0]`       - from `key` to the end of the keyspace (with an empty
-    ///                 `key`, that is every key)
+    ///   `key`, that is every key)
     /// * anything    - the half-open interval `[key, range_end)`
     ///
     /// A PREFIX is the third form: a client asks for `key = "/p/"` and
@@ -166,18 +167,15 @@ impl EtcdNode {
 
         let mut kvs = Vec::new();
         let key = QueueNameKey::new(String::from_utf8_lossy(&r.key).to_string());
-        if key.is_queue() {
-            if let Some(q) = self.queues.read().await.get(&key.queue_name) {
-                if let Some(x) = q.get(&key).await {
-                    kvs.push(x.into());
+        if key.is_queue()
+            && let Some(q) = self.queues.read().await.get(&key.queue_name)
+                && let Some(x) = q.get(&key).await {
+                    kvs.push(x);
                 }
-            }
-        }
-        if kvs.is_empty() {
-            if let Some(x) = self.vault.read().await.get(&r.key) {
+        if kvs.is_empty()
+            && let Some(x) = self.vault.read().await.get(&r.key) {
                 kvs.push(x.into());
             }
-        }
         Ok(Response::new( RangeResponse {
             header: None,
             count: kvs.len() as i64,
@@ -225,8 +223,8 @@ impl EtcdNode {
         -> Result<Response<PutResponse>, Status>
     {
         let key = String::from_utf8_lossy(&r.key).to_string();
-        if let Some(cid) = crate::route::consumer_of(&key) {
-            if let Some(reg) = crate::route::Registration::parse(&String::from_utf8_lossy(&r.value)) {
+        if let Some(cid) = crate::route::consumer_of(&key)
+            && let Some(reg) = crate::route::Registration::parse(&String::from_utf8_lossy(&r.value)) {
                 if reg.state == crate::route::StreamState::Closed {
                     return self.put_tombstone(r, cid, reg, key, from_peer).await;
                 }
@@ -234,7 +232,7 @@ impl EtcdNode {
                 // already closed - the two crossed on the way - is not stored
                 // (generation 0, an older form, names no stream: not dead by it)
                 let dead = reg.generation > 0 && self.tombstones.read().await.get(&(r.key.clone(), reg.node))
-                    .map_or(false, |(g, at)| at.elapsed() < crate::queue::QUEUE_IDLE && reg.generation <= *g);
+                    .is_some_and(|(g, at)| at.elapsed() < crate::queue::QUEUE_IDLE && reg.generation <= *g);
                 if dead {
                     return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
                 }
@@ -250,9 +248,29 @@ impl EtcdNode {
                     });
                 }
             }
+        // [coord] the key's lease: one this node holds - granted on the leader, and
+        // replicated here before the grant answered. `ignore_lease` keeps the key's own.
+        // A peer's write is taken as it comes: the leader checked it
+        let mut r = r;
+        if r.ignore_lease {
+            r.lease = self.vault.read().await.get(&r.key).map(|k| k.lease).unwrap_or(0);
+            r.ignore_lease = false;
+        }
+        if from_peer.is_none() && r.lease != 0 && !self.coord.leases.read().await.contains_key(&r.lease) {
+            return Err(Status::not_found(tr!("lease.not_found", id = r.lease)));
         }
         let kv: kv::Kv = r.clone().into();
         let prev_kv = self.vault.write().await.insert(r.key.clone(), kv.clone());
+        // [review 2026-11-21] the lease revoked between the check and the insert: the key
+        // goes again, not left on a dead lease
+        if from_peer.is_none() && r.lease != 0 && !self.coord.leases.read().await.contains_key(&r.lease) {
+            let mut vault = self.vault.write().await;
+            match prev_kv.clone() {
+                Some(p) => vault.insert(r.key.clone(), p),
+                None => vault.remove(&r.key),
+            };
+            return Err(Status::not_found(tr!("lease.not_found", id = r.lease)));
+        }
         let _ = self.watch_notify.send((kv, false)).await;
         // [q-registry] A consumer registration is news to a dispatcher holding
         // messages nobody could take: wake it, rather than leave them for the
@@ -277,7 +295,7 @@ impl EtcdNode {
                 Some(self.peers.read().await.my_zone().to_string())
             } else { None };
             // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
-            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
+            self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
                 PutRequest {
                     prev_kv: false,
                     ignore_value: true, ..r.clone()
@@ -300,11 +318,10 @@ impl EtcdNode {
     {
         // [q-dead] ...or on its behalf (`;gone`): its node down past the down
         // timeout, any node may say so
-        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok()) {
-            if sender != t.node && !t.gone {
+        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok())
+            && sender != t.node && !t.gone {
                 return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
             }
-        }
         // [q-dead] ...unless the named node answers here - cut off from the
         // writer, not from this node - or is this node: not gone, here
         if t.gone {
@@ -320,7 +337,7 @@ impl EtcdNode {
             let mut vault = self.vault.write().await;
             let stale = vault.get(&r.key)
                 .and_then(|kv| crate::route::Registration::parse(&String::from_utf8_lossy(&kv.value)))
-                .map_or(false, |s| s.removed_by(&t));
+                .is_some_and(|s| s.removed_by(&t));
             if stale {
                 vault.remove(&r.key);
             }
@@ -331,7 +348,7 @@ impl EtcdNode {
             let mut tombs = self.tombstones.write().await;
             tombs.retain(|_, (_, at)| at.elapsed() < crate::queue::QUEUE_IDLE);
             let k = (r.key.clone(), t.node);
-            if tombs.get(&k).map_or(true, |(g, _)| t.generation >= *g) {
+            if tombs.get(&k).is_none_or(|(g, _)| t.generation >= *g) {
                 tombs.insert(k, (t.generation, tokio::time::Instant::now()));
             }
         }
@@ -351,7 +368,7 @@ impl EtcdNode {
                 Some(self.peers.read().await.my_zone().to_string())
             } else { None };
             // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
-            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
+            self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Put(
                 PutRequest { prev_kv: false, ignore_value: true, ..r })), scope.as_deref()).await?;
         }
         Ok(Response::new(PutResponse { header: None, prev_kv: None }))
@@ -369,15 +386,14 @@ impl EtcdNode {
         // registered there; its old node withdrawing it later - its old stream
         // closed - would take a live consumer off this node, and hand out again
         // what it is still working on.
-        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok()) {
-            if r.range_end.is_empty() && crate::route::consumer_of(&String::from_utf8_lossy(&r.key)).is_some() {
+        if let Some(sender) = from_peer.as_deref().and_then(|p| p.trim().parse::<crate::cluster::NodeId>().ok())
+            && r.range_end.is_empty() && crate::route::consumer_of(&String::from_utf8_lossy(&r.key)).is_some() {
                 let host = self.vault.read().await.get(&r.key)
                     .and_then(|kv| crate::route::Registration::parse(&String::from_utf8_lossy(&kv.value)));
                 if matches!(host, Some(h) if h.node != sender) {
                     return Ok(Response::new(DeleteRangeResponse { header: None, deleted: 0, prev_kvs: vec![] }));
                 }
             }
-        }
 
         // [range] A DeleteRange carrying a `range_end` deletes the RANGE. This
         // used to `remove(&r.key)` and nothing else, so a prefix delete removed
@@ -414,7 +430,7 @@ impl EtcdNode {
                 Some(self.peers.read().await.my_zone().to_string())
             } else { None };
             // [lockup] not under `peers.read()`: see `peer::BroadcastPlan`
-            let _ = self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Delete(
+            self.broadcast_scoped(BroadcastRequest::Kv(KvEvent::Delete(
                 DeleteRangeRequest {
                     prev_kv: false, range_end: r.range_end, key: r.key
                 })), scope.as_deref()).await?;
@@ -480,7 +496,7 @@ impl EtcdNode {
             }
             drop(policy);
             if !any_local {
-                let _ = self.broadcast(BroadcastRequest::Kv(KvEvent::Txn(r))).await?;
+                self.broadcast(BroadcastRequest::Kv(KvEvent::Txn(r))).await?;
             }
         }
 

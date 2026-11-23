@@ -8,6 +8,30 @@ use tonic::{async_trait, Request, Response, Status};
 
 
 impl EtcdNode {
+    /// [sys] Whether a call reaches [`crate::sys::SYS_PREFIX`]: `None` it does not; `Some`
+    /// a peer's call on it; a client's call on it is refused here. Only a call that starts
+    /// in the prefix: the records are not in the store, so a range over every key - a
+    /// peer's sync at start, a client's - reads past them, as it should.
+    pub(crate) async fn sys_call(&self, meta: &tonic::metadata::MetadataMap, key: &[u8], remote: Option<std::net::SocketAddr>) -> Result<Option<()>, Status> {
+        if !key.starts_with(crate::sys::SYS_PREFIX.as_bytes()) {
+            return Ok(None);
+        }
+        self.verified_peer(meta, remote).await.map(Some)
+    }
+
+    /// [review 2026-11-21, 2] A peer's call, proved: `x-peer` with the cluster's `peer_token`,
+    /// or without a token set, from the address of a peer this node holds - `x-peer` alone is
+    /// any client's header
+    pub(crate) async fn verified_peer(&self, meta: &tonic::metadata::MetadataMap, remote: Option<std::net::SocketAddr>) -> Result<(), Status> {
+        let token = self.cfg.read().await.peer_token.clone();
+        match crate::guard::peer_proof(meta, &token) {
+            None => Err(Status::permission_denied(tr!("sys.peers_only"))),
+            Some(Err(e)) => Err(e),
+            Some(Ok(())) if token.is_empty() => self.known_peer(remote).await,
+            Some(Ok(())) => Ok(()),
+        }
+    }
+
     /// [otel] One KV call, on the instruments (metrics.rs), when the host gave a meter
     #[cfg(feature = "tracer")]
     pub(crate) async fn metric_kv(&self, op: &'static str, ok: bool, took: std::time::Duration) {
@@ -65,6 +89,16 @@ impl Kv for EtcdNode {
 
     /// TODO implement all variation
     async fn range(&self, request: Request<RangeRequest>) -> Result<Response<RangeResponse>, Status> {
+        // [auth] reading the range
+        self.check_call(request.metadata(), Some((&request.get_ref().key, &request.get_ref().range_end, crate::coord::READ))).await?;
+        // [sys] the system records: a peer's range over them, no client's - [review 2026-11-21, 2]
+        // a takeover's with its ballot, promised here
+        if self.sys_call(request.metadata(), &request.get_ref().key, request.remote_addr()).await?.is_some() {
+            let ballot = request.metadata().get(crate::sys::XBALLOT).and_then(|v| v.to_str().ok()).and_then(crate::sys::parse_ballot);
+            let kvs = self.sys_range_for_peer(ballot).await?;
+            let count = kvs.len() as i64;
+            return Ok(Response::new(RangeResponse { header: None, kvs, more: false, count }));
+        }
         let remote = request.remote_addr();
         self.deny_remote(&request.get_ref().key, remote).await?;
         // [E2] a range is checked over its whole span, not by its first key: a
@@ -101,8 +135,50 @@ impl Kv for EtcdNode {
     /// 2. else if queue producer - do not put to vault, send to queue dispatcher host
     /// 3. else if send to 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        // [approve] a queue's approval definition, or a vote on a waiting message: root's and
+        // labac's to allow, not a key range's - asked before the key's own permission
+        #[cfg(feature = "approvals")]
+        if let Some(answer) = self.approve_put(request.metadata(), request.get_ref(), true).await? {
+            return Ok(answer);
+        }
+        self.check_call(request.metadata(), Some((&request.get_ref().key, &[], crate::coord::WRITE))).await?;
+        // [sys] a record the leader replicates, from a peer; no client's
+        if self.sys_call(request.metadata(), &request.get_ref().key, request.remote_addr()).await?.is_some() {
+            let key = String::from_utf8_lossy(&request.get_ref().key).trim_start_matches(crate::sys::SYS_PREFIX).to_string();
+            // a peer waking this leader's consumer of the sequences' requests
+            if key == crate::sys::SEQ_WAKE && crate::coord::has(request.metadata(), crate::coord::XFWD) {
+                if self.route_to_leader(true).await?.is_none() {
+                    self.seq_consumer_start().await;
+                }
+                return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
+            }
+            if !crate::coord::has(request.metadata(), crate::coord::XREP) {
+                return Err(Status::permission_denied(tr!("sys.peers_only")));
+            }
+            self.sys_put_from_peer(&key, &request.get_ref().value, request.remote_addr()).await?;
+            return Ok(Response::new(PutResponse { header: None, prev_kv: None }));
+        }
+        // [sys] the sequences' own queues: a client puts a request only - no definition, no
+        // answer on a node's reply queue ([review 2026-11-21, 2] a peer's put proved)
+        if crate::sys::reserved_queue(&request.get_ref().key) && !crate::sys::is_seq_key(&request.get_ref().key) {
+            self.verified_peer(request.metadata(), request.remote_addr()).await?;
+        }
+        // [sys] a client's request for numbers: the leader's consumer woken before it lands
+        if crate::sys::is_seq_key(&request.get_ref().key) && request.metadata().get(crate::etcdpb::XPEER).is_none() {
+            self.seq_wake_leader().await?;
+        }
+        // [review 2026-11-21] the previous value comes back: reading it is needed too
+        if request.get_ref().prev_kv {
+            self.check_call(request.metadata(), Some((&request.get_ref().key, &[], crate::coord::READ))).await?;
+        }
         self.deny_remote(&request.get_ref().key, request.remote_addr()).await?;
         self.deny_readonly(&request.get_ref().key, &[]).await?;
+        // [approve] a message put to a gated queue waits for its approvals: held on the leader,
+        // not handed to a consumer
+        #[cfg(feature = "approvals")]
+        if let Some(answer) = self.approve_put(request.metadata(), request.get_ref(), false).await? {
+            return Ok(answer);
+        }
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("put"));
 
@@ -118,6 +194,23 @@ impl Kv for EtcdNode {
     /// TODO implement all variation of request
     /// TODO implement kv owner and queue consumer access 
     async fn delete_range(&self, request: Request<DeleteRangeRequest>) -> Result<Response<DeleteRangeResponse>, Status> {
+        // [approve] a waiting message withdrawn, or a queue's definition taken away
+        #[cfg(feature = "approvals")]
+        if let Some(answer) = self.approve_delete(request.metadata(), request.get_ref()).await? {
+            return Ok(answer);
+        }
+        self.check_call(request.metadata(), Some((&request.get_ref().key, &request.get_ref().range_end, crate::coord::WRITE))).await?;
+        // [sys] the records are deleted by the leader's put of a tombstone, never by a delete
+        if self.sys_call(request.metadata(), &request.get_ref().key, request.remote_addr()).await?.is_some() {
+            return Err(Status::permission_denied(tr!("sys.peers_only")));
+        }
+        // [review 2026-11-21, 2] nor what the sequences' queues hold, but by a peer
+        if crate::sys::reserved_queue(&request.get_ref().key) {
+            self.verified_peer(request.metadata(), request.remote_addr()).await?;
+        }
+        if request.get_ref().prev_kv {
+            self.check_call(request.metadata(), Some((&request.get_ref().key, &request.get_ref().range_end, crate::coord::READ))).await?;
+        }
         self.deny_remote(&request.get_ref().key, request.remote_addr()).await?;
         self.deny_readonly(&request.get_ref().key, &request.get_ref().range_end).await?;
         #[cfg(feature = "tracer")]
@@ -131,12 +224,31 @@ impl Kv for EtcdNode {
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        // [auth] each range it compares or reads, each it writes
+        let wants = EtcdNode::txn_access(request.get_ref());
+        if wants.is_empty() {
+            self.check_call(request.metadata(), None).await?;
+        }
+        for (k, e, w) in &wants {
+            self.check_call(request.metadata(), Some((k, e, *w))).await?;
+            // [sys] no txn reaches the system records or the sequences' queues
+            let _ = e;
+            if k.starts_with(crate::sys::SYS_PREFIX.as_bytes()) || crate::sys::reserved_queue(k) {
+                return Err(Status::permission_denied(tr!("sys.peers_only")));
+            }
+        }
         // every key the txn touches, or a restricted one could ride in on an
         // unrestricted request
         let remote = request.remote_addr();
         for k in crate::kv::txn_keys(request.get_ref()) {
             self.deny_remote(&k, remote).await?;
             self.deny_readonly(&k, &[]).await?;
+        }
+        // [approve] nor the approvals' keys, nor a put into a gated queue
+        #[cfg(feature = "approvals")]
+        {
+            let writes: Vec<(Vec<u8>, Vec<u8>)> = wants.iter().filter(|(_, _, w)| *w == crate::coord::WRITE).map(|(k, e, _)| (k.clone(), e.clone())).collect();
+            self.approve_txn(request.metadata(), &writes).await?;
         }
         #[cfg(feature = "tracer")]
         let _s = self.tracer.read().await.as_ref().map(|t| t.start("txn"));
@@ -147,7 +259,8 @@ impl Kv for EtcdNode {
         result
     }
 
-    async fn compact(&self, _request: Request<CompactionRequest>) -> Result<Response<CompactionResponse>, Status> {
+    async fn compact(&self, request: Request<CompactionRequest>) -> Result<Response<CompactionResponse>, Status> {
+        self.check_call(request.metadata(), None).await?;
         Ok(Response::new(CompactionResponse { header: None }))
     }
 }

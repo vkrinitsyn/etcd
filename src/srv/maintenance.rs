@@ -13,11 +13,45 @@ type SnapshotResult<T> = Result<Response<T>, Status>;
 
 #[async_trait]
 impl Maintenance for EtcdNode {
-    async fn alarm(&self, _request: Request<AlarmRequest>) -> Result<Response<AlarmResponse>, Status> {
-        Err(Status::unimplemented(tr!("srv.unimplemented")))
+    /// [coord] etcd's alarms, kept on this node: `GET` lists them, `ACTIVATE` and
+    /// `DEACTIVATE` raise and clear one (NOSPACE, CORRUPT) for a member - none raises
+    /// itself here, etcds has no disk to fill
+    async fn alarm(&self, request: Request<AlarmRequest>) -> Result<Response<AlarmResponse>, Status> {
+        use crate::etcdpb::etcdserverpb::alarm_request::AlarmAction;
+        use crate::etcdpb::etcdserverpb::AlarmMember;
+        let r = *request.get_ref();
+        if r.action == AlarmAction::Get as i32 {
+            self.check_call(request.metadata(), None).await?;
+        } else {
+            self.check_root(request.metadata()).await?;
+        }
+        let mut alarms = self.coord.alarms.lock().unwrap_or_else(|p| p.into_inner());
+        let member = if r.member_id == 0 { self.node_id } else { r.member_id };
+        let one = AlarmMember { member_id: member, alarm: r.alarm };
+        match AlarmAction::try_from(r.action) {
+            Ok(AlarmAction::Get) => {}
+            Ok(AlarmAction::Activate) => {
+                if r.alarm == 0 {
+                    return Err(Status::invalid_argument(tr!("srv.alarm_none")));
+                }
+                if !alarms.contains(&one) {
+                    alarms.push(one);
+                }
+            }
+            Ok(AlarmAction::Deactivate) => alarms.retain(|a| *a != one),
+            Err(_) => return Err(Status::invalid_argument(tr!("srv.alarm_action", action = r.action))),
+        }
+        let alarms = alarms.iter().filter(|a| r.alarm == 0 || a.alarm == r.alarm).cloned().collect();
+        Ok(Response::new(AlarmResponse { header: Some(self.response_header()), alarms }))
     }
 
+    /// Open to any caller, as a reachability probe: a peer dials with it before it holds
+    /// a token. [coord] the leader and the alarms raised here
     async fn status(&self, _request: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
+        let leader = self.leader().await;
+        let errors: Vec<String> = self.coord.alarms.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .map(|a| format!("alarm:{}", crate::etcdpb::etcdserverpb::AlarmType::try_from(a.alarm).map(|t| t.as_str_name()).unwrap_or("UNKNOWN")))
+            .collect();
         let vault_size = self.vault.read().await.len() as i64;
         let header = self.response_header();
         Ok(Response::new(StatusResponse {
@@ -26,11 +60,11 @@ impl Maintenance for EtcdNode {
             // an older node (`peer::registry_of`)
             version: crate::peer::status_version(),
             db_size: vault_size,
-            leader: 0,
+            leader,
             raft_index: 0,
             raft_term: header.raft_term,
             raft_applied_index: 0,
-            errors: vec![],
+            errors,
             db_size_in_use: vault_size,
             is_learner: false,
             // etcds has neither a storage version nor a quota, and nothing to downgrade
@@ -40,17 +74,26 @@ impl Maintenance for EtcdNode {
         }))
     }
 
-    async fn downgrade(&self, _request: Request<DowngradeRequest>) -> Result<Response<DowngradeResponse>, Status> {
-        Err(Status::unimplemented(tr!("srv.unimplemented")))
+    /// etcds keeps nothing on disk: there is no storage version to downgrade. `VALIDATE`
+    /// and `CANCEL` answer with this node's version, `ENABLE` is refused
+    async fn downgrade(&self, request: Request<DowngradeRequest>) -> Result<Response<DowngradeResponse>, Status> {
+        use crate::etcdpb::etcdserverpb::downgrade_request::DowngradeAction;
+        self.check_root(request.metadata()).await?;
+        match DowngradeAction::try_from(request.get_ref().action) {
+            Ok(DowngradeAction::Enable) => Err(Status::failed_precondition(tr!("srv.no_downgrade"))),
+            _ => Ok(Response::new(DowngradeResponse { header: Some(self.response_header()), version: env!("CARGO_PKG_VERSION").to_string() })),
+        }
     }
 
-    async fn defragment(&self, _request: Request<DefragmentRequest>) -> Result<Response<DefragmentResponse>, Status> {
+    async fn defragment(&self, request: Request<DefragmentRequest>) -> Result<Response<DefragmentResponse>, Status> {
+        self.check_root(request.metadata()).await?;
         Ok(Response::new(DefragmentResponse {
             header: Some(self.response_header()),
         }))
     }
 
     async fn hash(&self, request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
+        self.check_root(request.metadata()).await?;
         let remote = request.remote_addr();
         let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
@@ -68,6 +111,7 @@ impl Maintenance for EtcdNode {
     }
 
     async fn hash_kv(&self, request: Request<HashKvRequest>) -> Result<Response<HashKvResponse>, Status> {
+        self.check_root(request.metadata()).await?;
         let remote = request.remote_addr();
         let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
@@ -92,6 +136,7 @@ impl Maintenance for EtcdNode {
     type SnapshotStream = SnapshotResultStream;
 
     async fn snapshot(&self, request: Request<SnapshotRequest>) -> SnapshotResult<SnapshotResultStream> {
+        self.check_root(request.metadata()).await?;
         let remote = request.remote_addr();
         let policy = self.policy.read().await.clone();
         let vault = self.vault.read().await;
@@ -118,7 +163,8 @@ impl Maintenance for EtcdNode {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn move_leader(&self, _request: Request<MoveLeaderRequest>) -> Result<Response<MoveLeaderResponse>, Status> {
+    async fn move_leader(&self, request: Request<MoveLeaderRequest>) -> Result<Response<MoveLeaderResponse>, Status> {
+        self.check_root(request.metadata()).await?;
         Ok(Response::new(MoveLeaderResponse {
             header: Some(self.response_header()),
         }))

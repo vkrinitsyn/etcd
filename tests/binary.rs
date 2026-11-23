@@ -71,11 +71,10 @@ fn signal(child: &Child, sig: &str) {
 async fn connect(port: u16) -> etcd_client::Client {
     let url = format!("http://127.0.0.1:{}", port);
     for _ in 0..100 {
-        if let Ok(mut c) = etcd_client::Client::connect([url.as_str()], None).await {
-            if c.status().await.is_ok() {
+        if let Ok(mut c) = etcd_client::Client::connect([url.as_str()], None).await
+            && c.status().await.is_ok() {
                 return c;
             }
-        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("etcds on {} never answered", url);

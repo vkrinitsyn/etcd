@@ -33,15 +33,31 @@ pub mod prefix;
 /// [q-route] queue dispatcher + consumer registries, and the routing they buy
 pub mod route;
 mod peer;
+// [coord] the leader, leases and locks
+mod coord;
+// [sys] the system records a leader switch carries, and the sequences
+pub mod sys;
+/// [embed] leases and locks for the embedder, in process
+pub mod embed;
+// [auth] what every call is checked for
+mod guard;
+// [auth] the Auth API on signon's accounts
+#[cfg(feature = "auth")]
+mod auth;
+// [approve] approvals of a queue's messages: the rules, and the node's side
+#[cfg(feature = "approvals")]
+pub mod approve;
 
 
 /// Logging prefix, to start every logging message with a string to use in a server as a module 
-const LP: &'static str = "[etcd] ";
+const LP: &str = "[etcd] ";
 
 
 pub type WatchSender = Sender<Result<WatchResponse, Status>>;
 
 /// Etcd reconfiguration and integration events
+// the variants stay unboxed: an embedder builds and matches them, and a Box would change that public API
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum EtcdEvents {
     /// Cache modification event
@@ -50,6 +66,8 @@ pub enum EtcdEvents {
     Mgmt(EtcdMgmtEvent),
 }
 
+// the variants stay unboxed: an embedder builds and matches them, and a Box would change that public API
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum EtcdMgmtEvent {
     /// runtime reconfigure event

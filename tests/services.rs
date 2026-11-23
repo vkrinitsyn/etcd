@@ -27,7 +27,8 @@ fn unimplemented<T: std::fmt::Debug>(r: std::result::Result<T, Error>, what: &st
 
 /// [proto] What the official API added over this crate's old copy, seen by a client of the
 /// generated code: RangeStream is the range in one chunk, under the same limit and the same
-/// refusal as Range; Downgrade and AuthStatus are there and answer `unimplemented`; a member
+/// refusal as Range; Downgrade answers this node's version (nothing to downgrade, [coord]) and
+/// AuthStatus `unimplemented` without the `auth` feature; a member
 /// list may ask to be linearizable; HashKV has no revision to say.
 #[tokio::test]
 async fn what_the_official_api_added() -> Result<()> {
@@ -52,8 +53,8 @@ async fn what_the_official_api_added() -> Result<()> {
     assert_eq!(chunk.count, whole.count);
     assert!(stream.message().await.unwrap().is_none(), "one chunk");
 
-    let down = MaintenanceClient::connect(url.clone()).await.unwrap().downgrade(DowngradeRequest::default()).await.unwrap_err();
-    assert_eq!(down.code(), tonic::Code::Unimplemented);
+    let down = MaintenanceClient::connect(url.clone()).await.unwrap().downgrade(DowngradeRequest::default()).await.unwrap().into_inner();
+    assert_eq!(down.version, env!("CARGO_PKG_VERSION"), "VALIDATE: the version this node runs");
     let auth = AuthClient::connect(url.clone()).await.unwrap().auth_status(AuthStatusRequest::default()).await.unwrap_err();
     assert_eq!(auth.code(), tonic::Code::Unimplemented);
 
@@ -107,11 +108,12 @@ async fn every_call_of_every_service_is_answered() -> Result<()> {
     assert!(events.message().await.unwrap().unwrap().created);
 
     let mut lease = LeaseClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
-    assert_eq!(got(lease.lease_grant(pb::LeaseGrantRequest::default()).await), Unimplemented);
-    assert_eq!(got(lease.lease_revoke(pb::LeaseRevokeRequest::default()).await), Unimplemented);
-    assert_eq!(got(lease.lease_time_to_live(pb::LeaseTimeToLiveRequest::default()).await), Unimplemented);
-    assert_eq!(got(lease.lease_leases(pb::LeaseLeasesRequest::default()).await), Unimplemented);
-    assert_eq!(got(lease.lease_keep_alive(tokio_stream::iter(vec![pb::LeaseKeepAliveRequest::default()])).await), Unimplemented);
+    // [coord] Lease answers: a grant of nothing gets the minimum TTL, a revoke of none is not found
+    assert_eq!(got(lease.lease_grant(pb::LeaseGrantRequest::default()).await), Answered);
+    assert_eq!(got(lease.lease_revoke(pb::LeaseRevokeRequest::default()).await), tonic::Code::NotFound);
+    assert_eq!(got(lease.lease_time_to_live(pb::LeaseTimeToLiveRequest::default()).await), Answered);
+    assert_eq!(got(lease.lease_leases(pb::LeaseLeasesRequest::default()).await), Answered);
+    assert_eq!(got(lease.lease_keep_alive(tokio_stream::iter(vec![pb::LeaseKeepAliveRequest::default()])).await), Answered);
 
     let mut cluster = ClusterClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
     assert_eq!(got(cluster.member_list(pb::MemberListRequest::default()).await), Answered);
@@ -126,8 +128,8 @@ async fn every_call_of_every_service_is_answered() -> Result<()> {
     assert_eq!(got(m.hash(pb::HashRequest::default()).await), Answered);
     assert_eq!(got(m.hash_kv(pb::HashKvRequest::default()).await), Answered);
     assert_eq!(got(m.move_leader(pb::MoveLeaderRequest::default()).await), Answered);
-    assert_eq!(got(m.alarm(pb::AlarmRequest::default()).await), Unimplemented);
-    assert_eq!(got(m.downgrade(pb::DowngradeRequest::default()).await), Unimplemented);
+    assert_eq!(got(m.alarm(pb::AlarmRequest::default()).await), Answered, "[coord] GET");
+    assert_eq!(got(m.downgrade(pb::DowngradeRequest::default()).await), Answered, "[coord] VALIDATE");
     let mut snap = m.snapshot(pb::SnapshotRequest::default()).await.unwrap().into_inner();
     assert!(snap.message().await.unwrap().is_some());
 
@@ -158,8 +160,9 @@ async fn every_call_of_every_service_is_answered() -> Result<()> {
     assert_eq!(got(e.resign(el::ResignRequest::default()).await), Unimplemented);
 
     let mut l = LockClient::new(conn.clone()).max_decoding_message_size(1 << 24).max_encoding_message_size(1 << 24);
-    assert_eq!(got(l.lock(lk::LockRequest::default()).await), Unimplemented);
-    assert_eq!(got(l.unlock(lk::UnlockRequest::default()).await), Unimplemented);
+    // [coord] a lock with no name is refused; an unlock of a key nobody holds deletes nothing
+    assert_eq!(got(l.lock(lk::LockRequest::default()).await), tonic::Code::InvalidArgument);
+    assert_eq!(got(l.unlock(lk::UnlockRequest::default()).await), Answered);
 
     // still serving, over the connection all of that used
     assert_eq!(got(kv.range(pb::RangeRequest { key: key("/all/a"), ..Default::default() }).await), Answered);
@@ -201,9 +204,9 @@ async fn each_client_however_it_is_built() -> Result<()> {
     built!(MaintenanceClient, status, pb::StatusRequest::default(), tonic::Code::Ok);
     built!(ClusterClient, member_list, pb::MemberListRequest::default(), tonic::Code::Ok);
     built!(AuthClient, auth_status, pb::AuthStatusRequest::default(), tonic::Code::Unimplemented);
-    built!(LeaseClient, lease_grant, pb::LeaseGrantRequest::default(), tonic::Code::Unimplemented);
+    built!(LeaseClient, lease_grant, pb::LeaseGrantRequest::default(), tonic::Code::Ok);
     built!(ElectionClient, leader, el::LeaderRequest::default(), tonic::Code::Unimplemented);
-    built!(LockClient, unlock, lk::UnlockRequest::default(), tonic::Code::Unimplemented);
+    built!(LockClient, unlock, lk::UnlockRequest::default(), tonic::Code::Ok);
     let create = || pb::WatchRequest { request_union: Some(pb::watch_request::RequestUnion::CreateRequest(
         pb::WatchCreateRequest { key: b"/w".to_vec(), ..Default::default() })) };
     let created = WatchClient::connect(url.clone()).await.unwrap().watch(tokio_stream::iter(vec![create()])).await;
@@ -213,24 +216,12 @@ async fn each_client_however_it_is_built() -> Result<()> {
     Ok(())
 }
 
-/// Lease, Lock, Election and Auth are registered - a client gets an answer,
-/// not a transport error - and every call answers `unimplemented`.
+/// Election, and Auth without the `auth` feature, are registered - a client gets an
+/// answer, not a transport error - and every call answers `unimplemented`. Lease, Lock
+/// and alarms answer since [coord]: tests/lease_lock.rs, `maintenance_alarms_and_downgrade`.
 #[tokio::test]
-async fn lease_lock_election_and_auth_answer_unimplemented() -> Result<()> {
+async fn election_and_auth_answer_unimplemented() -> Result<()> {
     let (_node, mut client) = start_server().await;
-
-    unimplemented(client.lease_grant(10, None).await, "lease_grant");
-    unimplemented(client.lease_revoke(1).await, "lease_revoke");
-    unimplemented(client.lease_time_to_live(1, None).await, "lease_time_to_live");
-    unimplemented(client.leases().await, "leases");
-    // keep-alive is a stream: the refusal is the stream's first answer
-    match client.lease_keep_alive(1).await {
-        Ok((_, mut stream)) => unimplemented(stream.message().await, "lease_keep_alive"),
-        Err(e) => assert_eq!(code(e), tonic::Code::Unimplemented),
-    }
-
-    unimplemented(client.lock("l", None).await, "lock");
-    unimplemented(client.unlock("l").await, "unlock");
 
     unimplemented(client.campaign("e", "v", 0).await, "campaign");
     unimplemented(client.proclaim("v", None).await, "proclaim");
@@ -263,7 +254,6 @@ async fn lease_lock_election_and_auth_answer_unimplemented() -> Result<()> {
 
     unimplemented(client.member_remove(1).await, "member_remove");
     unimplemented(client.member_update(1, vec!["http://h:1".to_string()]).await, "member_update");
-    unimplemented(client.alarm(AlarmAction::Get, AlarmType::None, None).await, "alarm");
 
     // ...and the node is still serving after all of that
     client.put("still", "here", None).await?;
@@ -507,5 +497,41 @@ async fn delete_returns_prev_kvs_only_when_asked() -> Result<()> {
     assert!(r.prev_kvs().is_empty());
     let r = client.delete("d2", Some(DeleteOptions::new().with_prev_key())).await?;
     assert_eq!(r.prev_kvs()[0].value(), b"2");
+    Ok(())
+}
+
+/// [coord] Alarms are kept on the node: raised, listed, filtered by type and cleared; the
+/// leader is in `status`, and a raised alarm in its errors. Downgrade has nothing to do.
+#[tokio::test]
+async fn maintenance_alarms_and_downgrade() -> Result<()> {
+    use etcd_client::{AlarmOptions, DowngradeOptions};
+    let (_node, mut client) = start_server().await;
+    let none = client.alarm(AlarmAction::Get, AlarmType::None, None).await?;
+    assert!(none.alarms().is_empty());
+    let status = client.status().await?;
+    assert_eq!(status.leader(), status.header().unwrap().member_id(), "a node alone leads");
+    assert!(status.errors().is_empty());
+
+    client.alarm(AlarmAction::Activate, AlarmType::Nospace, None).await?;
+    client.alarm(AlarmAction::Activate, AlarmType::Nospace, None).await?;
+    let raised = client.alarm(AlarmAction::Get, AlarmType::None, None).await?;
+    assert_eq!(raised.alarms().len(), 1, "raised once, however often asked");
+    assert_eq!(raised.alarms()[0].alarm(), AlarmType::Nospace);
+    assert!(client.alarm(AlarmAction::Get, AlarmType::Corrupt, None).await?.alarms().is_empty(), "filtered by type");
+    assert_eq!(client.status().await?.errors(), ["alarm:NOSPACE"]);
+    let e = client.alarm(AlarmAction::Activate, AlarmType::None, None).await.unwrap_err();
+    assert_eq!(code(e), tonic::Code::InvalidArgument, "NONE is no alarm to raise");
+    let member = client.alarm(AlarmAction::Get, AlarmType::None, None).await?.alarms()[0].member_id();
+    let mut on = AlarmOptions::new();
+    on.with_member(member);
+    client.alarm(AlarmAction::Deactivate, AlarmType::Nospace, Some(on)).await?;
+    assert!(client.alarm(AlarmAction::Get, AlarmType::None, None).await?.alarms().is_empty());
+
+    let mut m = client.maintenance_client();
+    let v = m.downgrade(DowngradeOptions::Validate("3.5".to_string())).await?;
+    assert_eq!(v.version(), env!("CARGO_PKG_VERSION"));
+    let e = m.downgrade(DowngradeOptions::Enable("3.5".to_string())).await.unwrap_err();
+    assert_eq!(code(e), tonic::Code::FailedPrecondition, "no storage version to downgrade");
+    m.downgrade(DowngradeOptions::Cancel).await?;
     Ok(())
 }

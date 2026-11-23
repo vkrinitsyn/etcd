@@ -148,6 +148,36 @@ pub struct EtcdConfig {
     #[arg(long, required = false)]
     pub queue_down_timeout: Option<u64>,
 
+    /// [coord] The node deciding for the cluster - leases and locks (`coord.rs`) - by its
+    /// uuid: an embedder with a leader of its own sets it (YT Cluster: its Raft
+    /// leader), and a `Config` reconfigure moves it. Empty: the lowest node id among
+    /// this node and its Online peers.
+    #[arg(long, required = false, default_value = "")]
+    pub leader: String,
+
+    /// [sys] The global lock timeout, seconds: the lease a lock asked with none holds, and
+    /// what an embedder keeps its own locks' leases at (YT Cluster: a node's advisory locks).
+    #[arg(long, required = false, default_value = "60")]
+    pub lock_ttl: u64,
+
+    /// [auth] A secret every node of the cluster shares: each call one node makes to
+    /// another carries it, and a call claiming to come from a peer without it is
+    /// refused. Required with `auth_db_url` (a client could otherwise pass for a peer
+    /// and skip the checks); without auth, unchecked when empty.
+    #[arg(long, required = false, default_value = "")]
+    pub peer_token: String,
+
+    /// [auth] Feature `auth`: the PostgreSQL database of signon's accounts, roles and
+    /// key-range permissions (`postgres://...`); empty, no Auth API. Its schema is
+    /// applied at start (signon::migrate, append only).
+    #[arg(long, required = false, default_value = "")]
+    pub auth_db_url: String,
+
+    /// [auth] Feature `auth`: authentication on from the start, as `AuthEnable` turns
+    /// it on - every call then needs a token from `Authenticate`. Needs `auth_db_url`.
+    #[arg(long, required = false, default_value = "false")]
+    pub auth: bool,
+
     /// [bridge] The etcd queue the binary's bridge consumes and sends to `bridge_to`,
     /// acknowledging each message once the broker took it. Feature `bridge`; one of
     /// `bridge_queue`, `bridge_prefix`, `bridge_listen`. Empty: no bridge.
@@ -613,7 +643,7 @@ impl EtcdCliArgs {
     /// doc comments stay the source's documentation; `--help` shows these.
     pub fn command_in(lang: &str) -> clap::Command {
         let t = |key: &str| rust_i18n::t!(key, locale = lang).into_owned();
-        let header = clap::builder::styling::Styles::default().get_usage().clone();
+        let header = *clap::builder::styling::Styles::default().get_usage();
         let options = t("help.options");
         let arguments = t("help.arguments");
         <Self as clap::CommandFactory>::command()
@@ -681,6 +711,11 @@ impl EtcdConfig {
     }
 
     /// Every setting at its clap `default_value`.
+    /// [sys] `lock_ttl`, 60 s when unset (0: an embedder's `..Default::default()`)
+    pub fn lock_ttl_secs(&self) -> u64 {
+        if self.lock_ttl == 0 { 60 } else { self.lock_ttl }
+    }
+
     pub fn with_defaults() -> Self {
         <EtcdCliArgs as Parser>::parse_from(["etcd"]).config
     }
@@ -688,7 +723,7 @@ impl EtcdConfig {
     pub fn peers(&self) -> HashSet<&str> {
         let urls: HashSet<&str> = HashSet::from_iter(self.listen_client_urls.split(","));
         let mut clients: HashSet<&str> = HashSet::from_iter(self.initial_advertise_peer_urls.split(",")
-            .filter(|c| c.trim().len() > 0 && c.starts_with("http")));
+            .filter(|c| !c.trim().is_empty() && c.starts_with("http")));
         for h in urls {
             if h.contains("//") {
                 clients.remove(h);

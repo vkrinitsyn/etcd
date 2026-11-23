@@ -295,11 +295,10 @@ impl Http {
     /// The connection, made again when the endpoint closed the last one: its idle timeout
     /// or `Connection: close` is no failure of this message
     async fn ready(&mut self) -> Result<(), String> {
-        if let Some(c) = &mut self.conn {
-            if c.sender.ready().await.is_ok() {
+        if let Some(c) = &mut self.conn
+            && c.sender.ready().await.is_ok() {
                 return Ok(());
             }
-        }
         self.conn = None;
         self.conn = Some(self.dial().await?);
         Ok(())

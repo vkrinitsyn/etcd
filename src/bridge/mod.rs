@@ -258,7 +258,8 @@ impl Config {
 /// its `readonly_prefix` refusal - a prefix only the embedder writes - and its metrics
 #[derive(Clone)]
 enum Link {
-    Grpc(Client),
+    // boxed: an etcd client is some 3.5 KB, the node a few handles
+    Grpc(Box<Client>),
     Local(crate::cluster::EtcdNode),
 }
 
@@ -470,15 +471,14 @@ async fn watch_loop(cfg: Config, log: Logger, tx: mpsc::Sender<Held>, current: A
                     backoff.reset();
                     // [bridge-secret] in-process, the node's policy as it is now: a
                     // reconfigure that keeps the prefix's keys local stops the bridge
-                    if let (Some(n), false) = (&cfg.node, resp.events.is_empty()) {
-                        if let Err(e) = cfg.served_out(&*n.policy.read().await) {
+                    if let (Some(n), false) = (&cfg.node, resp.events.is_empty())
+                        && let Err(e) = cfg.served_out(&*n.policy.read().await) {
                             error!(log, "{}", tr!("bridge.stopped", err = e));
                             if let Ok(mut w) = why.lock() {
                                 *w = Some(e.clone());
                             }
                             return Err(e);
                         }
-                    }
                     if resp.canceled {
                         warn!(log, "{}", tr!("bridge.watch_canceled", reason = resp.reason));
                         rewatch.wait().await;
@@ -559,7 +559,7 @@ async fn connect_watch(cfg: &Config, key: &str, prefix: bool) -> Result<(Link, W
         Ok::<_, etcd_client::Error>((client, stream))
     };
     match tokio::time::timeout(ETCD_TIMEOUT, connect).await {
-        Ok(r) => r.map(|(c, s)| (Link::Grpc(c), Watch::Grpc(s))).map_err(|e| e.to_string()),
+        Ok(r) => r.map(|(c, s)| (Link::Grpc(Box::new(c)), Watch::Grpc(s))).map_err(|e| e.to_string()),
         Err(_) => Err(tr!("bridge.no_answer", timeout = format!("{:?}", ETCD_TIMEOUT))),
     }
 }

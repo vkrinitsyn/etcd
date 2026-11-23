@@ -81,11 +81,10 @@ impl EtcdNode {
                         if start == &kv.key {
                             continue;
                         }
-                        if crate::cluster::EtcdNode::in_range(&kv.key, start, end) {
-                            if let Some(v) = obs.get(start) {
+                        if crate::cluster::EtcdNode::in_range(&kv.key, start, end)
+                            && let Some(v) = obs.get(start) {
                                 targets.extend(v.iter().cloned());
                             }
-                        }
                     }
                 }
                 // [q-dead] The senders taken under the locks, sent to after:
@@ -97,11 +96,10 @@ impl EtcdNode {
                 if !targets.is_empty() {
                     let all = watchers.read().await;
                     for (cid, wid) in targets { // expected watcher per client
-                        if let Some(client_watcher) = all.get(&cid) {
-                            if let Some(client) = client_watcher.read().await.watchers.get(&wid) {
+                        if let Some(client_watcher) = all.get(&cid)
+                            && let Some(client) = client_watcher.read().await.watchers.get(&wid) {
                                 sends.push((cid, wid, client.client.clone()));
                             }
-                        }
                     }
                 }
                 for (cid, wid, client) in sends {
@@ -159,6 +157,8 @@ impl Watch for EtcdNode {
         let (sender, receiver) = mpsc::channel::<Result<WatchResponse, Status>>(10);
         // [E3] the caller, from the connection - a watch used to stream any key
         let remote = request.remote_addr();
+        // [auth] the stream's token, for each watch it creates
+        let meta = request.metadata().clone();
         let mut stream = request.into_inner();
         let etcd = self.clone();
         tokio::spawn(async move {
@@ -169,8 +169,8 @@ impl Watch for EtcdNode {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(r) => {
-                        if let Some(RequestUnion::CreateRequest(c)) = &r.request_union {
-                            if !etcd.policy.read().await.range_may_serve(&c.key, &c.range_end, remote) {
+                        if let Some(RequestUnion::CreateRequest(c)) = &r.request_union
+                            && !etcd.policy.read().await.range_may_serve(&c.key, &c.range_end, remote) {
                                 // refused, as etcd refuses a watch: created and
                                 // canceled at once, with the reason
                                 let _ = sender.send(Ok(WatchResponse {
@@ -185,7 +185,38 @@ impl Watch for EtcdNode {
                                 })).await;
                                 continue;
                             }
-                        }
+                        // [review 2026-11-21, 2] the sequences' queues are consumed by the leader
+                        // and the nodes only: a client's consumer would take their messages
+                        if let Some(RequestUnion::CreateRequest(c)) = &r.request_union
+                            && crate::sys::reserved_queue(&c.key)
+                            && let Err(e) = etcd.verified_peer(&meta, remote).await {
+                                let _ = sender.send(Ok(WatchResponse {
+                                    header: Some(etcd.response_header()),
+                                    watch_id: c.watch_id,
+                                    created: true,
+                                    canceled: true,
+                                    compact_revision: 0,
+                                    cancel_reason: e.message().to_string(),
+                                    fragment: false,
+                                    events: vec![],
+                                })).await;
+                                continue;
+                            }
+                        // [auth] reading what it watches: refused as the local-only one is
+                        if let Some(RequestUnion::CreateRequest(c)) = &r.request_union
+                            && let Err(e) = etcd.check_call(&meta, Some((&c.key, &c.range_end, crate::coord::READ))).await {
+                                let _ = sender.send(Ok(WatchResponse {
+                                    header: Some(etcd.response_header()),
+                                    watch_id: c.watch_id,
+                                    created: true,
+                                    canceled: true,
+                                    compact_revision: 0,
+                                    cancel_reason: e.message().to_string(),
+                                    fragment: false,
+                                    events: vec![],
+                                })).await;
+                                continue;
+                            }
                         cid = etcd.handle_watch_request(r.request_union, &sender, &cid).await;
                         cids.insert(cid);
                     }
@@ -207,7 +238,7 @@ impl EtcdNode {
     /// use as library watcher entry point
     pub async fn new_watcher(&self, mut stream: Receiver<WatchRequest>, sender: WatchSender, client_id: &Uuid) {
         let etcd = self.clone();
-        let mut cid = client_id.clone();
+        let mut cid = *client_id;
 
         tokio::spawn(async move {
             // [watch-gone] each id the stream watched under: its key watches go with it
@@ -225,10 +256,10 @@ impl EtcdNode {
         if let Some(rx) = request {
             match rx {
                 RequestUnion::CreateRequest(r) => {
-                    return self.create_watcher(r, cid.clone(), sender.clone()).await;
+                    return self.create_watcher(r, *cid, sender.clone()).await;
                 }
                 RequestUnion::CancelRequest(r) => {
-                    let _ = self.remove_watcher(r, cid.clone()).await;
+                    let _ = self.remove_watcher(r, *cid).await;
                 }
                 RequestUnion::ProgressRequest(_r) => {
                     let watchers = self.list_watchers(cid).await;
@@ -236,7 +267,7 @@ impl EtcdNode {
                     if let Err(e) = sender.send(Ok(
                             WatchResponse {
                                 header: Some(self.response_header()), // [watch-header]
-                                watch_id: *watchers.get(0).unwrap_or(&0),
+                                watch_id: *watchers.first().unwrap_or(&0),
                                 fragment: watchers.len() > 1, ..Default::default()
                             }
                         )
@@ -246,13 +277,13 @@ impl EtcdNode {
                 }
             }
         }
-        cid.clone()
+        *cid
     }
     
     async fn list_watchers(&self, cid: &Uuid) -> Vec<WatcherId> {
         match self.watchers.read().await.get(cid) {
             None => vec![],
-            Some(w) => w.read().await.watchers.keys().map(|e| *e).collect()
+            Some(w) => w.read().await.watchers.keys().copied().collect()
         }
     }
 }
@@ -311,7 +342,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(!entry, "its client's entry went with its last watch");
-        assert!(n.observers.read().await.get(b"/gone-key".as_slice()).map_or(true, |o| o.is_empty()));
+        assert!(n.observers.read().await.get(b"/gone-key".as_slice()).is_none_or(|o| o.is_empty()));
     }
 
     /// [watch-gone] A stream whose requests end is still told, as etcd serves a half-closed
@@ -336,7 +367,7 @@ mod tests {
             }
         }
         assert!(gone, "the client's entry is still there, with no change under its key");
-        assert!(n.observers.read().await.get(b"/ended-key".as_slice()).map_or(true, |o| o.is_empty()));
+        assert!(n.observers.read().await.get(b"/ended-key".as_slice()).is_none_or(|o| o.is_empty()));
         // a key watch on a stream still open is left as it is
         let mut live = Consumer::watch(&n, &Uuid::new_v4(), "/ended-key", 1).await;
         n.kv_put(b"/ended-key".to_vec(), b"2".to_vec()).await.unwrap();
@@ -361,7 +392,7 @@ mod tests {
             }
         }
         assert!(gone, "the unread watcher is still registered");
-        assert!(n.observers.read().await.get(b"/unread-key".as_slice()).map_or(true, |o| o.is_empty()));
+        assert!(n.observers.read().await.get(b"/unread-key".as_slice()).is_none_or(|o| o.is_empty()));
         drop(c);
     }
 

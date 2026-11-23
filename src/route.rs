@@ -118,7 +118,7 @@ pub fn is_control(key: &str) -> bool {
     if n.len() < 3 {
         return false;
     }
-    if !matches!(n.get(1).map(|s| *s), Some("q") | Some("queue")) {
+    if !matches!(n.get(1).copied(), Some("q") | Some("queue")) {
         return false;
     }
     match n.len() {
@@ -148,7 +148,7 @@ pub fn consumer_key(fq_name: &str, client: &uuid::Uuid) -> String {
 /// The client id out of a consumer registration key, or `None`.
 pub fn consumer_of(key: &str) -> Option<uuid::Uuid> {
     let n: Vec<&str> = key.trim_end_matches('/').split('/').collect();
-    if n.len() != 5 || !matches!(n.get(1).map(|s| *s), Some("q") | Some("queue")) {
+    if n.len() != 5 || !matches!(n.get(1).copied(), Some("q") | Some("queue")) {
         return None;
     }
     if !matches!(n[3], "c" | "consumer") {
